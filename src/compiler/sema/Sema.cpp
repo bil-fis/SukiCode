@@ -57,10 +57,23 @@ bool Sema::analyze(CompilationUnit& cu) {
             auto& fd = static_cast<FunctionDecl&>(*decl);
             Symbol* existing = symbols_.lookup(fd.name);
             if (!existing) {
+                // 临时注册泛型参数以解析类型 / Temporarily register generic params for type resolution
+                symbols_.enterScope();
+                for (const auto& gp : fd.genericParams) {
+                    Symbol gs;
+                    gs.kind = SymbolKind::Type;
+                    gs.name = gp.name;
+                    gs.type = getAnyType();
+                    symbols_.define(gs);
+                }
+
                 Symbol sym;
                 sym.kind = SymbolKind::Function;
                 sym.name = fd.name;
                 sym.isPublic = (fd.access == AccessLevel::Public);
+
+                // 解析参数类型（泛型参数在此作用域内可用）
+                // Resolve parameter types (generic params available in this scope)
                 for (const auto& param : fd.params) {
                     if (param.type) {
                         sym.paramTypes.push_back(resolveTypeRepr(*param.type));
@@ -73,6 +86,11 @@ bool Sema::analyze(CompilationUnit& cu) {
                 } else {
                     sym.returnType = getVoidType();
                 }
+
+                // 离开临时作用域 / Leave temporary scope
+                symbols_.leaveScope();
+
+                // 在外部作用域定义函数 / Define function in outer scope
                 symbols_.define(sym);
             }
         }
@@ -361,6 +379,18 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     sym.column = decl.loc.column;
     sym.isPublic = (decl.access == AccessLevel::Public) || isMain || isCDecl;
 
+    // 进入临时作用域以注册泛型参数 / Enter temporary scope for generic params
+    symbols_.enterScope();
+    for (const auto& gp : decl.genericParams) {
+        Symbol gs;
+        gs.kind = SymbolKind::Type;
+        gs.name = gp.name;
+        gs.type = getAnyType();
+        symbols_.define(gs);
+    }
+
+    // 解析参数类型（泛型参数在此作用域内可用）
+    // Resolve parameter types (generic params available in this scope)
     for (const auto& param : decl.params) {
         if (param.type) {
             sym.paramTypes.push_back(resolveTypeRepr(*param.type));
@@ -375,6 +405,9 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
         sym.returnType = getVoidType();
     }
 
+    // 离开临时作用域 / Leave temporary scope
+    symbols_.leaveScope();
+
     sym.type = std::make_shared<FunctionType>(
         std::vector<FunctionType::Param>(), sym.returnType, decl.isAsync, decl.isThrows);
 
@@ -383,6 +416,15 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     symbols_.define(sym); // 允许更新（不报错）
 
     symbols_.enterScope();
+
+    // 注册泛型类型参数 / Register generic type parameters
+    for (const auto& gp : decl.genericParams) {
+        Symbol gs;
+        gs.kind = SymbolKind::Type;
+        gs.name = gp.name;
+        gs.type = getAnyType(); // 泛型参数用 Any 类型表示
+        symbols_.define(gs);
+    }
 
     // 设置函数上下文 / Set function context
     TypePtr prevReturnType = currentReturnType_;
@@ -526,6 +568,9 @@ void Sema::processReturnStmt(ReturnStmt& stmt) {
     if (stmt.value) {
         TypePtr returnType = inferExprType(*stmt.value);
         if (returnType && currentReturnType_) {
+            // 泛型参数返回类型跳过检查 / Skip check for generic return types
+            if (returnType->kind() == TypeKind::Any) return;
+            if (currentReturnType_->kind() == TypeKind::Any) return;
             typeChecker_.checkReturnType(*currentReturnType_, *returnType, stmt.loc);
         }
     } else if (currentReturnType_ && currentReturnType_->kind() != TypeKind::Void) {

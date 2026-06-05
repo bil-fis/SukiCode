@@ -2141,21 +2141,31 @@ std::vector<FunctionParam> Parser::parseParamList() {
 
 // ─── Generic parameters ───────────────────────────────────────────────────
 
-std::vector<std::string> Parser::parseGenericParams() {
-    std::vector<std::string> params;
+std::vector<GenericParam> Parser::parseGenericParams() {
+    std::vector<GenericParam> params;
     expect(TokenKind::Less);
     do {
         if (check(TokenKind::Identifier)) {
-            std::string name = std::string(advance().stringValue);
-            // Optional constraint: T: Protocol, T: A & B
+            GenericParam param;
+            param.name = std::string(advance().stringValue);
+
+            // 泛型约束: T: Protocol, T: A & B
             if (match(TokenKind::Colon)) {
-                // Skip constraint types until we hit ',' or '>'
-                // TODO: parse and store constraints properly
-                while (!check(TokenKind::Comma) && !check(TokenKind::Greater) && !isAtEnd()) {
-                    advance();
-                }
+                // 解析约束类型 / Parse constraint types
+                do {
+                    TypeReprPtr constraint = parseType();
+                    if (constraint) {
+                        param.constraints.push_back(std::move(constraint));
+                    }
+                } while (match(TokenKind::Amp)); // A & B 用 & 分隔
             }
-            params.push_back(name);
+
+            // 默认值: T = Int
+            if (match(TokenKind::Assign)) {
+                param.defaultValue = parseType();
+            }
+
+            params.push_back(std::move(param));
         } else {
             error("expected generic parameter name");
         }

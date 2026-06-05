@@ -583,10 +583,17 @@ struct FunctionParam {
     bool isAutoclosure = false;
 };
 
+// 泛型参数 / Generic parameter
+struct GenericParam {
+    std::string name;                    // T
+    std::vector<TypeReprPtr> constraints; // T: Hashable & Equatable
+    TypeReprPtr defaultValue;            // T = Int
+};
+
 // Function declaration
 struct FunctionDecl : Decl {
     std::string name;
-    std::vector<std::string> genericParams; // <T, U>
+    std::vector<GenericParam> genericParams; // <T: Hashable, U>
     std::vector<FunctionParam> params;
     TypeReprPtr returnType; // optional, defaults to Void
     bool isAsync = false;
@@ -601,7 +608,7 @@ struct FunctionDecl : Decl {
 // Struct/Class/Enum/Protocol/Actor common fields
 struct TypeDecl : Decl {
     std::string name;
-    std::vector<std::string> genericParams;
+    std::vector<GenericParam> genericParams;
     std::vector<TypeReprPtr> conformsTo; // protocols / superclass
     std::vector<DeclPtr> members;
     explicit TypeDecl(DeclKind k) : Decl(k) {}
@@ -650,7 +657,7 @@ struct ExtensionDecl : TypeDecl {
 
 struct TypealiasDecl : Decl {
     std::string name;
-    std::vector<std::string> genericParams;
+    std::vector<GenericParam> genericParams;
     TypeReprPtr underlyingType;
     TypealiasDecl() : Decl(DeclKind::Typealias) {}
 };

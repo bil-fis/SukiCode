@@ -107,7 +107,7 @@ private:
     std::vector<FunctionParam> parseParamList();
 
     // ─── Generic parameters ───────────────────────────────────────────────
-    std::vector<std::string> parseGenericParams();
+    std::vector<GenericParam> parseGenericParams();
 
     // ─── Access control ───────────────────────────────────────────────────
     AccessLevel parseAccessLevel();
