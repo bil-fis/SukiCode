@@ -523,10 +523,22 @@ enum class AccessLevel : uint8_t {
     Open,
 };
 
+// Attribute attached to a declaration
+struct Attribute {
+    std::string name;       // e.g. "main", "cImport", "_cdecl"
+    std::vector<std::string> args; // optional arguments
+    SourceLocation loc;
+};
+
 struct Decl : ASTNode {
     DeclKind declKind;
     AccessLevel access = AccessLevel::Internal;
     bool isStatic = false;
+    bool isOverride = false;
+    bool isMutating = false;
+    bool isAsync = false;
+    bool isThrows = false;
+    std::vector<Attribute> attributes;
     explicit Decl(DeclKind k) : declKind(k) {}
 };
 

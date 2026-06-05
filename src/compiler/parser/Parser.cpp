@@ -164,6 +164,36 @@ DeclPtr Parser::parseDeclaration() {
         break;
     }
 
+    // Collect attributes
+    std::vector<Attribute> attrs;
+    while (true) {
+        if (check(TokenKind::AtMain) || check(TokenKind::AtCImport) ||
+            check(TokenKind::AtCDecl) || check(TokenKind::AtMacro) ||
+            check(TokenKind::AtTest) || check(TokenKind::AtEnumC) ||
+            check(TokenKind::AtNoMangle) || check(TokenKind::AtPanicHandler) ||
+            check(TokenKind::AtAttribute)) {
+            Attribute attr;
+            attr.loc = loc();
+            attr.name = std::string(advance().stringValue);
+            // Handle parenthesized arguments: @attr(args)
+            if (check(TokenKind::LParen)) {
+                advance(); // (
+                while (!check(TokenKind::RParen) && !isAtEnd()) {
+                    if (check(TokenKind::Identifier)) {
+                        attr.args.push_back(std::string(advance().stringValue));
+                    } else {
+                        advance(); // skip
+                    }
+                    match(TokenKind::Comma);
+                }
+                match(TokenKind::RParen);
+            }
+            attrs.push_back(std::move(attr));
+            continue;
+        }
+        break;
+    }
+
     DeclPtr decl;
 
     switch (peek().kind) {
@@ -194,22 +224,6 @@ DeclPtr Parser::parseDeclaration() {
         case TokenKind::KwSelect:    decl = parseSelectDecl(); break;
         case TokenKind::KwUnsafe:    decl = parseUnsafeDecl(); break;
 
-        // Attributes
-        case TokenKind::AtMain:
-        case TokenKind::AtCImport:
-        case TokenKind::AtCDecl:
-        case TokenKind::AtMacro:
-        case TokenKind::AtTest:
-        case TokenKind::AtEnumC:
-        case TokenKind::AtNoMangle:
-        case TokenKind::AtPanicHandler:
-        case TokenKind::AtAttribute: {
-            // For now, skip attributes and parse the following declaration
-            advance(); // consume attribute
-            // TODO: store attributes on the declaration
-            return parseDeclaration();
-        }
-
         default: {
             // Try to parse as expression statement
             ExprPtr expr = parseExpression();
@@ -231,6 +245,9 @@ DeclPtr Parser::parseDeclaration() {
     if (decl) {
         decl->access = access;
         decl->isStatic = isStatic;
+        decl->isOverride = isOverride;
+        decl->isMutating = isMutating;
+        decl->attributes = std::move(attrs);
     }
     return decl;
 }
@@ -1130,8 +1147,6 @@ ExprPtr Parser::parseComparisonExpr() {
         else if (match(TokenKind::Greater))  op = TokenKind::Greater;
         else if (match(TokenKind::LessEqual))    op = TokenKind::LessEqual;
         else if (match(TokenKind::GreaterEqual)) op = TokenKind::GreaterEqual;
-        else if (match(TokenKind::KwAs))     op = TokenKind::KwAs;
-        else if (match(TokenKind::KwIs))     op = TokenKind::KwIs;
         else break;
 
         ExprPtr right = parseShiftExpr();
@@ -1355,6 +1370,26 @@ ExprPtr Parser::parsePostfixExpr() {
             binary->left = std::move(expr);
             binary->right = std::move(rhs);
             expr = std::move(binary);
+        } else if (match(TokenKind::KwIs)) {
+            // Type check: expr is Type
+            auto check = makeNode<TypeCheckExpr>();
+            check->subExpr = std::move(expr);
+            check->checkType = parseType();
+            expr = std::move(check);
+        } else if (check(TokenKind::KwAs)) {
+            // Type cast: expr as Type, expr as? Type, expr as! Type
+            advance(); // consume 'as'
+            auto cast = makeNode<TypeCastExpr>();
+            cast->subExpr = std::move(expr);
+            if (match(TokenKind::Question)) {
+                cast->castKind = CastKind::Conditional;
+            } else if (match(TokenKind::Bang)) {
+                cast->castKind = CastKind::Force;
+            } else {
+                cast->castKind = CastKind::Coerce;
+            }
+            cast->targetType = parseType();
+            expr = std::move(cast);
         } else {
             break;
         }
