@@ -293,12 +293,36 @@ void Sema::processVariableDecl(VariableDecl& decl) {
 }
 
 void Sema::processFunctionDecl(FunctionDecl& decl) {
+    // 处理属性 / Process attributes
+    bool isMain = false;
+    bool isCDecl = false;
+    bool isNoMangle = false;
+    for (const auto& attr : decl.attributes) {
+        // 属性名可能包含 @ 前缀 / Attribute name may include @ prefix
+        std::string name = attr.name;
+        if (!name.empty() && name[0] == '@') name = name.substr(1);
+        if (name == "main") isMain = true;
+        if (name == "_cdecl") isCDecl = true;
+        if (name == "no_mangle") isNoMangle = true;
+    }
+    // 调试：检查属性是否被检测到
+
+    // @main 函数特殊处理 / @main function special handling
+    if (isMain) {
+        // @main 函数必须无参数，返回 Int 或 Void
+        if (!decl.params.empty()) {
+            warning(decl.loc, "@main function should have no parameters");
+        }
+        // 重命名为 main
+        decl.name = "main";
+    }
+
     Symbol sym;
     sym.kind = SymbolKind::Function;
     sym.name = decl.name;
     sym.line = decl.loc.line;
     sym.column = decl.loc.column;
-    sym.isPublic = (decl.access == AccessLevel::Public);
+    sym.isPublic = (decl.access == AccessLevel::Public) || isMain || isCDecl;
 
     for (const auto& param : decl.params) {
         if (param.type) {

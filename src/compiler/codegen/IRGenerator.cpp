@@ -216,6 +216,16 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
         return nullptr;
     }
 
+    // 处理属性 / Process attributes
+    for (const auto& attr : decl.attributes) {
+        if (attr.name == "_cdecl") {
+            func->setCallingConv(llvm::CallingConv::C);
+        }
+        if (attr.name == "no_mangle") {
+            // 已经使用函数名作为链接名，无需额外处理
+        }
+    }
+
     // 如果没有函数体，只是声明 / If no body, just a declaration
     if (decl.body.empty()) return func;
 

@@ -175,7 +175,14 @@ DeclPtr Parser::parseDeclaration() {
             check(TokenKind::AtAttribute)) {
             Attribute attr;
             attr.loc = loc();
-            attr.name = std::string(advance().stringValue);
+            // 属性名从 token 文本中提取（去掉 @ 前缀）
+            Token attrToken = advance();
+            std::string_view attrText = attrToken.text(source_);
+            if (!attrText.empty() && attrText[0] == '@') {
+                attr.name = std::string(attrText.substr(1));
+            } else {
+                attr.name = std::string(attrText);
+            }
             // Handle parenthesized arguments: @attr(args)
             if (check(TokenKind::LParen)) {
                 advance(); // (
