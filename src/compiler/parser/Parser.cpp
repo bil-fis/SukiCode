@@ -1284,6 +1284,41 @@ ExprPtr Parser::parsePostfixExpr() {
     while (true) {
         if (check(TokenKind::LParen)) {
             expr = parseCallExpr(std::move(expr));
+            // Trailing closure: call() { params in body }
+            if (check(TokenKind::LBrace)) {
+                auto closure = makeNode<ClosureExpr>();
+                advance(); // {
+                // Parse optional parameters before 'in'
+                if (!check(TokenKind::KwIn) && !check(TokenKind::RBrace)) {
+                    // Could be params: { x in ... } or { (a, b) in ... }
+                    if (check(TokenKind::Identifier)) {
+                        // Simple param: { x in ... }
+                        ClosureExpr::Param param;
+                        param.name = std::string(advance().stringValue);
+                        closure->params.push_back(std::move(param));
+                        // Check for more params
+                        while (match(TokenKind::Comma) && check(TokenKind::Identifier)) {
+                            ClosureExpr::Param p;
+                            p.name = std::string(advance().stringValue);
+                            closure->params.push_back(std::move(p));
+                        }
+                    }
+                }
+                match(TokenKind::KwIn); // consume 'in' if present
+                // Parse body
+                while (!check(TokenKind::RBrace) && !isAtEnd()) {
+                    auto stmt = parseStatement();
+                    if (stmt) closure->body.push_back(std::move(stmt));
+                }
+                match(TokenKind::RBrace); // }
+                // Add as last argument
+                if (expr->exprKind == ExprKind::Call) {
+                    auto& call = static_cast<CallExpr&>(*expr);
+                    CallExpr::Arg arg;
+                    arg.value = std::move(closure);
+                    call.args.push_back(std::move(arg));
+                }
+            }
         } else if (check(TokenKind::Dot) || check(TokenKind::Question)) {
             bool isOptional = match(TokenKind::Question);
             if (match(TokenKind::Dot)) {
@@ -1393,27 +1428,21 @@ ExprPtr Parser::parsePrimaryExpr() {
 
         // Parenthesized expression, tuple, or arrow closure
         case TokenKind::LParen: {
-            // Lookahead: check if this is an arrow closure (a: Int, b: Int) => expr
-            // Detect by checking for ':' or '=>' pattern after parameters
+            // Lookahead: check if this is an arrow closure (...)=> expr
+            // Only detect by checking for '=>' AFTER the closing ')'
             bool isArrowClosure = false;
             {
                 size_t save = pos_;
                 advance(); // (
-                // Skip tokens looking for '=>' pattern in parameter list
+                // Skip to matching ')'
                 int depth = 1;
                 while (pos_ < tokens_.size() && depth > 0) {
                     if (tokens_[pos_].is(TokenKind::LParen)) depth++;
-                    else if (tokens_[pos_].is(TokenKind::RParen)) {
-                        depth--;
-                        if (depth == 0) break;
-                    } else if (tokens_[pos_].is(TokenKind::Colon)) {
-                        // Found ':' inside parens — likely a parameter list
-                        isArrowClosure = true;
-                        // Don't break yet, confirm with '=>' after ')'
-                    }
-                    pos_++;
+                    else if (tokens_[pos_].is(TokenKind::RParen)) depth--;
+                    if (depth > 0) pos_++;
                 }
-                // Check for '=>' after ')'
+                // pos_ is now at the matching ')'
+                // Check if next token after ')' is '=>'
                 if (pos_ + 1 < tokens_.size() && tokens_[pos_ + 1].is(TokenKind::FatArrow)) {
                     isArrowClosure = true;
                 }

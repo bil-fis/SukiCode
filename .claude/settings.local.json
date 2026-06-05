@@ -53,7 +53,8 @@
       "Bash(./build/bin/sukic --emit-ast /tmp/test_z.suki)",
       "Bash(git commit -m 'feat: 改进解析器 - 多变量声明、泛型约束、控制流语句、计算属性 *)",
       "Bash(./build/bin/sukic --emit-ast examples/concurrency.suki)",
-      "Bash(git commit -m 'feat: 字典字面量、箭头闭包、可选类型、catch模式、while-let *)"
+      "Bash(git commit -m 'feat: 字典字面量、箭头闭包、可选类型、catch模式、while-let *)",
+      "Bash(git commit -m 'feat: trailing closure、while-let、箭头闭包前瞻修复 *)"
     ]
   }
 }
