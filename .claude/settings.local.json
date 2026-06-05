@@ -57,7 +57,9 @@
       "Bash(git commit -m 'feat: trailing closure、while-let、箭头闭包前瞻修复 *)",
       "Bash(git checkout *)",
       "Bash(./build/bin/sukic --emit-llvm /tmp/test_sema.suki)",
-      "Bash(git commit -m 'feat: 语义分析基础 - 类型系统、符号表、类型检查 *)"
+      "Bash(git commit -m 'feat: 语义分析基础 - 类型系统、符号表、类型检查 *)",
+      "Bash(ctest --test-dir build --output-on-failure)",
+      "Bash(git commit *)"
     ]
   }
 }

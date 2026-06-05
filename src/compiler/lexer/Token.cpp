@@ -70,6 +70,7 @@ static const std::unordered_map<std::string_view, TokenKind> keywordTable = {
     {"break",        TokenKind::KwBreak},
     {"continue",     TokenKind::KwContinue},
     {"fallthrough",  TokenKind::KwFallthrough},
+    {"defer",        TokenKind::KwDefer},
     {"select",       TokenKind::KwSelect},
 
     // Error handling
@@ -201,6 +202,7 @@ const char* Token::kindName(TokenKind kind) {
         case TokenKind::KwBreak:     return "'break'";
         case TokenKind::KwContinue:  return "'continue'";
         case TokenKind::KwFallthrough: return "'fallthrough'";
+        case TokenKind::KwDefer:     return "'defer'";
         case TokenKind::KwSelect:    return "'select'";
         case TokenKind::KwDo:        return "'do'";
         case TokenKind::KwCatch:     return "'catch'";
