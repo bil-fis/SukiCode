@@ -2057,6 +2057,13 @@ PatternPtr Parser::parsePattern() {
         return pat;
     }
 
+    // is Type pattern
+    if (match(TokenKind::KwIs)) {
+        auto pat = makeNode<IsTypePattern>();
+        pat->type = parseType();
+        return pat;
+    }
+
     // Fallback: try expression pattern
     auto expr = parseExpression();
     if (expr) {
