@@ -5,7 +5,7 @@
 
 namespace suki {
 
-Sema::Sema(DiagnosticEngine& diag) : diag_(diag) {}
+Sema::Sema(DiagnosticEngine& diag) : diag_(diag), typeChecker_(diag, symbols_) {}
 Sema::~Sema() = default;
 
 bool Sema::analyze(CompilationUnit& cu) {
@@ -241,9 +241,11 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
 
     symbols_.enterScope();
 
-    // Save and set current return type
+    // 设置函数上下文 / Set function context
     TypePtr prevReturnType = currentReturnType_;
     currentReturnType_ = sym.returnType;
+    typeChecker_.setInThrowsFunction(decl.isThrows);
+    typeChecker_.setInAsyncFunction(decl.isAsync);
 
     for (const auto& param : decl.params) {
         Symbol ps;
@@ -360,12 +362,8 @@ void Sema::processStmt(Stmt& stmt) {
 void Sema::processReturnStmt(ReturnStmt& stmt) {
     if (stmt.value) {
         TypePtr returnType = inferExprType(*stmt.value);
-        if (returnType && currentReturnType_ &&
-            returnType->kind() != TypeKind::Error &&
-            currentReturnType_->kind() != TypeKind::Void &&
-            !returnType->canImplicitlyConvertTo(*currentReturnType_)) {
-            error(stmt.loc, "return type " + returnType->name() +
-                  " does not match function return type " + currentReturnType_->name());
+        if (returnType && currentReturnType_) {
+            typeChecker_.checkReturnType(*currentReturnType_, *returnType, stmt.loc);
         }
     } else if (currentReturnType_ && currentReturnType_->kind() != TypeKind::Void) {
         error(stmt.loc, "non-void function must return a value");

@@ -6,6 +6,7 @@
 #include "compiler/ast/ASTNode.h"
 #include "compiler/diag/Diagnostic.h"
 #include "SymbolTable.h"
+#include "TypeChecker.h"
 #include "Type.h"
 #include <memory>
 
@@ -53,6 +54,7 @@ private:
 
     DiagnosticEngine& diag_;
     SymbolTable symbols_;
+    TypeChecker typeChecker_;
     std::string currentModule_;
     TypePtr currentReturnType_; // Current function's return type for checking
 };
