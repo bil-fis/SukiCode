@@ -292,6 +292,10 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
     // 存储初始值
     if (initVal) {
         builder_->CreateStore(initVal, allocaInst);
+        // ARC: 引用类型赋值时 retain / ARC: retain on reference type assignment
+        if (isReferenceType(initVal->getType())) {
+            insertRetain(initVal);
+        }
     }
 
     // 注册变量
@@ -969,6 +973,54 @@ llvm::Value* IRGenerator::createStringGlobal(const std::string& str) {
 
 void IRGenerator::error(SourceLocation loc, const std::string& msg) {
     diag_.error(loc, moduleName_, msg);
+}
+
+// ─── ARC 支持 / ARC support ─────────────────────────────────────────────
+
+void IRGenerator::insertRetain(llvm::Value* obj) {
+    if (!obj || !isReferenceType(obj->getType())) return;
+
+    // 查找或声明 suki_retain 函数
+    llvm::Function* retainFunc = module_->getFunction("suki_retain");
+    if (!retainFunc) {
+        llvm::FunctionType* retainTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(context_),
+            {llvm::PointerType::get(context_, 0)}, false);
+        retainFunc = llvm::Function::Create(retainTy, llvm::Function::ExternalLinkage,
+                                            "suki_retain", module_.get());
+    }
+
+    // 将对象指针传给 retain
+    llvm::Value* ptr = obj;
+    if (!obj->getType()->isPointerTy()) {
+        ptr = builder_->CreateIntToPtr(obj, llvm::PointerType::get(context_, 0));
+    }
+    builder_->CreateCall(retainFunc, {ptr});
+}
+
+void IRGenerator::insertRelease(llvm::Value* obj) {
+    if (!obj || !isReferenceType(obj->getType())) return;
+
+    // 查找或声明 suki_release 函数
+    llvm::Function* releaseFunc = module_->getFunction("suki_release");
+    if (!releaseFunc) {
+        llvm::FunctionType* releaseTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(context_),
+            {llvm::PointerType::get(context_, 0)}, false);
+        releaseFunc = llvm::Function::Create(releaseTy, llvm::Function::ExternalLinkage,
+                                             "suki_release", module_.get());
+    }
+
+    llvm::Value* ptr = obj;
+    if (!obj->getType()->isPointerTy()) {
+        ptr = builder_->CreateIntToPtr(obj, llvm::PointerType::get(context_, 0));
+    }
+    builder_->CreateCall(releaseFunc, {ptr});
+}
+
+bool IRGenerator::isReferenceType(llvm::Type* type) const {
+    // 指针类型视为引用类型
+    return type->isPointerTy();
 }
 
 #endif

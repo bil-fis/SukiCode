@@ -72,6 +72,11 @@ private:
     llvm::Value* genIfExpr(const IfExpr& expr);
     llvm::Value* genInterpolatedString(const InterpolatedStringExpr& expr);
 
+    // ─── ARC 支持 / ARC support ─────────────────────────────────────────
+    void insertRetain(llvm::Value* obj);
+    void insertRelease(llvm::Value* obj);
+    bool isReferenceType(llvm::Type* type) const;
+
     // ─── 辅助 / Helpers ────────────────────────────────────────────────
     llvm::AllocaInst* createEntryBlockAlloca(llvm::Function* func,
                                               llvm::Type* type,
