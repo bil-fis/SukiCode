@@ -76,6 +76,94 @@ void Sema::processDecl(Decl& decl) {
         case DeclKind::Enum:
             processEnumDecl(static_cast<EnumDecl&>(decl));
             break;
+        case DeclKind::Extension: {
+            // Extension: 处理扩展体内的成员
+            auto& ext = static_cast<ExtensionDecl&>(decl);
+            symbols_.enterScope();
+            for (auto& member : ext.members) {
+                if (member) processDecl(*member);
+            }
+            symbols_.leaveScope();
+            break;
+        }
+        case DeclKind::Protocol: {
+            // Protocol: 注册协议类型
+            auto& proto = static_cast<ProtocolDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Type;
+            sym.name = proto.name;
+            sym.isPublic = (proto.access == AccessLevel::Public);
+            symbols_.define(sym);
+            break;
+        }
+        case DeclKind::Actor: {
+            // Actor: 处理为类类型
+            auto& actor = static_cast<ActorDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Type;
+            sym.name = actor.name;
+            sym.isPublic = (actor.access == AccessLevel::Public);
+            symbols_.define(sym);
+            symbols_.enterScope();
+            for (auto& member : actor.members) {
+                if (member) processDecl(*member);
+            }
+            symbols_.leaveScope();
+            break;
+        }
+        case DeclKind::Typealias: {
+            // Typealias: 注册类型别名
+            auto& ta = static_cast<TypealiasDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Type;
+            sym.name = ta.name;
+            sym.isPublic = (ta.access == AccessLevel::Public);
+            if (ta.underlyingType) {
+                sym.type = resolveTypeRepr(*ta.underlyingType);
+            }
+            symbols_.define(sym);
+            break;
+        }
+        case DeclKind::Init: {
+            // Init: 注册为函数
+            auto& init = static_cast<InitDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Function;
+            sym.name = "init";
+            sym.isPublic = true;
+            sym.returnType = getVoidType();
+            symbols_.define(sym);
+            // 处理函数体
+            symbols_.enterScope();
+            for (auto& stmt : init.body) {
+                if (stmt) processStmt(*stmt);
+            }
+            symbols_.leaveScope();
+            break;
+        }
+        case DeclKind::Deinit: {
+            // Deinit: 处理函数体
+            auto& deinit = static_cast<DeinitDecl&>(decl);
+            symbols_.enterScope();
+            for (auto& stmt : deinit.body) {
+                if (stmt) processStmt(*stmt);
+            }
+            symbols_.leaveScope();
+            break;
+        }
+        case DeclKind::Subscript: {
+            // Subscript: 注册为函数
+            auto& sub = static_cast<SubscriptDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Function;
+            sym.name = "subscript";
+            sym.isPublic = true;
+            if (sub.returnType) {
+                sym.returnType = resolveTypeRepr(*sub.returnType);
+            }
+            symbols_.define(sym);
+            break;
+        }
         default: break;
     }
 }
