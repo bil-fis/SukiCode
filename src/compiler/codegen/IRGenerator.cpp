@@ -10,6 +10,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/InlineAsm.h>
 #endif
 
 namespace suki {
@@ -191,6 +192,18 @@ void IRGenerator::genDecl(const Decl& decl) {
         case DeclKind::Throw:
             genThrowStmt(static_cast<const ThrowDecl&>(decl));
             break;
+        case DeclKind::Asm: {
+            auto& asmDecl = static_cast<const AsmDecl&>(decl);
+            // 生成 LLVM 内联汇编 / Generate LLVM inline assembly
+            llvm::InlineAsm* inlineAsm = llvm::InlineAsm::get(
+                llvm::FunctionType::get(llvm::Type::getVoidTy(context_), false),
+                asmDecl.assembly,
+                asmDecl.constraints,
+                asmDecl.hasSideEffects
+            );
+            builder_->CreateCall(inlineAsm);
+            break;
+        }
         default:
             break;
     }

@@ -93,6 +93,7 @@ static const std::unordered_map<std::string_view, TokenKind> keywordTable = {
     {"unowned",      TokenKind::KwUnowned},
     {"move",         TokenKind::KwMove},
     {"unsafe",       TokenKind::KwUnsafe},
+    {"asm",          TokenKind::KwAsm},
 
     // Type-related
     {"self",         TokenKind::KwSelf},
@@ -219,6 +220,7 @@ const char* Token::kindName(TokenKind kind) {
         case TokenKind::KwUnowned:   return "'unowned'";
         case TokenKind::KwMove:      return "'move'";
         case TokenKind::KwUnsafe:    return "'unsafe'";
+        case TokenKind::KwAsm:       return "'asm'";
         case TokenKind::KwSelf:      return "'self'";
         case TokenKind::KwSelfType:  return "'Self'";
         case TokenKind::KwSuper:     return "'super'";

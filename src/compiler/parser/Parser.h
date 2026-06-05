@@ -59,6 +59,7 @@ private:
     DeclPtr parseDoCatchDecl();
     DeclPtr parseSelectDecl();
     DeclPtr parseUnsafeDecl();
+    DeclPtr parseAsmDecl();
 
     // ─── Statements ───────────────────────────────────────────────────────
     StmtPtr parseStatement();

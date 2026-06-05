@@ -512,6 +512,7 @@ enum class DeclKind : uint8_t {
     Throw,
     Select,
     Unsafe,
+    Asm,            // asm("..." : outputs : inputs : clobbers)
     Attribute,
 };
 
@@ -771,6 +772,14 @@ struct SelectDecl : Decl {
 struct UnsafeDecl : Decl {
     std::vector<StmtPtr> body;
     UnsafeDecl() : Decl(DeclKind::Unsafe) {}
+};
+
+struct AsmDecl : Decl {
+    std::string assembly;           // 汇编模板 / Assembly template
+    std::string constraints;        // 约束字符串 / Constraint string
+    bool hasSideEffects = true;     // 是否有副作用 / Has side effects
+    bool isAlignStack = false;      // 是否对齐栈 / Align stack
+    AsmDecl() : Decl(DeclKind::Asm) {}
 };
 
 // ─── Compilation Unit (top-level) ─────────────────────────────────────────

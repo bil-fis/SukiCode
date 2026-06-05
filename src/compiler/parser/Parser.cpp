@@ -224,6 +224,7 @@ DeclPtr Parser::parseDeclaration() {
         case TokenKind::KwDo:        decl = parseDoCatchDecl(); break;
         case TokenKind::KwSelect:    decl = parseSelectDecl(); break;
         case TokenKind::KwUnsafe:    decl = parseUnsafeDecl(); break;
+        case TokenKind::KwAsm:       decl = parseAsmDecl(); break;
 
         default: {
             // Try to parse as expression statement
@@ -926,6 +927,33 @@ DeclPtr Parser::parseUnsafeDecl() {
     return decl;
 }
 
+DeclPtr Parser::parseAsmDecl() {
+    expect(TokenKind::KwAsm);
+    auto decl = makeNode<AsmDecl>();
+
+    // asm("assembly template" : outputs : inputs : clobbers)
+    if (expect(TokenKind::LParen)) {
+        // 解析汇编模板字符串
+        if (check(TokenKind::StringLiteral)) {
+            decl->assembly = std::string(advance().stringValue);
+        } else {
+            error("expected string literal in asm");
+        }
+
+        // 可选的约束部分 : outputs : inputs : clobbers
+        while (match(TokenKind::Colon)) {
+            // 跳过约束字符串
+            if (check(TokenKind::StringLiteral)) {
+                decl->constraints += std::string(advance().stringValue);
+            }
+        }
+
+        expect(TokenKind::RParen);
+    }
+
+    return decl;
+}
+
 // ─── Statements ───────────────────────────────────────────────────────────
 
 StmtPtr Parser::parseStatement() {
@@ -955,7 +983,8 @@ StmtPtr Parser::parseStatement() {
         case TokenKind::KwRepeat:
         case TokenKind::KwDo:
         case TokenKind::KwSelect:
-        case TokenKind::KwUnsafe: {
+        case TokenKind::KwUnsafe:
+        case TokenKind::KwAsm: {
             auto decl = parseDeclaration();
             if (decl) {
                 auto stmt = makeNode<DeclStmt>();

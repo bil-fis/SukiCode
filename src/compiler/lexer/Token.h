@@ -96,6 +96,7 @@ enum class TokenKind : uint16_t {
     KwUnowned,
     KwMove,
     KwUnsafe,
+    KwAsm,          // asm (inline assembly)
 
     // Type-related
     KwSelf,
