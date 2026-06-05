@@ -199,6 +199,85 @@ private:
     std::vector<Case> cases_;
 };
 
+class ProtocolType : public Type {
+public:
+    explicit ProtocolType(std::string name) : Type(TypeKind::Protocol), name_(std::move(name)) {}
+    std::string name() const override { return name_; }
+    size_t sizeInBytes() const override { return sizeof(void*) * 2; } // witness table
+    size_t alignment() const override { return sizeof(void*); }
+private:
+    std::string name_;
+};
+
+class ActorType : public Type {
+public:
+    explicit ActorType(std::string name) : Type(TypeKind::Actor), name_(std::move(name)) {}
+    std::string name() const override { return name_; }
+    bool isReferenceType() const override { return true; }
+    size_t sizeInBytes() const override { return sizeof(void*); }
+    size_t alignment() const override { return sizeof(void*); }
+private:
+    std::string name_;
+};
+
+class SetType : public Type {
+public:
+    explicit SetType(TypePtr elem) : Type(TypeKind::Set), elem_(std::move(elem)) {}
+    std::string name() const override { return "Set<" + elem_->name() + ">"; }
+    TypePtr elementType() const { return elem_; }
+    size_t sizeInBytes() const override { return sizeof(void*) * 2; }
+    size_t alignment() const override { return sizeof(void*); }
+private:
+    TypePtr elem_;
+};
+
+class OwnedType : public Type {
+public:
+    explicit OwnedType(TypePtr inner) : Type(TypeKind::Owned), inner_(std::move(inner)) {}
+    std::string name() const override { return "Owned<" + inner_->name() + ">"; }
+    TypePtr innerType() const { return inner_; }
+    size_t sizeInBytes() const override { return inner_->sizeInBytes(); }
+    size_t alignment() const override { return inner_->alignment(); }
+private:
+    TypePtr inner_;
+};
+
+class UIntType : public Type {
+public:
+    explicit UIntType(int bits = 64) : Type(TypeKind::UInt), bits_(bits) {}
+    std::string name() const override { return "UInt"; }
+    int bitWidth() const { return bits_; }
+    size_t sizeInBytes() const override { return static_cast<size_t>(bits_ / 8); }
+    size_t alignment() const override { return static_cast<size_t>(bits_ / 8); }
+private:
+    int bits_;
+};
+
+class CharType : public Type {
+public:
+    CharType() : Type(TypeKind::Char) {}
+    std::string name() const override { return "Char"; }
+    size_t sizeInBytes() const override { return 4; } // Unicode scalar
+    size_t alignment() const override { return 4; }
+};
+
+class AnyType : public Type {
+public:
+    AnyType() : Type(TypeKind::Any) {}
+    std::string name() const override { return "Any"; }
+    size_t sizeInBytes() const override { return sizeof(void*) * 2; } // type + value
+    size_t alignment() const override { return sizeof(void*); }
+};
+
+class AnyObjectType : public Type {
+public:
+    AnyObjectType() : Type(TypeKind::AnyObject) {}
+    std::string name() const override { return "AnyObject"; }
+    bool isReferenceType() const override { return true; }
+    size_t sizeInBytes() const override { return sizeof(void*); }
+    size_t alignment() const override { return sizeof(void*); }
+};
+
 class UnresolvedType : public Type {
 public:
     explicit UnresolvedType(std::string name) : Type(TypeKind::Unresolved), name_(std::move(name)) {}

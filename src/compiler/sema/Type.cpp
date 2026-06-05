@@ -122,7 +122,7 @@ TypePtr getUIntType(int bits) {
     static std::unordered_map<int, TypePtr> cache;
     auto it = cache.find(bits);
     if (it != cache.end()) return it->second;
-    auto t = std::make_shared<IntType>(bits); // TODO: separate signed/unsigned
+    auto t = std::make_shared<UIntType>(bits);
     cache[bits] = t;
     return t;
 }
@@ -137,10 +137,10 @@ TypePtr getFloatType(int bits) {
 }
 
 TypePtr getDoubleType() { static auto i = std::make_shared<FloatType>(64); return i; }
-TypePtr getCharType() { static auto i = std::make_shared<IntType>(32); return i; }
+TypePtr getCharType() { static auto i = std::make_shared<CharType>(); return i; }
 TypePtr getStringType() { static auto i = std::make_shared<StringType>(); return i; }
-TypePtr getAnyType() { static auto i = std::make_shared<VoidType>(); return i; } // TODO: proper Any type
-TypePtr getAnyObjectType() { static auto i = std::make_shared<VoidType>(); return i; } // TODO
+TypePtr getAnyType() { static auto i = std::make_shared<AnyType>(); return i; }
+TypePtr getAnyObjectType() { static auto i = std::make_shared<AnyObjectType>(); return i; }
 TypePtr getErrorType() { static auto i = std::make_shared<ErrorType>(); return i; }
 
 TypePtr resolvePrimitiveType(const std::string& name) {
