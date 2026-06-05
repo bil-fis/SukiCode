@@ -3,6 +3,7 @@
 // expressions, statements, declarations, types, and patterns.
 
 #include "Parser.h"
+#include "compiler/lexer/Lexer.h"
 #include <cassert>
 
 namespace suki {
@@ -1412,9 +1413,56 @@ ExprPtr Parser::parsePrimaryExpr() {
             return expr;
         }
         case TokenKind::StringLiteral: {
-            auto expr = makeNode<StringLiteralExpr>();
-            expr->value = std::string(advance().stringValue);
-            return expr;
+            std::string strValue = std::string(advance().stringValue);
+            // 检查是否包含字符串插值 \(expr)
+            size_t interpPos = strValue.find("\\(");
+            if (interpPos == std::string::npos) {
+                // 普通字符串
+                auto expr = makeNode<StringLiteralExpr>();
+                expr->value = strValue;
+                return expr;
+            }
+            // 字符串插值：拆分为片段
+            auto interpExpr = makeNode<InterpolatedStringExpr>();
+            size_t pos = 0;
+            while (pos < strValue.size()) {
+                size_t found = strValue.find("\\(", pos);
+                if (found == std::string::npos) {
+                    // 剩余部分是字面文本
+                    InterpolatedStringExpr::Segment seg;
+                    seg.literalText = strValue.substr(pos);
+                    interpExpr->segments.push_back(std::move(seg));
+                    break;
+                }
+                // \( 之前的字面文本
+                if (found > pos) {
+                    InterpolatedStringExpr::Segment seg;
+                    seg.literalText = strValue.substr(pos, found - pos);
+                    interpExpr->segments.push_back(std::move(seg));
+                }
+                // 解析 \(expr) 中的表达式
+                // 查找匹配的 )
+                size_t exprStart = found + 2;
+                int depth = 1;
+                size_t exprEnd = exprStart;
+                while (exprEnd < strValue.size() && depth > 0) {
+                    if (strValue[exprEnd] == '(') depth++;
+                    else if (strValue[exprEnd] == ')') depth--;
+                    if (depth > 0) exprEnd++;
+                }
+                std::string exprStr = strValue.substr(exprStart, exprEnd - exprStart);
+                // 创建临时词法分析器解析表达式
+                DiagnosticEngine tempDiag;
+                Lexer tempLexer(exprStr, "interpolation", tempDiag);
+                auto tempTokens = tempLexer.lexAll();
+                Parser tempParser(std::move(tempTokens), exprStr, "interpolation", tempDiag);
+                auto parsedExpr = tempParser.parseExpression();
+                InterpolatedStringExpr::Segment seg;
+                seg.expression = std::move(parsedExpr);
+                interpExpr->segments.push_back(std::move(seg));
+                pos = exprEnd + 1;
+            }
+            return interpExpr;
         }
         case TokenKind::CharLiteral: {
             auto expr = makeNode<CharLiteralExpr>();
