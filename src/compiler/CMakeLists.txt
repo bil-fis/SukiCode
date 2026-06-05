@@ -20,6 +20,7 @@ add_library(sukicompiler STATIC
     # IR Generation
     codegen/IRGenerator.cpp
     codegen/TypeConverter.cpp
+    codegen/ObjectEmitter.cpp
     # Diagnostics
     diag/Diagnostic.cpp
     # Utilities

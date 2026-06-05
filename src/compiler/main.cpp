@@ -29,6 +29,7 @@
 #include "compiler/ast/ASTPrinter.h"
 #include "compiler/sema/Sema.h"
 #include "compiler/codegen/IRGenerator.h"
+#include "compiler/codegen/ObjectEmitter.h"
 #include "compiler/diag/Diagnostic.h"
 
 #include <iostream>
@@ -285,30 +286,86 @@ int main(int argc, char* argv[]) {
 
     // ─── Phase 5: Object code generation (requires LLVM) ──────────────────
 #ifdef SUKI_HAS_LLVM
-    if (opts.verbose) std::cerr << "sukic: generating object code...\n";
-    // TODO: use LLVM MC layer to emit .o file
-    // TODO: use LLD to link
-#endif
+    suki::ObjectEmitter::initializeTargets();
 
-    // For now, just print a success message
-    if (opts.verbose) {
-        std::cerr << "sukic: compilation successful\n";
+    // 确定输出路径 / Determine output path
+    std::string outputPath;
+    if (!opts.outputFile.empty()) {
+        outputPath = opts.outputFile;
+    } else {
+        outputPath = moduleName + ".o";
     }
 
-    // Output LLVM IR to file if requested
+    // 输出汇编文件 / Emit assembly
+    if (opts.emitAssembly) {
+        std::string asmPath = outputPath;
+        if (asmPath.substr(asmPath.size() - 2) != ".s") {
+            asmPath = moduleName + ".s";
+        }
+        if (opts.verbose) std::cerr << "sukic: emitting assembly to " << asmPath << "\n";
+        auto llvmModule = codegen.releaseModule();
+        suki::ObjectEmitter emitter;
+        if (!emitter.emitAssembly(*llvmModule, asmPath, opts.target)) {
+            diag.printAll(source, opts.inputFile);
+            return 1;
+        }
+        std::cerr << "sukic: assembly written to " << asmPath << "\n";
+        return 0;
+    }
+
+    // 输出目标文件 / Emit object file
+    if (opts.compileOnly || outputPath.substr(outputPath.size() - 2) == ".o" ||
+        outputPath.substr(outputPath.size() - 4) == ".obj") {
+        if (opts.verbose) std::cerr << "sukic: emitting object file to " << outputPath << "\n";
+        auto llvmModule = codegen.releaseModule();
+        suki::ObjectEmitter emitter;
+        if (!emitter.emitObjectFile(*llvmModule, outputPath, opts.target)) {
+            diag.printAll(source, opts.inputFile);
+            return 1;
+        }
+        std::cerr << "sukic: object file written to " << outputPath << "\n";
+        return 0;
+    }
+
+    // 链接可执行文件 / Link executable
+    {
+        // 先输出临时 .obj 文件
+        std::string objPath = outputPath + ".obj";
+        if (opts.verbose) std::cerr << "sukic: generating object file...\n";
+        auto llvmModule = codegen.releaseModule();
+        suki::ObjectEmitter emitter;
+        if (!emitter.emitObjectFile(*llvmModule, objPath, opts.target)) {
+            diag.printAll(source, opts.inputFile);
+            return 1;
+        }
+
+        // 链接
+        if (opts.verbose) std::cerr << "sukic: linking " << outputPath << "...\n";
+        std::vector<std::string> objFiles = {objPath};
+        if (!suki::ObjectEmitter::linkExecutable(objFiles, outputPath, opts.target)) {
+            std::cerr << "sukic: linking failed\n";
+            return 1;
+        }
+
+        // 清理临时 .o 文件 / Cleanup temporary .o file
+        std::remove(objPath.c_str());
+
+        std::cerr << "sukic: executable written to " << outputPath << "\n";
+        return 0;
+    }
+#else
+    // 无 LLVM 后端 / No LLVM backend
+    if (opts.verbose) {
+        std::cerr << "sukic: compilation successful (no LLVM backend)\n";
+    }
     if (!opts.outputFile.empty() && opts.emitLLVM) {
         std::ofstream out(opts.outputFile);
         out << codegen.getIRString();
     }
-
-    // Print diagnostics
     if (diag.hadErrors()) {
         diag.printAll(source, opts.inputFile);
         return 1;
     }
-
-    std::cerr << "sukic: compilation complete (full backend not yet implemented)\n";
-    std::cerr << "       Use --emit-llvm to output LLVM IR, --emit-ast for AST dump\n";
-
     return 0;
+#endif
 }
