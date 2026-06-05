@@ -64,6 +64,10 @@ private:
     Token makeToken(TokenKind kind, uint32_t startPos);
     Token makeErrorToken(std::string_view message, uint32_t startPos);
 
+    // ─── Conditional compilation ───────────────────────────────────────────
+    bool evaluateCondition(); // 评估 #if 条件
+    void skipUntilHashEnd();  // 跳过到 #endif
+
     // ─── State ────────────────────────────────────────────────────────────
     std::string_view source_;
     std::string_view filename_;
@@ -71,6 +75,7 @@ private:
     uint32_t line_;         // current line (1-based)
     uint32_t lineStart_;    // byte offset of current line start
     DiagnosticEngine& diag_;
+    std::vector<std::string> defines_; // 已定义的编译标志
 };
 
 } // namespace suki

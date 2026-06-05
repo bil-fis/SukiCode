@@ -138,7 +138,34 @@ Token Lexer::scanToken() {
         case ']': return makeToken(TokenKind::RBracket, startPos);
         case ',': return makeToken(TokenKind::Comma, startPos);
         case ';': return makeToken(TokenKind::Semicolon, startPos);
-        case '#': return makeToken(TokenKind::Hash, startPos);
+        case '#': {
+            // 条件编译指令 / Conditional compilation directives
+            // 检查是否是 #if, #else, #endif
+            uint32_t hashPos = startPos;
+            if (peek() == 'i' && peekAt(1) == 'f') {
+                // #if condition
+                advance(); advance(); // skip 'if'
+                skipWhitespace();
+                bool condition = evaluateCondition();
+                if (!condition) {
+                    skipUntilHashEnd();
+                }
+                // 继续扫描下一个 token
+                return next();
+            }
+            if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
+                // #else — 在 #if 块内，跳过到 #endif
+                advance(); advance(); advance(); advance(); // skip 'else'
+                skipUntilHashEnd();
+                return next();
+            }
+            if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' && peekAt(3) == 'i' && peekAt(4) == 'f') {
+                // #endif — 正常跳过
+                advance(); advance(); advance(); advance(); advance(); // skip 'endif'
+                return next();
+            }
+            return makeToken(TokenKind::Hash, hashPos);
+        }
         case '~': return makeToken(TokenKind::Tilde, startPos);
 
         case '.':
@@ -731,6 +758,104 @@ uint32_t Lexer::decodeUTF8() {
     }
 
     return codepoint;
+}
+
+// ─── Conditional compilation ────────────────────────────────────────────
+
+bool Lexer::evaluateCondition() {
+    // 评估 #if 条件
+    // 支持: os(Linux), os(Windows), os(macOS), arch(x86_64), arch(arm64), FLAG, !FLAG
+    skipWhitespace();
+
+    bool negate = false;
+    if (peek() == '!') {
+        negate = true;
+        advance();
+    }
+
+    // 读取条件标识符
+    std::string cond;
+    while (pos_ < source_.size() && (isAlphaNumeric(peek()) || peek() == '_')) {
+        cond += advance();
+    }
+
+    bool result = false;
+
+    // os() 条件
+    if (cond == "os") {
+        if (match('(')) {
+            std::string osName;
+            while (pos_ < source_.size() && peek() != ')') {
+                osName += advance();
+            }
+            match(')');
+#ifdef _WIN32
+            result = (osName == "Windows");
+#elif defined(__APPLE__)
+            result = (osName == "macOS" || osName == "iOS");
+#elif defined(__linux__)
+            result = (osName == "Linux" || osName == "Android");
+#elif defined(__FreeBSD__)
+            result = (osName == "FreeBSD");
+#endif
+        }
+    }
+    // arch() 条件
+    else if (cond == "arch") {
+        if (match('(')) {
+            std::string archName;
+            while (pos_ < source_.size() && peek() != ')') {
+                archName += advance();
+            }
+            match(')');
+#if defined(_M_X64) || defined(__x86_64__)
+            result = (archName == "x86_64");
+#elif defined(_M_ARM64) || defined(__aarch64__)
+            result = (archName == "arm64");
+#elif defined(_M_IX86) || defined(__i386__)
+            result = (archName == "x86");
+#elif defined(__arm__)
+            result = (archName == "arm");
+#endif
+        }
+    }
+    // 自定义标志
+    else {
+        // 检查是否在 defines_ 列表中
+        for (const auto& def : defines_) {
+            if (def == cond) {
+                result = true;
+                break;
+            }
+        }
+    }
+
+    return negate ? !result : result;
+}
+
+void Lexer::skipUntilHashEnd() {
+    // 跳过到匹配的 #endif，处理嵌套 #if
+    int depth = 1;
+    while (pos_ < source_.size() && depth > 0) {
+        // 跳过到行首的 #
+        while (pos_ < source_.size() && peek() != '\n') {
+            advance();
+        }
+        if (peek() == '\n') advance(); // skip newline
+
+        skipWhitespace();
+        if (peek() == '#') {
+            advance(); // skip #
+            if (peek() == 'i' && peekAt(1) == 'f') {
+                depth++;
+                advance(); advance();
+            } else if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' &&
+                       peekAt(3) == 'i' && peekAt(4) == 'f') {
+                depth--;
+                advance(); advance(); advance(); advance(); advance();
+            }
+        }
+    }
 }
 
 } // namespace suki
