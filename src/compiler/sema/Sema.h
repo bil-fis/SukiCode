@@ -9,6 +9,7 @@
 #include "TypeChecker.h"
 #include "Type.h"
 #include <memory>
+#include <unordered_set>
 
 namespace suki {
 
@@ -58,6 +59,7 @@ private:
     std::string currentModule_;
     TypePtr currentReturnType_; // Current function's return type for checking
     std::vector<std::string> importedModules_; // 已导入模块列表
+    std::unordered_set<std::string> movedVariables_; // 已移动的变量集合
 };
 
 } // namespace suki

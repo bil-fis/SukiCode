@@ -602,9 +602,10 @@ TypePtr Sema::inferExprType(Expr& expr) {
                 error(expr.loc, "undeclared identifier '" + id.name + "'");
                 return getErrorType();
             }
-            // 访问控制检查 / Access control check
-            if (!sym->isPublic && currentModule_.empty()) {
-                // 模块内访问，允许
+            // 移动语义检查 / Move semantics check
+            if (movedVariables_.count(id.name) > 0) {
+                error(expr.loc, "variable '" + id.name + "' has been moved and cannot be used");
+                return getErrorType();
             }
             return sym->type;
         }
@@ -726,6 +727,11 @@ TypePtr Sema::inferExprType(Expr& expr) {
         }
         case ExprKind::Move: {
             auto& me = static_cast<MoveExpr&>(expr);
+            // 标记变量为已移动 / Mark variable as moved
+            if (me.subExpr->exprKind == ExprKind::Identifier) {
+                auto& id = static_cast<IdentifierExpr&>(*me.subExpr);
+                movedVariables_.insert(id.name);
+            }
             return inferExprType(*me.subExpr);
         }
         case ExprKind::ArrayLiteral: {
@@ -857,7 +863,14 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
             // 规范要求 T 必须是值类型（struct/enum/基本类型），不能是 class
             auto& o = static_cast<const OwnedTypeRepr&>(tr);
             TypePtr innerType = resolveTypeRepr(*o.inner);
-            // TODO: 检查 innerType 是否为引用类型（class），如果是则报错
+            if (innerType) {
+                // 检查是否为引用类型 / Check if reference type
+                TypeKind kind = innerType->kind();
+                if (kind == TypeKind::Class || kind == TypeKind::Actor) {
+                    error(tr.loc, "Owned<T> cannot be used with class types; "
+                          "use struct, enum, or primitive types instead");
+                }
+            }
             return innerType;
         }
         case TypeReprKind::Self:
