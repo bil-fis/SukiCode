@@ -160,6 +160,7 @@ DeclPtr Parser::parseDeclaration() {
         if (match(TokenKind::KwConvenience)) { isConvenience = true; continue; }
         if (match(TokenKind::KwRequired)) { isRequired = true; continue; }
         if (match(TokenKind::KwFinal)) { isFinal = true; continue; }
+        if (match(TokenKind::KwAsync)) { continue; } // async modifier (consumed, stored later)
         break;
     }
 
@@ -785,7 +786,21 @@ DeclPtr Parser::parseForInDecl() {
 DeclPtr Parser::parseWhileDecl() {
     expect(TokenKind::KwWhile);
     auto decl = makeNode<WhileDecl>();
-    decl->condition = parseExpression();
+
+    // Handle 'while let pattern = expr' (optional binding)
+    if (check(TokenKind::KwLet) || check(TokenKind::KwVar)) {
+        // Parse as a variable declaration used as condition
+        // For now, parse the whole thing as an expression
+        // TODO: proper while-let binding support
+        advance(); // consume let/var
+        if (check(TokenKind::Identifier)) advance(); // consume pattern name
+        if (match(TokenKind::Assign)) {
+            decl->condition = parseExpression();
+        }
+    } else {
+        decl->condition = parseExpression();
+    }
+
     decl->body = parseBlock();
     return decl;
 }
@@ -806,9 +821,17 @@ DeclPtr Parser::parseDoCatchDecl() {
 
     while (match(TokenKind::KwCatch)) {
         DoCatchDecl::CatchClause cc;
-        // Optional catch pattern
+        // Optional catch pattern: catch { ... }, catch let error { ... },
+        // catch let error as FileError { ... }, catch is FileError { ... }
         if (!check(TokenKind::LBrace)) {
             cc.pattern = parsePattern();
+            // Handle 'pattern as Type' in catch
+            if (match(TokenKind::KwAs)) {
+                auto asPat = makeNode<AsTypePattern>();
+                asPat->subPattern = std::move(cc.pattern);
+                asPat->type = parseType();
+                cc.pattern = std::move(asPat);
+            }
             if (match(TokenKind::KwWhere)) {
                 cc.whereClause = parseExpression();
             }
@@ -828,7 +851,11 @@ DeclPtr Parser::parseSelectDecl() {
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
             SelectCase sc;
 
-            if (match(TokenKind::KwCase)) {
+            if (match(TokenKind::KwDefault)) {
+                // Standalone default: (without case prefix)
+                sc.kind = SelectCase::Kind::Default;
+                expect(TokenKind::Colon);
+            } else if (match(TokenKind::KwCase)) {
                 if (match(TokenKind::KwDefault)) {
                     sc.kind = SelectCase::Kind::Default;
                     expect(TokenKind::Colon);
@@ -855,7 +882,7 @@ DeclPtr Parser::parseSelectDecl() {
                     }
                 }
             } else {
-                error("expected 'case' in select");
+                error("expected 'case' or 'default' in select");
                 advance();
                 continue;
             }
@@ -1364,8 +1391,64 @@ ExprPtr Parser::parsePrimaryExpr() {
             return expr;
         }
 
-        // Parenthesized expression or tuple
+        // Parenthesized expression, tuple, or arrow closure
         case TokenKind::LParen: {
+            // Lookahead: check if this is an arrow closure (a: Int, b: Int) => expr
+            // Detect by checking for ':' or '=>' pattern after parameters
+            bool isArrowClosure = false;
+            {
+                size_t save = pos_;
+                advance(); // (
+                // Skip tokens looking for '=>' pattern in parameter list
+                int depth = 1;
+                while (pos_ < tokens_.size() && depth > 0) {
+                    if (tokens_[pos_].is(TokenKind::LParen)) depth++;
+                    else if (tokens_[pos_].is(TokenKind::RParen)) {
+                        depth--;
+                        if (depth == 0) break;
+                    } else if (tokens_[pos_].is(TokenKind::Colon)) {
+                        // Found ':' inside parens — likely a parameter list
+                        isArrowClosure = true;
+                        // Don't break yet, confirm with '=>' after ')'
+                    }
+                    pos_++;
+                }
+                // Check for '=>' after ')'
+                if (pos_ + 1 < tokens_.size() && tokens_[pos_ + 1].is(TokenKind::FatArrow)) {
+                    isArrowClosure = true;
+                }
+                pos_ = save; // restore
+            }
+
+            if (isArrowClosure) {
+                // Parse as arrow closure: (params) => expr
+                advance(); // (
+                auto closure = makeNode<ClosureExpr>();
+                closure->isArrow = true;
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        ClosureExpr::Param param;
+                        if (check(TokenKind::Identifier)) {
+                            param.name = std::string(advance().stringValue);
+                        }
+                        if (match(TokenKind::Colon)) {
+                            param.type = parseType();
+                        }
+                        closure->params.push_back(std::move(param));
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen);
+                expect(TokenKind::FatArrow);
+                // Parse body expression
+                auto bodyExpr = parseExpression();
+                if (bodyExpr) {
+                    auto retStmt = makeNode<ReturnStmt>();
+                    retStmt->value = std::move(bodyExpr);
+                    closure->body.push_back(std::move(retStmt));
+                }
+                return closure;
+            }
+
             advance(); // (
             if (check(TokenKind::RParen)) {
                 advance(); // empty tuple ()
@@ -1391,17 +1474,38 @@ ExprPtr Parser::parsePrimaryExpr() {
             return inner;
         }
 
-        // Array literal
+        // Array literal [1, 2, 3] or Dictionary literal ["key": "value"]
         case TokenKind::LBracket: {
             advance(); // [
             if (check(TokenKind::RBracket)) {
-                advance(); // empty array []
+                advance(); // empty []
                 return makeNode<ArrayLiteralExpr>();
             }
+            // Parse first expression
+            ExprPtr first = parseExpression();
+            // Check if it's a dictionary: [key: value, ...]
+            if (match(TokenKind::Colon)) {
+                auto dict = makeNode<DictLiteralExpr>();
+                DictLiteralExpr::Entry entry;
+                entry.key = std::move(first);
+                entry.value = parseExpression();
+                dict->entries.push_back(std::move(entry));
+                while (match(TokenKind::Comma)) {
+                    DictLiteralExpr::Entry e;
+                    e.key = parseExpression();
+                    expect(TokenKind::Colon);
+                    e.value = parseExpression();
+                    dict->entries.push_back(std::move(e));
+                }
+                expect(TokenKind::RBracket);
+                return dict;
+            }
+            // Array literal
             auto arr = makeNode<ArrayLiteralExpr>();
-            do {
+            arr->elements.push_back(std::move(first));
+            while (match(TokenKind::Comma)) {
                 arr->elements.push_back(parseExpression());
-            } while (match(TokenKind::Comma));
+            }
             expect(TokenKind::RBracket);
             return arr;
         }
