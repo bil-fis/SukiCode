@@ -17,9 +17,14 @@ bool Type::isReferenceType() const {
 
 bool Type::canImplicitlyConvertTo(const Type& target) const {
     if (equals(target)) return true;
+    // Any 类型接受所有类型 / Any type accepts all types
+    if (target.kind_ == TypeKind::Any) return true;
+    // 数值类型隐式转换 / Numeric type implicit conversion
     if (kind_ == TypeKind::Int && target.kind_ == TypeKind::Double) return true;
     if (kind_ == TypeKind::Int && target.kind_ == TypeKind::Float) return true;
     if (kind_ == TypeKind::Float && target.kind_ == TypeKind::Double) return true;
+    // 整数字面量可以到任何整数类型 / Integer literals can go to any integer type
+    if (kind_ == TypeKind::Int && target.kind_ == TypeKind::Int) return true;
     return false;
 }
 

@@ -28,6 +28,11 @@ add_library(sukicompiler STATIC
 
 target_include_directories(sukicompiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+# MSVC UTF-8 support for Chinese comments
+if(MSVC)
+    target_compile_options(sukicompiler PRIVATE /utf-8)
+endif()
+
 # LLVM integration
 if(LLVM_FOUND)
     target_include_directories(sukicompiler PUBLIC ${LLVM_INCLUDE_DIRS})
