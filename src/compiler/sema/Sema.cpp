@@ -164,6 +164,88 @@ void Sema::processDecl(Decl& decl) {
             symbols_.define(sym);
             break;
         }
+        case DeclKind::While: {
+            auto& w = static_cast<WhileDecl&>(decl);
+            typeChecker_.enterLoop();
+            if (w.condition) inferExprType(*w.condition);
+            symbols_.enterScope();
+            for (auto& s : w.body) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            typeChecker_.leaveLoop();
+            break;
+        }
+        case DeclKind::ForIn: {
+            auto& f = static_cast<ForInDecl&>(decl);
+            typeChecker_.enterLoop();
+            if (f.sequence) inferExprType(*f.sequence);
+            symbols_.enterScope();
+            for (auto& s : f.body) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            typeChecker_.leaveLoop();
+            break;
+        }
+        case DeclKind::RepeatWhile: {
+            auto& r = static_cast<RepeatWhileDecl&>(decl);
+            typeChecker_.enterLoop();
+            symbols_.enterScope();
+            for (auto& s : r.body) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            if (r.condition) inferExprType(*r.condition);
+            typeChecker_.leaveLoop();
+            break;
+        }
+        case DeclKind::Switch: {
+            auto& sw = static_cast<SwitchDecl&>(decl);
+            typeChecker_.enterSwitch();
+            if (sw.subject) inferExprType(*sw.subject);
+            for (auto& c : sw.cases) {
+                symbols_.enterScope();
+                for (auto& s : c.body) { if (s) processStmt(*s); }
+                symbols_.leaveScope();
+            }
+            typeChecker_.leaveSwitch();
+            break;
+        }
+        case DeclKind::DoCatch: {
+            auto& dc = static_cast<DoCatchDecl&>(decl);
+            symbols_.enterScope();
+            for (auto& s : dc.doBody) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            for (auto& c : dc.catches) {
+                symbols_.enterScope();
+                for (auto& s : c.body) { if (s) processStmt(*s); }
+                symbols_.leaveScope();
+            }
+            break;
+        }
+        case DeclKind::If: {
+            auto& ifDecl = static_cast<IfDecl&>(decl);
+            if (ifDecl.condition) inferExprType(*ifDecl.condition);
+            symbols_.enterScope();
+            for (auto& s : ifDecl.thenBody) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            symbols_.enterScope();
+            for (auto& s : ifDecl.elseBody) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            break;
+        }
+        case DeclKind::Guard: {
+            auto& g = static_cast<GuardDecl&>(decl);
+            if (g.condition) inferExprType(*g.condition);
+            symbols_.enterScope();
+            for (auto& s : g.elseBody) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            break;
+        }
+        case DeclKind::Unsafe: {
+            auto& u = static_cast<UnsafeDecl&>(decl);
+            typeChecker_.enterUnsafe();
+            symbols_.enterScope();
+            for (auto& s : u.body) { if (s) processStmt(*s); }
+            symbols_.leaveScope();
+            typeChecker_.leaveUnsafe();
+            break;
+        }
         default: break;
     }
 }
@@ -335,6 +417,26 @@ void Sema::processStmt(Stmt& stmt) {
             break;
         case StmtKind::Return:
             processReturnStmt(static_cast<ReturnStmt&>(stmt));
+            break;
+        case StmtKind::Break:
+            if (!typeChecker_.isInLoop() && !typeChecker_.isInSwitch()) {
+                error(stmt.loc, "'break' must be inside a loop or switch");
+            }
+            break;
+        case StmtKind::Continue:
+            if (!typeChecker_.isInLoop()) {
+                error(stmt.loc, "'continue' must be inside a loop");
+            }
+            break;
+        case StmtKind::Fallthrough:
+            if (!typeChecker_.isInSwitch()) {
+                error(stmt.loc, "'fallthrough' must be inside a switch case");
+            }
+            break;
+        case StmtKind::Throw:
+            if (!typeChecker_.isInThrowsFunction()) {
+                error(stmt.loc, "'throw' must be inside a function marked 'throws'");
+            }
             break;
         case StmtKind::VariableDecl: {
             auto& vs = static_cast<VariableDeclStmt&>(stmt);
