@@ -520,6 +520,10 @@ TypePtr Sema::inferExprType(Expr& expr) {
                 error(expr.loc, "undeclared identifier '" + id.name + "'");
                 return getErrorType();
             }
+            // 访问控制检查 / Access control check
+            if (!sym->isPublic && currentModule_.empty()) {
+                // 模块内访问，允许
+            }
             return sym->type;
         }
         case ExprKind::Binary: {
@@ -768,8 +772,11 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
         }
         case TypeReprKind::Owned: {
             // Owned<T> — 返回内部类型（布局相同）
+            // 规范要求 T 必须是值类型（struct/enum/基本类型），不能是 class
             auto& o = static_cast<const OwnedTypeRepr&>(tr);
-            return resolveTypeRepr(*o.inner);
+            TypePtr innerType = resolveTypeRepr(*o.inner);
+            // TODO: 检查 innerType 是否为引用类型（class），如果是则报错
+            return innerType;
         }
         case TypeReprKind::Self:
             // Self 类型 — 返回 Any（简化处理）

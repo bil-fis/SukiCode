@@ -376,7 +376,38 @@ DeclPtr Parser::parseVariableDecl() {
         multiDecls_.push_back(std::move(extra));
     }
 
-    // TODO: parse willSet/didSet blocks
+    // 解析 willSet/didSet 属性观察器 / Parse willSet/didSet property observers
+    if (check(TokenKind::LBrace)) {
+        // 检查是否是 willSet/didSet（而不是计算属性）
+        if (peekAt(1).is(TokenKind::KwWillSet) || peekAt(1).is(TokenKind::KwDidSet)) {
+            advance(); // {
+            while (!check(TokenKind::RBrace) && !isAtEnd()) {
+                if (match(TokenKind::KwWillSet)) {
+                    primary->hasWillSet = true;
+                    // 可选参数名: willSet(newX) { ... }
+                    if (check(TokenKind::LParen)) {
+                        advance(); // (
+                        if (check(TokenKind::Identifier)) advance(); // 参数名
+                        expect(TokenKind::RParen);
+                    }
+                    primary->willSetBody = parseBlock();
+                } else if (match(TokenKind::KwDidSet)) {
+                    primary->hasDidSet = true;
+                    // 可选参数名: didSet(oldX) { ... }
+                    if (check(TokenKind::LParen)) {
+                        advance(); // (
+                        if (check(TokenKind::Identifier)) advance(); // 参数名
+                        expect(TokenKind::RParen);
+                    }
+                    primary->didSetBody = parseBlock();
+                } else {
+                    error("expected 'willSet' or 'didSet' in property observer block");
+                    advance();
+                }
+            }
+            match(TokenKind::RBrace); // }
+        }
+    }
     return primary;
 }
 
