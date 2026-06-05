@@ -385,7 +385,8 @@ TypePtr Sema::inferExprType(Expr& expr) {
         case ExprKind::BoolLiteral:
             return getBoolType();
         case ExprKind::NilLiteral:
-            return nullptr;
+            // nil 的类型需要从上下文推断，返回 Optional<Any> 作为占位符
+            return std::make_shared<OptionalType>(getAnyType());
         case ExprKind::Identifier: {
             auto& id = static_cast<IdentifierExpr&>(expr);
             Symbol* sym = symbols_.lookup(id.name);
@@ -515,10 +516,61 @@ TypePtr Sema::inferExprType(Expr& expr) {
             auto& me = static_cast<MoveExpr&>(expr);
             return inferExprType(*me.subExpr);
         }
-        case ExprKind::ArrayLiteral:
-            return std::make_shared<ArrayType>(getAnyType());
-        case ExprKind::DictLiteral:
-            return std::make_shared<DictType>(getAnyType(), getAnyType());
+        case ExprKind::ArrayLiteral: {
+            auto& arr = static_cast<const ArrayLiteralExpr&>(expr);
+            // 从第一个元素推断类型 / Infer type from first element
+            TypePtr elemType = getAnyType();
+            if (!arr.elements.empty()) {
+                TypePtr firstType = inferExprType(*arr.elements[0]);
+                if (firstType) elemType = firstType;
+            }
+            return std::make_shared<ArrayType>(elemType);
+        }
+        case ExprKind::DictLiteral: {
+            auto& dict = static_cast<const DictLiteralExpr&>(expr);
+            TypePtr keyType = getAnyType();
+            TypePtr valType = getAnyType();
+            if (!dict.entries.empty()) {
+                TypePtr k = inferExprType(*dict.entries[0].key);
+                TypePtr v = inferExprType(*dict.entries[0].value);
+                if (k) keyType = k;
+                if (v) valType = v;
+            }
+            return std::make_shared<DictType>(keyType, valType);
+        }
+        case ExprKind::SetLiteral: {
+            auto& set = static_cast<const SetLiteralExpr&>(expr);
+            TypePtr elemType = getAnyType();
+            if (!set.elements.empty()) {
+                TypePtr firstType = inferExprType(*set.elements[0]);
+                if (firstType) elemType = firstType;
+            }
+            return std::make_shared<SetType>(elemType);
+        }
+        case ExprKind::Tuple: {
+            auto& tuple = static_cast<const TupleExpr&>(expr);
+            std::vector<TupleType::Element> elems;
+            for (const auto& e : tuple.elements) {
+                TupleType::Element te;
+                te.label = e.label;
+                te.type = e.value ? inferExprType(*e.value) : getAnyType();
+                elems.push_back(te);
+            }
+            return std::make_shared<TupleType>(std::move(elems));
+        }
+        case ExprKind::Closure:
+            // 闭包类型需要从上下文推断，返回 nullptr
+            return nullptr;
+        case ExprKind::If: {
+            auto& ifExpr = static_cast<const IfExpr&>(expr);
+            TypePtr thenType = ifExpr.thenExpr ? inferExprType(*ifExpr.thenExpr) : nullptr;
+            TypePtr elseType = ifExpr.elseExpr ? inferExprType(*ifExpr.elseExpr) : nullptr;
+            if (thenType) return thenType;
+            if (elseType) return elseType;
+            return nullptr;
+        }
+        case ExprKind::InterpolatedString:
+            return getStringType();
         default:
             return nullptr;
     }
