@@ -474,6 +474,45 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
             TypePtr ret = f.returnType ? resolveTypeRepr(*f.returnType) : getVoidType();
             return std::make_shared<FunctionType>(params, ret, f.isAsync, f.isThrows);
         }
+        case TypeReprKind::Tuple: {
+            auto& t = static_cast<const TupleTypeRepr&>(tr);
+            std::vector<TupleType::Element> elems;
+            for (const auto& e : t.elements) {
+                TupleType::Element te;
+                te.label = e.label;
+                te.type = resolveTypeRepr(*e.type);
+                elems.push_back(te);
+            }
+            return std::make_shared<TupleType>(std::move(elems));
+        }
+        case TypeReprKind::Composition: {
+            // A & B 组合类型 — 返回第一个协议类型（简化处理）
+            auto& c = static_cast<const CompositionTypeRepr&>(tr);
+            if (!c.protocols.empty()) {
+                return resolveTypeRepr(*c.protocols[0]);
+            }
+            return getAnyType();
+        }
+        case TypeReprKind::Opaque: {
+            // some P 不透明类型 — 返回约束类型
+            auto& o = static_cast<const OpaqueTypeRepr&>(tr);
+            return resolveTypeRepr(*o.constraint);
+        }
+        case TypeReprKind::Existential: {
+            // any P 存在类型 — 返回 Any 类型
+            return getAnyType();
+        }
+        case TypeReprKind::Owned: {
+            // Owned<T> — 返回内部类型（布局相同）
+            auto& o = static_cast<const OwnedTypeRepr&>(tr);
+            return resolveTypeRepr(*o.inner);
+        }
+        case TypeReprKind::Self:
+            // Self 类型 — 返回 Any（简化处理）
+            return getAnyType();
+        case TypeReprKind::Inferred:
+            // _ 推断类型 — 返回 nullptr（让调用者推断）
+            return nullptr;
         default:
             return nullptr;
     }
