@@ -133,15 +133,15 @@ public:
     Condition(const Condition&) = delete;
     Condition& operator=(const Condition&) = delete;
 
-    // 等待 / Wait
-    void wait(Mutex& mutex) {
-        cv_.wait(mutex.native());
+    // 等待 / Wait (需要配合 LockGuard 使用)
+    void wait(std::unique_lock<std::mutex>& lock) {
+        cv_.wait(lock);
     }
 
     // 带谓词等待 / Wait with predicate
     template<typename Pred>
-    void wait(Mutex& mutex, Pred pred) {
-        cv_.wait(mutex.native(), pred);
+    void wait(std::unique_lock<std::mutex>& lock, Pred pred) {
+        cv_.wait(lock, pred);
     }
 
     // 通知一个等待者 / Notify one waiter
