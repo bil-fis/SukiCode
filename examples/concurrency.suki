@@ -1,0 +1,69 @@
+// Concurrency — SukiCode async/await, actors, channels
+
+// Async function
+async func fetchData(from url: String) throws -> String {
+    let data = await httpClient.get(url)
+    return data
+}
+
+// Actor for thread-safe state
+actor Counter {
+    private var value = 0
+
+    func increment() {
+        value += 1
+    }
+
+    func getValue() -> Int {
+        return value
+    }
+}
+
+// Structured concurrency with TaskGroup
+func downloadAll(urls: [String]) async -> [String] {
+    var results: [String] = []
+
+    await withTaskGroup(of: String.self) { group in
+        for url in urls {
+            group.addTask {
+                return await fetchData(from: url)
+            }
+        }
+        for await data in group {
+            results.append(data)
+        }
+    }
+
+    return results
+}
+
+// Channel communication
+async func producerConsumer() {
+    let channel = Channel<Int>(capacity: 10)
+
+    // Producer
+    Task {
+        for i in 0..<100 {
+            await channel.send(i)
+        }
+    }
+
+    // Consumer
+    Task {
+        while let value = await channel.receive() {
+            print("Received: \(value)")
+        }
+    }
+}
+
+// Select statement
+async func selectExample(ch1: Channel<String>, ch2: Channel<Int>) {
+    select {
+    case msg <- ch1:
+        print("Got string: \(msg)")
+    case num <- ch2:
+        print("Got number: \(num)")
+    default:
+        print("No data available")
+    }
+}

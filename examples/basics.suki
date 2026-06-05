@@ -1,0 +1,132 @@
+// Basics — SukiCode language features overview
+
+// Variables and constants
+var mutableVar = 10
+let immutableVal = "hello"
+let inferredType = 3.14
+
+// Functions
+func greet(person name: String, from city: String = "Unknown") -> String {
+    return "Hello \(name) from \(city)"
+}
+
+// Struct
+struct Point {
+    var x, y: Double
+
+    func distance(to other: Point) -> Double {
+        let dx = x - other.x
+        let dy = y - other.y
+        return (dx * dx + dy * dy).squareRoot()
+    }
+}
+
+// Enum with associated values
+enum Result<T, E: Error> {
+    case success(T)
+    case failure(E)
+}
+
+// Class with inheritance
+class Animal {
+    var name: String
+    init(name: String) {
+        self.name = name
+    }
+    func speak() -> String {
+        return "..."
+    }
+}
+
+class Dog: Animal {
+    override func speak() -> String {
+        return "Woof!"
+    }
+}
+
+// Protocol
+protocol Printable {
+    func description() -> String
+}
+
+// Extension
+extension Int {
+    var isEven: Bool {
+        return self % 2 == 0
+    }
+}
+
+// Control flow
+func demonstrateControlFlow() {
+    let value = 42
+
+    if value > 0 {
+        print("positive")
+    } else if value < 0 {
+        print("negative")
+    } else {
+        print("zero")
+    }
+
+    guard value >= 0 else {
+        print("unexpected negative")
+        return
+    }
+
+    switch value {
+    case 0:
+        print("zero")
+    case 1..<10:
+        print("single digit")
+    case 10..<100:
+        print("double digit")
+    default:
+        print("large number")
+    }
+
+    for i in 0..<10 {
+        print(i)
+    }
+
+    var count = 0
+    while count < 5 {
+        count += 1
+    }
+}
+
+// Collections
+let array = [1, 2, 3, 4, 5]
+let dict = ["key": "value", "name": "SukiCode"]
+let set: Set<Int> = {1, 2, 3}
+
+// Closures
+let add = { (a: Int, b: Int) -> Int in
+    return a + b
+}
+let multiply = (a: Int, b: Int) => a * b
+
+// Optional chaining
+var middleName: String? = nil
+let uppercased = middleName?.uppercased()
+
+// Error handling
+enum FileError: Error {
+    case notFound(path: String)
+    case permissionDenied
+}
+
+func readFile(path: String) throws -> String {
+    if path.isEmpty {
+        throw FileError.notFound(path: path)
+    }
+    return "file contents"
+}
+
+do {
+    let content = try readFile(path: "/tmp/data")
+    print(content)
+} catch let error as FileError {
+    print("File error: \(error)")
+} catch {
+    print("Unknown error")
+}

@@ -1,0 +1,45 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+.cache/
+
+# Claude session memory (not for version control)
+MEMORY.md
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# Compiled
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# LLVM/Clang generated
+*.bc
+*.ll
+*.s
+
+# Test output
+Testing/
+CTestTestfile.cmake
+
+# Package manager cache
+.build/
+Package.resolved
+
+# OS
+.DS_Store
+Thumbs.db

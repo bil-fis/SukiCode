@@ -1,0 +1,7 @@
+// Hello World — SukiCode example
+// Demonstrates the minimal SukiCode program.
+
+@main
+func main() {
+    print("Hello, SukiCode!")
+}

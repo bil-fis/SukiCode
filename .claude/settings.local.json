@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSUKICODE_USE_SYSTEM_LLVM=OFF)",
+      "Bash(where cmake *)",
+      "Read(//c/Program Files/Microsoft Visual Studio/**)",
+      "Read(//c/Program Files/CMake/bin/**)",
+      "Bash(cmake --build build)",
+      "Bash(./bin/test_lexer.exe)",
+      "Bash(./build/bin/test_lexer.exe)",
+      "Bash(python3 -c ' *)",
+      "Bash(./build/bin/test_parser.exe)",
+      "Bash(./build/bin/sukic --emit-ast examples/hello_world.suki)",
+      "Bash(./build/bin/sukic --emit-llvm examples/hello_world.suki)",
+      "Bash(./build/bin/sukic --emit-ast examples/basics.suki)",
+      "Bash(ctest --output-on-failure)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git rm *)",
+      "Bash(rm -f SukiCode.cpp SukiCode.h)",
+      "Bash(git commit -m 'feat: SukiCode 编译器初始实现 \\(Phase 0+1\\) *)"
+    ]
+  }
+}

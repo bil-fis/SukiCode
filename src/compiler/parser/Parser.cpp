@@ -1,0 +1,1746 @@
+// SukiCode recursive descent parser implementation.
+// Parses tokens into an AST. Handles all SukiCode syntax including
+// expressions, statements, declarations, types, and patterns.
+
+#include "Parser.h"
+#include <cassert>
+
+namespace suki {
+
+Parser::Parser(std::vector<Token> tokens, std::string_view source,
+               std::string_view filename, DiagnosticEngine& diag)
+    : tokens_(std::move(tokens)), pos_(0), source_(source),
+      filename_(filename), diag_(diag) {}
+
+// ─── Token navigation ─────────────────────────────────────────────────────
+
+const Token& Parser::peek() const {
+    if (pos_ >= tokens_.size()) return tokens_.back(); // Eof
+    return tokens_[pos_];
+}
+
+const Token& Parser::peekAt(size_t offset) const {
+    size_t idx = pos_ + offset;
+    if (idx >= tokens_.size()) return tokens_.back();
+    return tokens_[idx];
+}
+
+const Token& Parser::advance() {
+    const Token& tok = peek();
+    if (pos_ < tokens_.size() - 1) pos_++;
+    return tok;
+}
+
+bool Parser::check(TokenKind kind) const {
+    return peek().is(kind);
+}
+
+bool Parser::match(TokenKind kind) {
+    if (check(kind)) {
+        advance();
+        return true;
+    }
+    return false;
+}
+
+bool Parser::expect(TokenKind kind) {
+    if (check(kind)) {
+        advance();
+        return true;
+    }
+    std::string msg = "expected ";
+    msg += Token::kindName(kind);
+    msg += ", got ";
+    msg += Token::kindName(peek().kind);
+    error(msg);
+    return false;
+}
+
+bool Parser::isAtEnd() const {
+    return check(TokenKind::Eof);
+}
+
+SourceLocation Parser::loc() const {
+    return peek().loc;
+}
+
+void Parser::error(std::string_view message) {
+    diag_.error(loc(), filename_, message);
+}
+
+void Parser::synchronize() {
+    // Skip tokens until we find a statement boundary
+    while (!isAtEnd()) {
+        if (peek().is(TokenKind::Semicolon)) {
+            advance();
+            return;
+        }
+        // Check for tokens that typically start a new statement
+        if (peek().isOneOf({
+            TokenKind::KwFunc, TokenKind::KwLet, TokenKind::KwVar,
+            TokenKind::KwReturn, TokenKind::KwIf, TokenKind::KwFor,
+            TokenKind::KwWhile, TokenKind::KwSwitch, TokenKind::KwClass,
+            TokenKind::KwStruct, TokenKind::KwEnum, TokenKind::KwProtocol,
+            TokenKind::KwImport, TokenKind::KwModule,
+        })) {
+            return;
+        }
+        advance();
+    }
+}
+
+// ─── Top-level parsing ────────────────────────────────────────────────────
+
+std::unique_ptr<CompilationUnit> Parser::parse() {
+    auto cu = makeNode<CompilationUnit>();
+    cu->filename = std::string(filename_);
+
+    // Optional module declaration
+    if (match(TokenKind::KwModule)) {
+        auto mod = makeNode<ModuleDecl>();
+        if (check(TokenKind::Identifier)) {
+            mod->name = std::string(advance().stringValue);
+        } else {
+            error("expected module name after 'module'");
+        }
+        // Semicolons are optional (spec says no semicolons, but allow for module line)
+        match(TokenKind::Semicolon);
+        cu->moduleDecl = mod.get();
+        cu->declarations.push_back(std::move(mod));
+    }
+
+    // Parse declarations
+    while (!isAtEnd()) {
+        try {
+            auto decl = parseDeclaration();
+            if (decl) {
+                cu->declarations.push_back(std::move(decl));
+            }
+        } catch (...) {
+            synchronize();
+        }
+    }
+
+    return cu;
+}
+
+// ─── Declaration parsing ──────────────────────────────────────────────────
+
+DeclPtr Parser::parseDeclaration() {
+    // Check for attributes
+    // (Attributes are parsed inline where needed for now)
+
+    // Access level modifiers
+    AccessLevel access = AccessLevel::Internal;
+    bool isStatic = false;
+
+    // Parse access modifiers
+    while (true) {
+        if (match(TokenKind::KwPublic)) { access = AccessLevel::Public; continue; }
+        if (match(TokenKind::KwInternal)) { access = AccessLevel::Internal; continue; }
+        if (match(TokenKind::KwFileprivate)) { access = AccessLevel::FilePrivate; continue; }
+        if (match(TokenKind::KwPrivate)) { access = AccessLevel::Private; continue; }
+        if (match(TokenKind::KwOpen)) { access = AccessLevel::Open; continue; }
+        if (match(TokenKind::KwStatic)) { isStatic = true; continue; }
+        break;
+    }
+
+    DeclPtr decl;
+
+    switch (peek().kind) {
+        case TokenKind::KwModule:    decl = parseModuleDecl(); break;
+        case TokenKind::KwImport:    decl = parseImportDecl(); break;
+        case TokenKind::KwLet:
+        case TokenKind::KwVar:       decl = parseVariableDecl(); break;
+        case TokenKind::KwFunc:      decl = parseFunctionDecl(); break;
+        case TokenKind::KwStruct:    decl = parseStructDecl(); break;
+        case TokenKind::KwClass:     decl = parseClassDecl(); break;
+        case TokenKind::KwEnum:      decl = parseEnumDecl(); break;
+        case TokenKind::KwProtocol:  decl = parseProtocolDecl(); break;
+        case TokenKind::KwActor:     decl = parseActorDecl(); break;
+        case TokenKind::KwExtension: decl = parseExtensionDecl(); break;
+        case TokenKind::KwTypealias: decl = parseTypealiasDecl(); break;
+        case TokenKind::KwInit:      decl = parseInitDecl(); break;
+        case TokenKind::KwDeinit:    decl = parseDeinitDecl(); break;
+        case TokenKind::KwSubscript: decl = parseSubscriptDecl(); break;
+
+        // Control flow
+        case TokenKind::KwIf:        decl = parseIfDecl(); break;
+        case TokenKind::KwGuard:     decl = parseGuardDecl(); break;
+        case TokenKind::KwSwitch:    decl = parseSwitchDecl(); break;
+        case TokenKind::KwFor:       decl = parseForInDecl(); break;
+        case TokenKind::KwWhile:     decl = parseWhileDecl(); break;
+        case TokenKind::KwRepeat:    decl = parseRepeatWhileDecl(); break;
+        case TokenKind::KwDo:        decl = parseDoCatchDecl(); break;
+        case TokenKind::KwSelect:    decl = parseSelectDecl(); break;
+        case TokenKind::KwUnsafe:    decl = parseUnsafeDecl(); break;
+
+        // Attributes
+        case TokenKind::AtMain:
+        case TokenKind::AtCImport:
+        case TokenKind::AtCDecl:
+        case TokenKind::AtMacro:
+        case TokenKind::AtTest:
+        case TokenKind::AtEnumC:
+        case TokenKind::AtNoMangle:
+        case TokenKind::AtPanicHandler:
+        case TokenKind::AtAttribute: {
+            // For now, skip attributes and parse the following declaration
+            advance(); // consume attribute
+            // TODO: store attributes on the declaration
+            return parseDeclaration();
+        }
+
+        default: {
+            // Try to parse as expression statement
+            ExprPtr expr = parseExpression();
+            if (expr) {
+                auto stmt = makeNode<ExpressionStmt>();
+                stmt->expression = std::move(expr);
+                // Wrap in a declaration for top-level
+                // For now, return as expression statement wrapped in a Decl
+                // TODO: proper statement/declaration distinction at top level
+                error("unexpected expression at top level");
+            } else {
+                error("expected declaration");
+                advance(); // skip unknown token
+            }
+            return nullptr;
+        }
+    }
+
+    if (decl) {
+        decl->access = access;
+        decl->isStatic = isStatic;
+    }
+    return decl;
+}
+
+// ─── Module / Import ──────────────────────────────────────────────────────
+
+DeclPtr Parser::parseModuleDecl() {
+    expect(TokenKind::KwModule);
+    auto decl = makeNode<ModuleDecl>();
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected module name");
+    }
+    match(TokenKind::Semicolon);
+    return decl;
+}
+
+DeclPtr Parser::parseImportDecl() {
+    expect(TokenKind::KwImport);
+    auto decl = makeNode<ImportDecl>();
+    if (check(TokenKind::Identifier)) {
+        decl->moduleName = std::string(advance().stringValue);
+    } else {
+        error("expected module name after 'import'");
+    }
+    match(TokenKind::Semicolon);
+    return decl;
+}
+
+// ─── Variable declaration ─────────────────────────────────────────────────
+
+DeclPtr Parser::parseVariableDecl() {
+    auto decl = makeNode<VariableDecl>();
+    decl->isLet = peek().is(TokenKind::KwLet);
+    advance(); // consume let/var
+
+    // Parse the binding pattern (simple identifier for now)
+    if (check(TokenKind::Identifier)) {
+        auto pat = makeNode<IdentifierPattern>();
+        pat->name = std::string(advance().stringValue);
+        pat->isLet = decl->isLet;
+        decl->pattern = std::move(pat);
+    } else if (match(TokenKind::Underscore)) {
+        auto pat = makeNode<WildcardPattern>();
+        decl->pattern = std::move(pat);
+    } else {
+        error("expected variable name");
+    }
+
+    // Optional type annotation
+    if (match(TokenKind::Colon)) {
+        decl->typeAnnotation = parseType();
+    }
+
+    // Optional initializer
+    if (match(TokenKind::Assign)) {
+        decl->initializer = parseExpression();
+    }
+
+    // TODO: parse willSet/didSet blocks
+    return decl;
+}
+
+// ─── Function declaration ─────────────────────────────────────────────────
+
+DeclPtr Parser::parseFunctionDecl() {
+    expect(TokenKind::KwFunc);
+    auto decl = makeNode<FunctionDecl>();
+
+    // Function name (or operator for operator functions)
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else if (check(TokenKind::KwInit)) {
+        decl->name = "init";
+        advance();
+    } else {
+        error("expected function name");
+    }
+
+    // Generic parameters
+    if (check(TokenKind::Less)) {
+        decl->genericParams = parseGenericParams();
+    }
+
+    // Parameter list
+    if (expect(TokenKind::LParen)) {
+        decl->params = parseParamList();
+        expect(TokenKind::RParen);
+    }
+
+    // async/throws
+    while (true) {
+        if (match(TokenKind::KwAsync)) { decl->isAsync = true; continue; }
+        if (match(TokenKind::KwThrows)) { decl->isThrows = true; continue; }
+        break;
+    }
+
+    // Return type
+    if (match(TokenKind::Arrow)) {
+        decl->returnType = parseType();
+    }
+
+    // Body (optional for protocol requirements)
+    if (check(TokenKind::LBrace)) {
+        decl->body = parseBlock();
+    }
+
+    return decl;
+}
+
+// ─── Type declarations ────────────────────────────────────────────────────
+
+DeclPtr Parser::parseStructDecl() {
+    expect(TokenKind::KwStruct);
+    auto decl = makeNode<StructDecl>();
+
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected struct name");
+    }
+
+    if (check(TokenKind::Less)) {
+        decl->genericParams = parseGenericParams();
+    }
+
+    // Conformances: struct Foo: Protocol1, Protocol2
+    if (match(TokenKind::Colon)) {
+        do {
+            decl->conformsTo.push_back(parseType());
+        } while (match(TokenKind::Comma));
+    }
+
+    // Body
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            auto member = parseDeclaration();
+            if (member) decl->members.push_back(std::move(member));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseClassDecl() {
+    expect(TokenKind::KwClass);
+    auto decl = makeNode<ClassDecl>();
+
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected class name");
+    }
+
+    if (check(TokenKind::Less)) {
+        decl->genericParams = parseGenericParams();
+    }
+
+    // Superclass and/or protocol conformances
+    if (match(TokenKind::Colon)) {
+        // First type is the superclass (classes have single inheritance)
+        auto firstType = parseType();
+        decl->superclass = std::move(firstType);
+        // Additional conformances
+        while (match(TokenKind::Comma)) {
+            decl->conformsTo.push_back(parseType());
+        }
+    }
+
+    // Body
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            auto member = parseDeclaration();
+            if (member) decl->members.push_back(std::move(member));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseEnumDecl() {
+    expect(TokenKind::KwEnum);
+    auto decl = makeNode<EnumDecl>();
+
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected enum name");
+    }
+
+    if (check(TokenKind::Less)) {
+        decl->genericParams = parseGenericParams();
+    }
+
+    // Raw value type: enum Foo: Int
+    if (match(TokenKind::Colon)) {
+        decl->rawValueType = parseType();
+    }
+
+    // Body
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            if (match(TokenKind::KwCase)) {
+                auto enumCase = makeNode<EnumCaseDecl>();
+                if (check(TokenKind::Identifier)) {
+                    enumCase->name = std::string(advance().stringValue);
+                } else {
+                    error("expected case name");
+                }
+
+                // Associated values: case foo(Int, String)
+                if (check(TokenKind::LParen)) {
+                    advance(); // (
+                    do {
+                        EnumCaseDecl::AssociatedValue av;
+                        if (check(TokenKind::Identifier)) {
+                            // Check if next is ':' (labeled) or type (unlabeled)
+                            auto& next = peekAt(1);
+                            if (next.is(TokenKind::Colon)) {
+                                av.label = std::string(advance().stringValue);
+                                advance(); // :
+                            }
+                        }
+                        av.type = parseType();
+                        enumCase->associatedValues.push_back(std::move(av));
+                    } while (match(TokenKind::Comma));
+                    expect(TokenKind::RParen);
+                }
+
+                // Raw value: case foo = 42
+                if (match(TokenKind::Assign)) {
+                    enumCase->rawValue = parseExpression();
+                }
+
+                decl->cases.push_back(std::move(enumCase));
+            } else {
+                auto member = parseDeclaration();
+                if (member) decl->members.push_back(std::move(member));
+            }
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseProtocolDecl() {
+    expect(TokenKind::KwProtocol);
+    auto decl = makeNode<ProtocolDecl>();
+
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected protocol name");
+    }
+
+    // Inheritance: protocol Foo: Bar, Baz
+    if (match(TokenKind::Colon)) {
+        do {
+            decl->conformsTo.push_back(parseType());
+        } while (match(TokenKind::Comma));
+    }
+
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            auto member = parseDeclaration();
+            if (member) decl->members.push_back(std::move(member));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseActorDecl() {
+    expect(TokenKind::KwActor);
+    auto decl = makeNode<ActorDecl>();
+
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected actor name");
+    }
+
+    if (check(TokenKind::Less)) {
+        decl->genericParams = parseGenericParams();
+    }
+
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            auto member = parseDeclaration();
+            if (member) decl->members.push_back(std::move(member));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseExtensionDecl() {
+    expect(TokenKind::KwExtension);
+    auto decl = makeNode<ExtensionDecl>();
+
+    decl->extendedType = parseType();
+
+    if (match(TokenKind::Colon)) {
+        do {
+            decl->conformsTo.push_back(parseType());
+        } while (match(TokenKind::Comma));
+    }
+
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            auto member = parseDeclaration();
+            if (member) decl->members.push_back(std::move(member));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseTypealiasDecl() {
+    expect(TokenKind::KwTypealias);
+    auto decl = makeNode<TypealiasDecl>();
+
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected typealias name");
+    }
+
+    if (check(TokenKind::Less)) {
+        decl->genericParams = parseGenericParams();
+    }
+
+    expect(TokenKind::Assign);
+    decl->underlyingType = parseType();
+
+    return decl;
+}
+
+DeclPtr Parser::parseInitDecl() {
+    expect(TokenKind::KwInit);
+    auto decl = makeNode<InitDecl>();
+
+    if (expect(TokenKind::LParen)) {
+        decl->params = parseParamList();
+        expect(TokenKind::RParen);
+    }
+
+    if (check(TokenKind::LBrace)) {
+        decl->body = parseBlock();
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseDeinitDecl() {
+    expect(TokenKind::KwDeinit);
+    auto decl = makeNode<DeinitDecl>();
+
+    if (check(TokenKind::LBrace)) {
+        decl->body = parseBlock();
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseSubscriptDecl() {
+    expect(TokenKind::KwSubscript);
+    auto decl = makeNode<SubscriptDecl>();
+
+    if (expect(TokenKind::LParen)) {
+        decl->params = parseParamList();
+        expect(TokenKind::RParen);
+    }
+
+    if (match(TokenKind::Arrow)) {
+        decl->returnType = parseType();
+    }
+
+    // Body: get/set or single expression
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            if (match(TokenKind::KwGet)) {
+                decl->getterBody = parseBlock();
+            } else if (match(TokenKind::KwSet)) {
+                decl->setterBody = parseBlock();
+            } else {
+                error("expected 'get' or 'set' in subscript");
+                advance();
+            }
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+// ─── Control flow declarations ────────────────────────────────────────────
+
+DeclPtr Parser::parseIfDecl() {
+    expect(TokenKind::KwIf);
+    auto decl = makeNode<IfDecl>();
+    decl->condition = parseExpression();
+    decl->thenBody = parseBlock();
+
+    if (match(TokenKind::KwElse)) {
+        if (check(TokenKind::KwIf)) {
+            // else if — store as nested IfDecl
+            decl->elseIfDecl = parseIfDecl();
+        } else {
+            decl->elseBody = parseBlock();
+        }
+    }
+    return decl;
+}
+
+DeclPtr Parser::parseGuardDecl() {
+    expect(TokenKind::KwGuard);
+    auto decl = makeNode<GuardDecl>();
+    decl->condition = parseExpression();
+    expect(TokenKind::KwElse);
+    decl->elseBody = parseBlock();
+    return decl;
+}
+
+DeclPtr Parser::parseSwitchDecl() {
+    expect(TokenKind::KwSwitch);
+    auto decl = makeNode<SwitchDecl>();
+    decl->subject = parseExpression();
+
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            SwitchCase sc;
+
+            if (match(TokenKind::KwCase)) {
+                // Parse case labels
+                do {
+                    SwitchCase::Label label;
+                    // Try to parse as pattern first, fall back to expression
+                    label.expression = parseExpression();
+                    sc.labels.push_back(std::move(label));
+                } while (match(TokenKind::Comma));
+            } else if (match(TokenKind::KwDefault)) {
+                SwitchCase::Label label;
+                label.isDefault = true;
+                sc.labels.push_back(std::move(label));
+            } else {
+                error("expected 'case' or 'default' in switch");
+                advance();
+                continue;
+            }
+
+            expect(TokenKind::Colon);
+
+            // Parse case body (until next case/default/})
+            while (!check(TokenKind::KwCase) && !check(TokenKind::KwDefault) &&
+                   !check(TokenKind::RBrace) && !isAtEnd()) {
+                auto stmt = parseStatement();
+                if (stmt) sc.body.push_back(std::move(stmt));
+            }
+
+            // Check for fallthrough
+            if (!sc.body.empty()) {
+                auto& lastStmt = sc.body.back();
+                if (lastStmt && lastStmt->stmtKind == StmtKind::Fallthrough) {
+                    sc.isFallthrough = true;
+                }
+            }
+
+            decl->cases.push_back(std::move(sc));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseForInDecl() {
+    expect(TokenKind::KwFor);
+    auto decl = makeNode<ForInDecl>();
+    decl->pattern = parsePattern();
+    expect(TokenKind::KwIn);
+    decl->sequence = parseExpression();
+
+    // Optional where clause
+    if (match(TokenKind::KwWhere)) {
+        decl->whereClause = parseExpression();
+    }
+
+    decl->body = parseBlock();
+    return decl;
+}
+
+DeclPtr Parser::parseWhileDecl() {
+    expect(TokenKind::KwWhile);
+    auto decl = makeNode<WhileDecl>();
+    decl->condition = parseExpression();
+    decl->body = parseBlock();
+    return decl;
+}
+
+DeclPtr Parser::parseRepeatWhileDecl() {
+    expect(TokenKind::KwRepeat);
+    auto decl = makeNode<RepeatWhileDecl>();
+    decl->body = parseBlock();
+    expect(TokenKind::KwWhile);
+    decl->condition = parseExpression();
+    return decl;
+}
+
+DeclPtr Parser::parseDoCatchDecl() {
+    expect(TokenKind::KwDo);
+    auto decl = makeNode<DoCatchDecl>();
+    decl->doBody = parseBlock();
+
+    while (match(TokenKind::KwCatch)) {
+        DoCatchDecl::CatchClause cc;
+        // Optional catch pattern
+        if (!check(TokenKind::LBrace)) {
+            cc.pattern = parsePattern();
+            if (match(TokenKind::KwWhere)) {
+                cc.whereClause = parseExpression();
+            }
+        }
+        cc.body = parseBlock();
+        decl->catches.push_back(std::move(cc));
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseSelectDecl() {
+    expect(TokenKind::KwSelect);
+    auto decl = makeNode<SelectDecl>();
+
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            SelectCase sc;
+
+            if (match(TokenKind::KwCase)) {
+                if (match(TokenKind::KwDefault)) {
+                    sc.kind = SelectCase::Kind::Default;
+                    expect(TokenKind::Colon);
+                } else {
+                    // Check if this is send or receive
+                    // send: case value <- channel
+                    // receive: case let x <- channel (or case x <- channel)
+                    sc.recvPattern = parsePattern();
+                    if (expect(TokenKind::LeftArrow)) {
+                        sc.channel = parseExpression();
+                    }
+                    expect(TokenKind::Colon);
+
+                    // Determine send vs receive by pattern type
+                    if (sc.recvPattern && sc.recvPattern->patternKind == PatternKind::Identifier) {
+                        auto* ip = static_cast<IdentifierPattern*>(sc.recvPattern.get());
+                        if (ip->name.empty()) {
+                            sc.kind = SelectCase::Kind::Send;
+                        } else {
+                            sc.kind = SelectCase::Kind::Receive;
+                        }
+                    } else {
+                        sc.kind = SelectCase::Kind::Receive;
+                    }
+                }
+            } else {
+                error("expected 'case' in select");
+                advance();
+                continue;
+            }
+
+            // Parse case body
+            while (!check(TokenKind::KwCase) && !check(TokenKind::RBrace) && !isAtEnd()) {
+                auto stmt = parseStatement();
+                if (stmt) sc.body.push_back(std::move(stmt));
+            }
+
+            decl->cases.push_back(std::move(sc));
+        }
+        expect(TokenKind::RBrace);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseUnsafeDecl() {
+    expect(TokenKind::KwUnsafe);
+    auto decl = makeNode<UnsafeDecl>();
+    decl->body = parseBlock();
+    return decl;
+}
+
+// ─── Statements ───────────────────────────────────────────────────────────
+
+StmtPtr Parser::parseStatement() {
+    switch (peek().kind) {
+        case TokenKind::KwReturn:   return parseReturnStmt();
+        case TokenKind::KwBreak:    return parseBreakStmt();
+        case TokenKind::KwContinue: return parseContinueStmt();
+        case TokenKind::KwFallthrough: return parseFallthroughStmt();
+        case TokenKind::KwDefer:    return parseDeferStmt();
+        case TokenKind::KwThrow:    return parseThrowStmt();
+        default: {
+            // Try expression statement
+            ExprPtr expr = parseExpression();
+            if (expr) {
+                auto stmt = makeNode<ExpressionStmt>();
+                stmt->expression = std::move(expr);
+                return stmt;
+            }
+            error("expected statement");
+            advance();
+            return nullptr;
+        }
+    }
+}
+
+StmtPtr Parser::parseReturnStmt() {
+    expect(TokenKind::KwReturn);
+    auto stmt = makeNode<ReturnStmt>();
+    // Return value is optional (return vs return expr)
+    if (!check(TokenKind::RBrace) && !isAtEnd() &&
+        !peek().isOneOf({TokenKind::KwCase, TokenKind::KwDefault, TokenKind::KwElse})) {
+        stmt->value = parseExpression();
+    }
+    return stmt;
+}
+
+StmtPtr Parser::parseBreakStmt() {
+    expect(TokenKind::KwBreak);
+    return makeNode<BreakStmt>();
+}
+
+StmtPtr Parser::parseContinueStmt() {
+    expect(TokenKind::KwContinue);
+    return makeNode<ContinueStmt>();
+}
+
+StmtPtr Parser::parseFallthroughStmt() {
+    expect(TokenKind::KwFallthrough);
+    return makeNode<FallthroughStmt>();
+}
+
+StmtPtr Parser::parseDeferStmt() {
+    expect(TokenKind::KwDefer);
+    auto stmt = makeNode<DeferStmt>();
+    stmt->body = parseBlock();
+    return stmt;
+}
+
+StmtPtr Parser::parseThrowStmt() {
+    expect(TokenKind::KwThrow);
+    auto stmt = makeNode<ThrowStmt>();
+    stmt->value = parseExpression();
+    return stmt;
+}
+
+std::vector<StmtPtr> Parser::parseBlock() {
+    std::vector<StmtPtr> stmts;
+    if (expect(TokenKind::LBrace)) {
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            auto stmt = parseStatement();
+            if (stmt) stmts.push_back(std::move(stmt));
+        }
+        expect(TokenKind::RBrace);
+    }
+    return stmts;
+}
+
+// ─── Expression parsing (precedence climbing) ─────────────────────────────
+
+ExprPtr Parser::parseExpression() {
+    return parseAssignmentExpr();
+}
+
+ExprPtr Parser::parseAssignmentExpr() {
+    ExprPtr left = parseTernaryExpr();
+
+    // Assignment operators
+    if (peek().isAssignmentOperator()) {
+        TokenKind op = advance().kind;
+        ExprPtr right = parseAssignmentExpr();
+        auto expr = makeNode<AssignmentExpr>();
+        expr->target = std::move(left);
+        expr->value = std::move(right);
+        return expr;
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseTernaryExpr() {
+    ExprPtr cond = parseLogicalOrExpr();
+
+    // No ternary operator in SukiCode (use if expressions instead)
+    return cond;
+}
+
+ExprPtr Parser::parseLogicalOrExpr() {
+    ExprPtr left = parseLogicalAndExpr();
+
+    while (match(TokenKind::PipePipe) || match(TokenKind::KwOr)) {
+        TokenKind op = tokens_[pos_ - 1].kind;
+        ExprPtr right = parseLogicalAndExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseLogicalAndExpr() {
+    ExprPtr left = parseBitwiseOrExpr();
+
+    while (match(TokenKind::AmpAmp) || match(TokenKind::KwAnd)) {
+        TokenKind op = tokens_[pos_ - 1].kind;
+        ExprPtr right = parseBitwiseOrExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseBitwiseOrExpr() {
+    ExprPtr left = parseBitwiseXorExpr();
+
+    while (match(TokenKind::Pipe)) {
+        ExprPtr right = parseBitwiseXorExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = TokenKind::Pipe;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseBitwiseXorExpr() {
+    ExprPtr left = parseBitwiseAndExpr();
+
+    while (match(TokenKind::Caret)) {
+        ExprPtr right = parseBitwiseAndExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = TokenKind::Caret;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseBitwiseAndExpr() {
+    ExprPtr left = parseComparisonExpr();
+
+    while (match(TokenKind::Amp)) {
+        ExprPtr right = parseComparisonExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = TokenKind::Amp;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseComparisonExpr() {
+    ExprPtr left = parseShiftExpr();
+
+    while (true) {
+        TokenKind op;
+        if (match(TokenKind::Equal))         op = TokenKind::Equal;
+        else if (match(TokenKind::NotEqual)) op = TokenKind::NotEqual;
+        else if (match(TokenKind::Less))     op = TokenKind::Less;
+        else if (match(TokenKind::Greater))  op = TokenKind::Greater;
+        else if (match(TokenKind::LessEqual))    op = TokenKind::LessEqual;
+        else if (match(TokenKind::GreaterEqual)) op = TokenKind::GreaterEqual;
+        else if (match(TokenKind::KwAs))     op = TokenKind::KwAs;
+        else if (match(TokenKind::KwIs))     op = TokenKind::KwIs;
+        else break;
+
+        ExprPtr right = parseShiftExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseShiftExpr() {
+    ExprPtr left = parseAdditionExpr();
+
+    while (true) {
+        TokenKind op;
+        if (match(TokenKind::LShift))      op = TokenKind::LShift;
+        else if (match(TokenKind::RShift)) op = TokenKind::RShift;
+        else break;
+
+        ExprPtr right = parseAdditionExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseAdditionExpr() {
+    ExprPtr left = parseMultiplicationExpr();
+
+    while (true) {
+        TokenKind op;
+        if (match(TokenKind::Plus))       op = TokenKind::Plus;
+        else if (match(TokenKind::Minus)) op = TokenKind::Minus;
+        else break;
+
+        ExprPtr right = parseMultiplicationExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseMultiplicationExpr() {
+    ExprPtr left = parsePrefixExpr();
+
+    while (true) {
+        TokenKind op;
+        if (match(TokenKind::Star))        op = TokenKind::Star;
+        else if (match(TokenKind::Slash))  op = TokenKind::Slash;
+        else if (match(TokenKind::Percent)) op = TokenKind::Percent;
+        else break;
+
+        ExprPtr right = parsePrefixExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parsePrefixExpr() {
+    // Prefix operators: -, !, ~, try, await, move, unsafe
+    if (match(TokenKind::Minus)) {
+        auto expr = makeNode<UnaryExpr>();
+        expr->op = TokenKind::Minus;
+        expr->isPrefix = true;
+        expr->operand = parsePrefixExpr();
+        return expr;
+    }
+    if (match(TokenKind::Bang)) {
+        auto expr = makeNode<UnaryExpr>();
+        expr->op = TokenKind::Bang;
+        expr->isPrefix = true;
+        expr->operand = parsePrefixExpr();
+        return expr;
+    }
+    if (match(TokenKind::Tilde)) {
+        auto expr = makeNode<UnaryExpr>();
+        expr->op = TokenKind::Tilde;
+        expr->isPrefix = true;
+        expr->operand = parsePrefixExpr();
+        return expr;
+    }
+    if (match(TokenKind::KwTry)) {
+        auto expr = makeNode<TryExpr>();
+        if (match(TokenKind::Bang)) expr->isForce = true;
+        else if (match(TokenKind::Question)) expr->isOptional = true;
+        expr->subExpr = parsePrefixExpr();
+        return expr;
+    }
+    if (match(TokenKind::KwAwait)) {
+        auto expr = makeNode<AwaitExpr>();
+        expr->subExpr = parsePrefixExpr();
+        return expr;
+    }
+    if (match(TokenKind::KwMove)) {
+        auto expr = makeNode<MoveExpr>();
+        expr->subExpr = parsePrefixExpr();
+        return expr;
+    }
+    if (match(TokenKind::Amp)) {
+        auto expr = makeNode<InOutExpr>();
+        expr->subExpr = parsePrefixExpr();
+        return expr;
+    }
+
+    return parsePostfixExpr();
+}
+
+ExprPtr Parser::parsePostfixExpr() {
+    ExprPtr expr = parsePrimaryExpr();
+    if (!expr) return nullptr;
+
+    while (true) {
+        if (check(TokenKind::LParen)) {
+            expr = parseCallExpr(std::move(expr));
+        } else if (check(TokenKind::Dot) || check(TokenKind::Question)) {
+            bool isOptional = match(TokenKind::Question);
+            if (match(TokenKind::Dot)) {
+                if (check(TokenKind::Identifier)) {
+                    auto member = makeNode<MemberAccessExpr>();
+                    member->base = std::move(expr);
+                    member->member = std::string(advance().stringValue);
+                    member->isOptionalChain = isOptional;
+                    expr = std::move(member);
+                } else {
+                    error("expected member name after '.'");
+                    break;
+                }
+            } else if (isOptional) {
+                // ?. optional chain
+                auto chain = makeNode<OptionalChainExpr>();
+                chain->subExpr = std::move(expr);
+                expr = std::move(chain);
+            } else {
+                break;
+            }
+        } else if (check(TokenKind::LBracket)) {
+            expr = parseSubscriptExpr(std::move(expr));
+        } else if (match(TokenKind::Bang)) {
+            auto unwrap = makeNode<ForceUnwrapExpr>();
+            unwrap->subExpr = std::move(expr);
+            expr = std::move(unwrap);
+        } else if (match(TokenKind::QuestionQuestion)) {
+            // Null coalescing: expr ?? default
+            ExprPtr rhs = parsePrefixExpr();
+            auto binary = makeNode<BinaryExpr>();
+            binary->op = TokenKind::QuestionQuestion;
+            binary->left = std::move(expr);
+            binary->right = std::move(rhs);
+            expr = std::move(binary);
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
+ExprPtr Parser::parsePrimaryExpr() {
+    switch (peek().kind) {
+        // Literals
+        case TokenKind::IntegerLiteral: {
+            auto expr = makeNode<IntegerLiteralExpr>();
+            expr->value = advance().literal.intValue;
+            return expr;
+        }
+        case TokenKind::FloatLiteral: {
+            auto expr = makeNode<FloatLiteralExpr>();
+            expr->value = advance().literal.floatValue;
+            return expr;
+        }
+        case TokenKind::StringLiteral: {
+            auto expr = makeNode<StringLiteralExpr>();
+            expr->value = std::string(advance().stringValue);
+            return expr;
+        }
+        case TokenKind::CharLiteral: {
+            auto expr = makeNode<CharLiteralExpr>();
+            expr->value = advance().literal.charValue;
+            return expr;
+        }
+        case TokenKind::True: {
+            advance();
+            auto expr = makeNode<BoolLiteralExpr>();
+            expr->value = true;
+            return expr;
+        }
+        case TokenKind::False: {
+            advance();
+            auto expr = makeNode<BoolLiteralExpr>();
+            expr->value = false;
+            return expr;
+        }
+        case TokenKind::Nil: {
+            advance();
+            return makeNode<NilLiteralExpr>();
+        }
+
+        // Identifier
+        case TokenKind::Identifier: {
+            auto expr = makeNode<IdentifierExpr>();
+            expr->name = std::string(advance().stringValue);
+            return expr;
+        }
+
+        // self / super / Self
+        case TokenKind::KwSelf: {
+            advance();
+            return makeNode<SelfRefExpr>();
+        }
+        case TokenKind::KwSuper: {
+            advance();
+            return makeNode<SuperRefExpr>();
+        }
+        case TokenKind::KwSelfType: {
+            auto expr = makeNode<IdentifierExpr>();
+            expr->name = "Self";
+            advance();
+            return expr;
+        }
+
+        // Parenthesized expression or tuple
+        case TokenKind::LParen: {
+            advance(); // (
+            if (check(TokenKind::RParen)) {
+                advance(); // empty tuple ()
+                auto expr = makeNode<TupleExpr>();
+                return expr;
+            }
+            ExprPtr inner = parseExpression();
+            if (match(TokenKind::Comma)) {
+                // Tuple
+                auto tuple = makeNode<TupleExpr>();
+                TupleExpr::Element first;
+                first.value = std::move(inner);
+                tuple->elements.push_back(std::move(first));
+                do {
+                    TupleExpr::Element elem;
+                    elem.value = parseExpression();
+                    tuple->elements.push_back(std::move(elem));
+                } while (match(TokenKind::Comma));
+                expect(TokenKind::RParen);
+                return tuple;
+            }
+            expect(TokenKind::RParen);
+            return inner;
+        }
+
+        // Array literal
+        case TokenKind::LBracket: {
+            advance(); // [
+            if (check(TokenKind::RBracket)) {
+                advance(); // empty array []
+                return makeNode<ArrayLiteralExpr>();
+            }
+            auto arr = makeNode<ArrayLiteralExpr>();
+            do {
+                arr->elements.push_back(parseExpression());
+            } while (match(TokenKind::Comma));
+            expect(TokenKind::RBracket);
+            return arr;
+        }
+
+        // Closure: { params -> return in body } or () => expr
+        case TokenKind::LBrace: {
+            auto closure = makeNode<ClosureExpr>();
+            advance(); // {
+
+            // Capture list: [weak self, unowned delegate]
+            if (check(TokenKind::LBracket)) {
+                advance(); // [
+                do {
+                    if (check(TokenKind::Identifier)) {
+                        std::string capture = std::string(advance().stringValue);
+                        if (capture == "weak" || capture == "unowned") {
+                            if (check(TokenKind::Identifier)) {
+                                capture += " " + std::string(advance().stringValue);
+                            }
+                        }
+                        closure->captureList.push_back(capture);
+                    }
+                } while (match(TokenKind::Comma));
+                expect(TokenKind::RBracket);
+            }
+
+            // Parameters: (a, b) or a, b in
+            if (check(TokenKind::LParen)) {
+                advance(); // (
+                do {
+                    ClosureExpr::Param param;
+                    if (check(TokenKind::Identifier)) {
+                        param.name = std::string(advance().stringValue);
+                    }
+                    if (match(TokenKind::Colon)) {
+                        param.type = parseType();
+                    }
+                    closure->params.push_back(std::move(param));
+                } while (match(TokenKind::Comma));
+                expect(TokenKind::RParen);
+            }
+
+            // Return type
+            if (match(TokenKind::Arrow)) {
+                closure->returnType = parseType();
+            }
+
+            // 'in' keyword separates params from body
+            match(TokenKind::KwIn);
+
+            // Body
+            while (!check(TokenKind::RBrace) && !isAtEnd()) {
+                auto stmt = parseStatement();
+                if (stmt) closure->body.push_back(std::move(stmt));
+            }
+            expect(TokenKind::RBrace);
+            return closure;
+        }
+
+        // if expression
+        case TokenKind::KwIf: {
+            advance(); // if
+            auto expr = makeNode<IfExpr>();
+            expr->condition = parseExpression();
+            // if x > 0 { expr } else { expr }
+            if (expect(TokenKind::LBrace)) {
+                expr->thenExpr = parseExpression();
+                expect(TokenKind::RBrace);
+            }
+            if (match(TokenKind::KwElse)) {
+                if (expect(TokenKind::LBrace)) {
+                    expr->elseExpr = parseExpression();
+                    expect(TokenKind::RBrace);
+                }
+            }
+            return expr;
+        }
+
+        // Type cast: expr as Type, expr as? Type, expr as! Type
+        case TokenKind::KwAs: {
+            // This shouldn't happen in prefix position; handled in postfix
+            break;
+        }
+
+        // Selector: #selector(method)
+        case TokenKind::Hash: {
+            advance(); // #
+            if (check(TokenKind::Identifier)) {
+                auto& name = advance().stringValue;
+                if (name == "selector") {
+                    if (expect(TokenKind::LParen)) {
+                        // For now, parse the selector argument as an expression
+                        auto inner = parseExpression();
+                        expect(TokenKind::RParen);
+                        // TODO: create proper SelectorExpr
+                        return inner;
+                    }
+                }
+            }
+            error("expected '#selector(...)'");
+            return nullptr;
+        }
+
+        default:
+            break;
+    }
+
+    return nullptr;
+}
+
+// ─── Call / Member / Subscript ────────────────────────────────────────────
+
+ExprPtr Parser::parseCallExpr(ExprPtr callee) {
+    expect(TokenKind::LParen);
+    auto expr = makeNode<CallExpr>();
+    expr->callee = std::move(callee);
+
+    if (!check(TokenKind::RParen)) {
+        do {
+            CallExpr::Arg arg;
+            // Check for labeled argument: label: expr
+            if (check(TokenKind::Identifier) && peekAt(1).is(TokenKind::Colon)) {
+                arg.label = std::string(advance().stringValue);
+                advance(); // :
+            }
+            arg.value = parseExpression();
+            expr->args.push_back(std::move(arg));
+        } while (match(TokenKind::Comma));
+    }
+
+    expect(TokenKind::RParen);
+    return expr;
+}
+
+ExprPtr Parser::parseMemberAccessExpr(ExprPtr base) {
+    auto expr = makeNode<MemberAccessExpr>();
+    expr->base = std::move(base);
+    if (check(TokenKind::Identifier)) {
+        expr->member = std::string(advance().stringValue);
+    } else {
+        error("expected member name");
+    }
+    return expr;
+}
+
+ExprPtr Parser::parseSubscriptExpr(ExprPtr base) {
+    expect(TokenKind::LBracket);
+    auto expr = makeNode<SubscriptExpr>();
+    expr->base = std::move(base);
+
+    do {
+        expr->indices.push_back(parseExpression());
+    } while (match(TokenKind::Comma));
+
+    expect(TokenKind::RBracket);
+    return expr;
+}
+
+// ─── Type parsing ─────────────────────────────────────────────────────────
+
+TypeReprPtr Parser::parseType() {
+    // Check for function type first: (A, B) -> C
+    if (check(TokenKind::LParen)) {
+        auto& next = peekAt(1);
+        if (next.is(TokenKind::RParen) || next.is(TokenKind::Identifier) ||
+            next.is(TokenKind::KwSelfType)) {
+            // Could be function type or tuple type — try function type
+            // if we see -> after the closing paren
+            size_t savePos = pos_;
+            // Quick lookahead for ->
+            int depth = 1;
+            size_t i = pos_ + 1;
+            while (i < tokens_.size() && depth > 0) {
+                if (tokens_[i].is(TokenKind::LParen)) depth++;
+                else if (tokens_[i].is(TokenKind::RParen)) depth--;
+                i++;
+            }
+            if (i < tokens_.size() && tokens_[i].is(TokenKind::Arrow)) {
+                return parseFunctionType();
+            }
+            pos_ = savePos; // restore
+        }
+    }
+
+    return parseSimpleType();
+}
+
+TypeReprPtr Parser::parseSimpleType() {
+    // 'some' opaque type
+    if (match(TokenKind::KwSome)) {
+        auto type = makeNode<OpaqueTypeRepr>();
+        type->constraint = parseSimpleType();
+        return type;
+    }
+
+    // 'any' existential type
+    if (match(TokenKind::KwAny)) {
+        auto type = makeNode<ExistentialTypeRepr>();
+        type->constraint = parseSimpleType();
+        return type;
+    }
+
+    // Self type
+    if (match(TokenKind::KwSelfType)) {
+        return makeNode<SelfTypeRepr>();
+    }
+
+    // Named type: Identifier, Identifier<T, U>
+    if (check(TokenKind::Identifier)) {
+        auto namedType = makeNode<NamedTypeRepr>();
+        namedType->name = std::string(advance().stringValue);
+
+        // Module prefix: Module.Type
+        while (match(TokenKind::Dot)) {
+            if (check(TokenKind::Identifier)) {
+                namedType->name += ".";
+                namedType->name += advance().stringValue;
+            }
+        }
+
+        // Generic arguments
+        if (match(TokenKind::Less)) {
+            do {
+                namedType->genericArgs.push_back(parseType());
+            } while (match(TokenKind::Comma));
+            expect(TokenKind::Greater);
+        }
+
+        TypeReprPtr type = std::move(namedType);
+
+        // Postfix: [] for Array, [:] for Dict, ? for Optional
+        while (true) {
+            if (check(TokenKind::LBracket)) {
+                advance(); // [
+                if (match(TokenKind::Colon)) {
+                    // Dictionary: [Key: Value]
+                    expect(TokenKind::RBracket);
+                    auto dictType = makeNode<DictTypeRepr>();
+                    dictType->keyType = std::move(type);
+                    dictType->valueType = parseType();
+                    type = std::move(dictType);
+                } else if (match(TokenKind::RBracket)) {
+                    // Array: [Element]
+                    auto arrType = makeNode<ArrayTypeRepr>();
+                    arrType->elementType = std::move(type);
+                    type = std::move(arrType);
+                } else {
+                    // Shouldn't happen in type context
+                    break;
+                }
+            } else if (match(TokenKind::Question)) {
+                auto optType = makeNode<OptionalTypeRepr>();
+                optType->base = std::move(type);
+                type = std::move(optType);
+            } else {
+                break;
+            }
+        }
+
+        return type;
+    }
+
+    // Array type: [T]
+    if (check(TokenKind::LBracket)) {
+        advance(); // [
+        auto elemType = parseType();
+        if (match(TokenKind::Colon)) {
+            auto valType = parseType();
+            expect(TokenKind::RBracket);
+            auto dictType = makeNode<DictTypeRepr>();
+            dictType->keyType = std::move(elemType);
+            dictType->valueType = std::move(valType);
+            return dictType;
+        }
+        expect(TokenKind::RBracket);
+        auto arrType = makeNode<ArrayTypeRepr>();
+        arrType->elementType = std::move(elemType);
+        return arrType;
+    }
+
+    error("expected type");
+    return nullptr;
+}
+
+TypeReprPtr Parser::parseFunctionType() {
+    auto type = makeNode<FunctionTypeRepr>();
+
+    expect(TokenKind::LParen);
+    if (!check(TokenKind::RParen)) {
+        do {
+            FunctionTypeRepr::Param param;
+            param.type = parseType();
+            type->params.push_back(std::move(param));
+        } while (match(TokenKind::Comma));
+    }
+    expect(TokenKind::RParen);
+
+    // async/throws
+    while (true) {
+        if (match(TokenKind::KwAsync)) { type->isAsync = true; continue; }
+        if (match(TokenKind::KwThrows)) { type->isThrows = true; continue; }
+        break;
+    }
+
+    expect(TokenKind::Arrow);
+    type->returnType = parseType();
+
+    return type;
+}
+
+// ─── Pattern parsing ──────────────────────────────────────────────────────
+
+PatternPtr Parser::parsePattern() {
+    // Wildcard
+    if (match(TokenKind::Underscore)) {
+        return makeNode<WildcardPattern>();
+    }
+
+    // let/var binding
+    bool isLet = true;
+    if (match(TokenKind::KwLet)) isLet = true;
+    else if (match(TokenKind::KwVar)) isLet = false;
+
+    // Identifier pattern
+    if (check(TokenKind::Identifier)) {
+        auto pat = makeNode<IdentifierPattern>();
+        pat->name = std::string(advance().stringValue);
+        pat->isLet = isLet;
+        return pat;
+    }
+
+    // Enum case pattern: .caseName
+    if (check(TokenKind::Dot) && peekAt(1).is(TokenKind::Identifier)) {
+        advance(); // .
+        auto pat = makeNode<EnumCasePattern>();
+        pat->caseName = std::string(advance().stringValue);
+
+        // Associated values: .case(let x, let y)
+        if (check(TokenKind::LParen)) {
+            advance();
+            do {
+                pat->associatedPatterns.push_back(parsePattern());
+            } while (match(TokenKind::Comma));
+            expect(TokenKind::RParen);
+        }
+        return pat;
+    }
+
+    // Tuple pattern: (a, b, c)
+    if (check(TokenKind::LParen)) {
+        advance();
+        auto pat = makeNode<TuplePattern>();
+        if (!check(TokenKind::RParen)) {
+            do {
+                pat->elements.push_back(parsePattern());
+            } while (match(TokenKind::Comma));
+        }
+        expect(TokenKind::RParen);
+        return pat;
+    }
+
+    // Fallback: try expression pattern
+    auto expr = parseExpression();
+    if (expr) {
+        // Wrap as an expression pattern
+        auto pat = makeNode<IdentifierPattern>();
+        pat->name = "_expr_"; // TODO: proper expression pattern
+        return pat;
+    }
+
+    error("expected pattern");
+    return makeNode<WildcardPattern>();
+}
+
+// ─── Function parameters ──────────────────────────────────────────────────
+
+FunctionParam Parser::parseFunctionParam() {
+    FunctionParam param;
+
+    // External label (optional): externalName internalName: Type
+    if (check(TokenKind::Identifier)) {
+        // First identifier is the external label
+        param.externalLabel = std::string(advance().stringValue);
+
+        // Second identifier (if present) is the internal name
+        if (check(TokenKind::Identifier)) {
+            param.internalName = std::string(advance().stringValue);
+        } else {
+            // No internal name — external label IS the internal name
+            // Unless external label is "_" (unlabeled)
+            if (param.externalLabel == "_") {
+                param.internalName = "_";
+            } else {
+                param.internalName = param.externalLabel;
+            }
+        }
+    } else if (match(TokenKind::Underscore)) {
+        // Unlabeled parameter: _ name: Type
+        param.externalLabel = "_";
+        if (check(TokenKind::Identifier)) {
+            param.internalName = std::string(advance().stringValue);
+        }
+    }
+
+    expect(TokenKind::Colon);
+
+    // inout modifier
+    if (match(TokenKind::KwInOut)) {
+        param.isInOut = true;
+    }
+
+    param.type = parseType();
+
+    // Default value
+    if (match(TokenKind::Assign)) {
+        param.defaultValue = parseExpression();
+    }
+
+    // Variadic
+    if (match(TokenKind::Ellipsis)) {
+        param.isVariadic = true;
+    }
+
+    return param;
+}
+
+std::vector<FunctionParam> Parser::parseParamList() {
+    std::vector<FunctionParam> params;
+    if (!check(TokenKind::RParen)) {
+        do {
+            params.push_back(parseFunctionParam());
+        } while (match(TokenKind::Comma));
+    }
+    return params;
+}
+
+// ─── Generic parameters ───────────────────────────────────────────────────
+
+std::vector<std::string> Parser::parseGenericParams() {
+    std::vector<std::string> params;
+    expect(TokenKind::Less);
+    do {
+        if (check(TokenKind::Identifier)) {
+            params.push_back(std::string(advance().stringValue));
+        } else {
+            error("expected generic parameter name");
+        }
+    } while (match(TokenKind::Comma));
+    expect(TokenKind::Greater);
+    return params;
+}
+
+// ─── Access control ───────────────────────────────────────────────────────
+
+AccessLevel Parser::parseAccessLevel() {
+    if (match(TokenKind::KwPublic)) return AccessLevel::Public;
+    if (match(TokenKind::KwInternal)) return AccessLevel::Internal;
+    if (match(TokenKind::KwFileprivate)) return AccessLevel::FilePrivate;
+    if (match(TokenKind::KwPrivate)) return AccessLevel::Private;
+    if (match(TokenKind::KwOpen)) return AccessLevel::Open;
+    return AccessLevel::Internal;
+}
+
+} // namespace suki

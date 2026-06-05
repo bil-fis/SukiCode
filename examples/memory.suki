@@ -1,0 +1,61 @@
+// Memory management — ARC, Pool, Owned
+
+// ARC reference cycles and weak references
+class Node {
+    var value: Int
+    var next: Node?        // strong reference
+    weak var prev: Node?   // weak reference to break cycle
+
+    init(value: Int) {
+        self.value = value
+    }
+}
+
+// Pool for batch allocation
+func poolExample() {
+    let pool = MemoryPool<Int>(capacity: 1000)
+
+    for i in 0..<1000 {
+        let ptr = pool.allocate()
+        // Use ptr...
+    }
+
+    // All memory freed when pool goes out of scope
+}
+
+// Owned<T> for move semantics
+struct Buffer {
+    var data: Owned<[UInt8]>
+
+    init(size: Int) {
+        data = Owned<[UInt8]>(capacity: size)
+    }
+
+    mutating func transfer() -> Owned<[UInt8]> {
+        return move data  // data is now invalid
+    }
+}
+
+// Collection for resource lifecycle
+func collectionExample() {
+    let collection = Collection()
+
+    let dbPool = ConnectionPool(capacity: 10)
+    let cachePool = MemoryPool<String>(capacity: 1000)
+
+    collection.add(dbPool)
+    collection.add(cachePool)
+
+    // Use pools...
+    // collection.shutdown() called automatically on scope exit
+}
+
+// Unsafe pointer operations
+func unsafeExample() {
+    unsafe {
+        let ptr: UnsafeMutablePointer<Int> = allocate(capacity: 1)
+        ptr.pointee = 42
+        print(ptr.pointee)
+        ptr.deallocate()
+    }
+}
