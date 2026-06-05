@@ -6,6 +6,7 @@
 add_library(sukistd STATIC
     core/Print.cpp
     core/Assert.cpp
+    core/String.cpp
 )
 
 target_include_directories(sukistd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
