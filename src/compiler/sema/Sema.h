@@ -54,6 +54,7 @@ private:
     DiagnosticEngine& diag_;
     SymbolTable symbols_;
     std::string currentModule_;
+    TypePtr currentReturnType_; // Current function's return type for checking
 };
 
 } // namespace suki

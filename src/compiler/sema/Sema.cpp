@@ -153,6 +153,10 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
 
     symbols_.enterScope();
 
+    // Save and set current return type
+    TypePtr prevReturnType = currentReturnType_;
+    currentReturnType_ = sym.returnType;
+
     for (const auto& param : decl.params) {
         Symbol ps;
         ps.kind = SymbolKind::Variable;
@@ -166,6 +170,9 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     for (auto& stmt : decl.body) {
         if (stmt) processStmt(*stmt);
     }
+
+    // Restore previous return type
+    currentReturnType_ = prevReturnType;
 
     symbols_.leaveScope();
 }
@@ -264,7 +271,16 @@ void Sema::processStmt(Stmt& stmt) {
 
 void Sema::processReturnStmt(ReturnStmt& stmt) {
     if (stmt.value) {
-        inferExprType(*stmt.value);
+        TypePtr returnType = inferExprType(*stmt.value);
+        if (returnType && currentReturnType_ &&
+            returnType->kind() != TypeKind::Error &&
+            currentReturnType_->kind() != TypeKind::Void &&
+            !returnType->canImplicitlyConvertTo(*currentReturnType_)) {
+            error(stmt.loc, "return type " + returnType->name() +
+                  " does not match function return type " + currentReturnType_->name());
+        }
+    } else if (currentReturnType_ && currentReturnType_->kind() != TypeKind::Void) {
+        error(stmt.loc, "non-void function must return a value");
     }
 }
 
@@ -319,6 +335,25 @@ TypePtr Sema::inferExprType(Expr& expr) {
                     error(expr.loc, "'" + id.name + "' is not a function");
                     return getErrorType();
                 }
+                // Check argument count
+                if (call.args.size() != sym->paramTypes.size()) {
+                    error(expr.loc, "function '" + id.name + "' expects " +
+                          std::to_string(sym->paramTypes.size()) + " arguments, got " +
+                          std::to_string(call.args.size()));
+                } else {
+                    // Check argument types
+                    for (size_t i = 0; i < call.args.size(); i++) {
+                        TypePtr argType = inferExprType(*call.args[i].value);
+                        if (argType && sym->paramTypes[i] &&
+                            argType->kind() != TypeKind::Error &&
+                            sym->paramTypes[i]->kind() != TypeKind::Error &&
+                            !argType->canImplicitlyConvertTo(*sym->paramTypes[i])) {
+                            error(call.args[i].value->loc,
+                                  "argument type " + argType->name() +
+                                  " does not match parameter type " + sym->paramTypes[i]->name());
+                        }
+                    }
+                }
                 return sym->returnType;
             }
             return nullptr;
@@ -329,6 +364,70 @@ TypePtr Sema::inferExprType(Expr& expr) {
             if (!ot) return getErrorType();
             if (u.op == TokenKind::Bang) return getBoolType();
             return ot;
+        }
+        case ExprKind::MemberAccess: {
+            auto& ma = static_cast<MemberAccessExpr&>(expr);
+            TypePtr baseType = inferExprType(*ma.base);
+            if (!baseType) return nullptr;
+            // Look up member in the base type's scope
+            // For now, look up as a function or variable
+            Symbol* sym = symbols_.lookup(ma.member);
+            if (sym) return sym->type;
+            // TODO: proper member lookup based on base type
+            return nullptr;
+        }
+        case ExprKind::Subscript: {
+            auto& sub = static_cast<SubscriptExpr&>(expr);
+            TypePtr baseType = inferExprType(*sub.base);
+            if (!baseType) return nullptr;
+            // Array subscript returns element type
+            if (baseType->kind() == TypeKind::Array) {
+                return std::static_pointer_cast<ArrayType>(baseType)->elementType();
+            }
+            // Dictionary subscript returns value type
+            if (baseType->kind() == TypeKind::Dictionary) {
+                return std::static_pointer_cast<DictType>(baseType)->valueType();
+            }
+            return nullptr;
+        }
+        case ExprKind::OptionalChain: {
+            auto& oc = static_cast<OptionalChainExpr&>(expr);
+            TypePtr innerType = inferExprType(*oc.subExpr);
+            if (!innerType) return nullptr;
+            // Optional chain wraps result in Optional
+            return std::make_shared<OptionalType>(innerType);
+        }
+        case ExprKind::ForceUnwrap: {
+            auto& fu = static_cast<ForceUnwrapExpr&>(expr);
+            TypePtr innerType = inferExprType(*fu.subExpr);
+            if (!innerType) return nullptr;
+            // Force unwrap removes Optional
+            if (innerType->kind() == TypeKind::Optional) {
+                return std::static_pointer_cast<OptionalType>(innerType)->baseType();
+            }
+            return innerType;
+        }
+        case ExprKind::TypeCast: {
+            auto& tc = static_cast<TypeCastExpr&>(expr);
+            return resolveTypeRepr(*tc.targetType);
+        }
+        case ExprKind::TypeCheck:
+            return getBoolType(); // is Type always returns Bool
+        case ExprKind::Try: {
+            auto& te = static_cast<TryExpr&>(expr);
+            TypePtr innerType = inferExprType(*te.subExpr);
+            if (!innerType) return nullptr;
+            // try? wraps in Optional, try! unwraps, try passes through
+            if (te.isOptional) return std::make_shared<OptionalType>(innerType);
+            return innerType;
+        }
+        case ExprKind::Await: {
+            auto& ae = static_cast<AwaitExpr&>(expr);
+            return inferExprType(*ae.subExpr);
+        }
+        case ExprKind::Move: {
+            auto& me = static_cast<MoveExpr&>(expr);
+            return inferExprType(*me.subExpr);
         }
         case ExprKind::ArrayLiteral:
             return std::make_shared<ArrayType>(getAnyType());
