@@ -426,6 +426,7 @@ enum class StmtKind : uint8_t {
     Defer,
     Throw,          // throw expr
     VariableDecl,   // let x = ... / var y: T
+    DeclStmt,       // control flow decl used as statement (if, for, while, etc.)
     Compound,       // { stmts }
 };
 
@@ -469,6 +470,17 @@ struct CompoundStmt : Stmt {
 struct ThrowStmt : Stmt {
     ExprPtr value;
     ThrowStmt() : Stmt(StmtKind::Throw) {}
+};
+
+struct VariableDeclStmt : Stmt {
+    DeclPtr varDecl;
+    VariableDeclStmt() : Stmt(StmtKind::VariableDecl) {}
+};
+
+// Generic wrapper: any Decl used as a statement (if, for, while, switch, etc.)
+struct DeclStmt : Stmt {
+    DeclPtr decl;
+    DeclStmt() : Stmt(StmtKind::DeclStmt) {}
 };
 
 // ─── Declarations ─────────────────────────────────────────────────────────
@@ -540,6 +552,9 @@ struct VariableDecl : Decl {
     bool hasDidSet = false;
     std::vector<StmtPtr> willSetBody;
     std::vector<StmtPtr> didSetBody;
+    // Computed property getter/setter bodies
+    std::vector<StmtPtr> getterBody;
+    std::vector<StmtPtr> setterBody;
     VariableDecl() : Decl(DeclKind::Variable) {}
 };
 

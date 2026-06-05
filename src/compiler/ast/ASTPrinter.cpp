@@ -377,7 +377,12 @@ void ASTPrinter::printStmt(const Stmt& stmt, int indentLevel) {
             break;
         }
         case StmtKind::VariableDecl: {
-            out_ << "VarDecl (inline)\n";
+            auto& s = static_cast<const VariableDeclStmt&>(stmt);
+            if (s.varDecl) {
+                printDecl(*s.varDecl, indentLevel);
+            } else {
+                out_ << "VarDecl (inline)\n";
+            }
             break;
         }
         case StmtKind::Compound: {

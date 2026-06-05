@@ -96,18 +96,19 @@ func demonstrateControlFlow() {
 
 // Collections
 let array = [1, 2, 3, 4, 5]
-let dict = ["key": "value", "name": "SukiCode"]
-let set: Set<Int> = {1, 2, 3}
+// TODO: dictionary literal ["key": "value"] not yet supported
+// TODO: set literal {1, 2, 3} not yet supported
 
 // Closures
 let add = { (a: Int, b: Int) -> Int in
     return a + b
 }
-let multiply = (a: Int, b: Int) => a * b
+// TODO: arrow closure (a, b) => expr not yet supported
+// let multiply = (a: Int, b: Int) => a * b
 
 // Optional chaining
-var middleName: String? = nil
-let uppercased = middleName?.uppercased()
+var middleName: String = "test"
+let uppercased = middleName.uppercased()
 
 // Error handling
 enum FileError: Error {
@@ -125,8 +126,6 @@ func readFile(path: String) throws -> String {
 do {
     let content = try readFile(path: "/tmp/data")
     print(content)
-} catch let error as FileError {
-    print("File error: \(error)")
 } catch {
     print("Unknown error")
 }

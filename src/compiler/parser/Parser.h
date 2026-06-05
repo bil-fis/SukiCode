@@ -32,6 +32,8 @@ private:
 
     // ─── Declarations ─────────────────────────────────────────────────────
     DeclPtr parseDeclaration();
+    // Parse declaration and collect any extra decls (multi-variable) into the given vector
+    void parseDeclarationInto(std::vector<DeclPtr>& out);
     DeclPtr parseModuleDecl();
     DeclPtr parseImportDecl();
     DeclPtr parseVariableDecl();  // let / var
@@ -73,6 +75,7 @@ private:
     ExprPtr parseExpression();
     ExprPtr parseAssignmentExpr();
     ExprPtr parseTernaryExpr();
+    ExprPtr parseRangeExpr();
     ExprPtr parseLogicalOrExpr();
     ExprPtr parseLogicalAndExpr();
     ExprPtr parseBitwiseOrExpr();
@@ -120,6 +123,8 @@ private:
     std::string_view filename_;
     DiagnosticEngine& diag_;
     NodeID nextNodeId_ = 1;
+    // Multi-variable declarations: var x, y: Double produces extra decls
+    std::vector<DeclPtr> multiDecls_;
 
     template<typename T>
     std::unique_ptr<T> makeNode() {

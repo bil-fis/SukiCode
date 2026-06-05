@@ -112,10 +112,7 @@ std::unique_ptr<CompilationUnit> Parser::parse() {
     // Parse declarations
     while (!isAtEnd()) {
         try {
-            auto decl = parseDeclaration();
-            if (decl) {
-                cu->declarations.push_back(std::move(decl));
-            }
+            parseDeclarationInto(cu->declarations);
         } catch (...) {
             synchronize();
         }
@@ -126,6 +123,17 @@ std::unique_ptr<CompilationUnit> Parser::parse() {
 
 // ─── Declaration parsing ──────────────────────────────────────────────────
 
+void Parser::parseDeclarationInto(std::vector<DeclPtr>& out) {
+    auto decl = parseDeclaration();
+    if (decl) {
+        out.push_back(std::move(decl));
+        for (auto& extra : multiDecls_) {
+            out.push_back(std::move(extra));
+        }
+        multiDecls_.clear();
+    }
+}
+
 DeclPtr Parser::parseDeclaration() {
     // Check for attributes
     // (Attributes are parsed inline where needed for now)
@@ -134,7 +142,12 @@ DeclPtr Parser::parseDeclaration() {
     AccessLevel access = AccessLevel::Internal;
     bool isStatic = false;
 
-    // Parse access modifiers
+    // Parse access modifiers and other modifiers
+    bool isOverride = false;
+    bool isMutating = false;
+    bool isConvenience = false;
+    bool isRequired = false;
+    bool isFinal = false;
     while (true) {
         if (match(TokenKind::KwPublic)) { access = AccessLevel::Public; continue; }
         if (match(TokenKind::KwInternal)) { access = AccessLevel::Internal; continue; }
@@ -142,6 +155,11 @@ DeclPtr Parser::parseDeclaration() {
         if (match(TokenKind::KwPrivate)) { access = AccessLevel::Private; continue; }
         if (match(TokenKind::KwOpen)) { access = AccessLevel::Open; continue; }
         if (match(TokenKind::KwStatic)) { isStatic = true; continue; }
+        if (match(TokenKind::KwOverride)) { isOverride = true; continue; }
+        if (match(TokenKind::KwMutating)) { isMutating = true; continue; }
+        if (match(TokenKind::KwConvenience)) { isConvenience = true; continue; }
+        if (match(TokenKind::KwRequired)) { isRequired = true; continue; }
+        if (match(TokenKind::KwFinal)) { isFinal = true; continue; }
         break;
     }
 
@@ -245,35 +263,94 @@ DeclPtr Parser::parseImportDecl() {
 // ─── Variable declaration ─────────────────────────────────────────────────
 
 DeclPtr Parser::parseVariableDecl() {
-    auto decl = makeNode<VariableDecl>();
-    decl->isLet = peek().is(TokenKind::KwLet);
+    bool isLet = peek().is(TokenKind::KwLet);
     advance(); // consume let/var
 
-    // Parse the binding pattern (simple identifier for now)
+    // Parse first variable name
+    std::vector<std::string> names;
     if (check(TokenKind::Identifier)) {
-        auto pat = makeNode<IdentifierPattern>();
-        pat->name = std::string(advance().stringValue);
-        pat->isLet = decl->isLet;
-        decl->pattern = std::move(pat);
+        names.push_back(std::string(advance().stringValue));
     } else if (match(TokenKind::Underscore)) {
-        auto pat = makeNode<WildcardPattern>();
-        decl->pattern = std::move(pat);
+        names.push_back("_");
     } else {
         error("expected variable name");
     }
 
-    // Optional type annotation
-    if (match(TokenKind::Colon)) {
-        decl->typeAnnotation = parseType();
+    // Check for multi-variable declaration: var x, y, z: Type
+    while (match(TokenKind::Comma)) {
+        if (check(TokenKind::Identifier)) {
+            names.push_back(std::string(advance().stringValue));
+        } else if (match(TokenKind::Underscore)) {
+            names.push_back("_");
+        } else {
+            error("expected variable name after ','");
+        }
     }
 
-    // Optional initializer
+    // Shared type annotation
+    TypeReprPtr sharedType;
+    if (match(TokenKind::Colon)) {
+        sharedType = parseType();
+    }
+
+    // Shared initializer
+    ExprPtr sharedInit;
     if (match(TokenKind::Assign)) {
-        decl->initializer = parseExpression();
+        sharedInit = parseExpression();
+    }
+
+    // Property accessors or computed property getter:
+    // { get }, { get set } (protocol requirements)
+    // { return expr } (computed property getter body)
+    // Only check if no '=' was found AND no type annotation with initializer
+    std::vector<StmtPtr> getterBody;
+    std::vector<StmtPtr> setterBody;
+    if (!sharedInit && check(TokenKind::LBrace)) {
+        if (peekAt(1).is(TokenKind::KwGet) || peekAt(1).is(TokenKind::KwSet)) {
+            // Accessor block: { get { ... } set { ... } }
+            advance(); // {
+            while (!check(TokenKind::RBrace) && !isAtEnd()) {
+                if (match(TokenKind::KwGet)) {
+                    getterBody = parseBlock();
+                } else if (match(TokenKind::KwSet)) {
+                    setterBody = parseBlock();
+                } else {
+                    advance(); // skip unknown
+                }
+            }
+            match(TokenKind::RBrace); // }
+        } else {
+            // Computed property getter body: { statements }
+            getterBody = parseBlock();
+        }
+    }
+
+    // Create the first VariableDecl (returned as primary)
+    auto primary = makeNode<VariableDecl>();
+    primary->isLet = isLet;
+    auto pat = makeNode<IdentifierPattern>();
+    pat->name = names[0];
+    pat->isLet = isLet;
+    primary->pattern = std::move(pat);
+    primary->typeAnnotation = std::move(sharedType);
+    primary->initializer = std::move(sharedInit);
+    primary->getterBody = std::move(getterBody);
+    primary->setterBody = std::move(setterBody);
+
+    // Create additional VariableDecls for remaining names (same type/init)
+    multiDecls_.clear();
+    for (size_t i = 1; i < names.size(); i++) {
+        auto extra = makeNode<VariableDecl>();
+        extra->isLet = isLet;
+        auto extraPat = makeNode<IdentifierPattern>();
+        extraPat->name = names[i];
+        extraPat->isLet = isLet;
+        extra->pattern = std::move(extraPat);
+        multiDecls_.push_back(std::move(extra));
     }
 
     // TODO: parse willSet/didSet blocks
-    return decl;
+    return primary;
 }
 
 // ─── Function declaration ─────────────────────────────────────────────────
@@ -349,8 +426,7 @@ DeclPtr Parser::parseStructDecl() {
     // Body
     if (expect(TokenKind::LBrace)) {
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            auto member = parseDeclaration();
-            if (member) decl->members.push_back(std::move(member));
+            parseDeclarationInto(decl->members);
         }
         expect(TokenKind::RBrace);
     }
@@ -386,8 +462,7 @@ DeclPtr Parser::parseClassDecl() {
     // Body
     if (expect(TokenKind::LBrace)) {
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            auto member = parseDeclaration();
-            if (member) decl->members.push_back(std::move(member));
+            parseDeclarationInto(decl->members);
         }
         expect(TokenKind::RBrace);
     }
@@ -451,8 +526,7 @@ DeclPtr Parser::parseEnumDecl() {
 
                 decl->cases.push_back(std::move(enumCase));
             } else {
-                auto member = parseDeclaration();
-                if (member) decl->members.push_back(std::move(member));
+                parseDeclarationInto(decl->members);
             }
         }
         expect(TokenKind::RBrace);
@@ -480,8 +554,7 @@ DeclPtr Parser::parseProtocolDecl() {
 
     if (expect(TokenKind::LBrace)) {
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            auto member = parseDeclaration();
-            if (member) decl->members.push_back(std::move(member));
+            parseDeclarationInto(decl->members);
         }
         expect(TokenKind::RBrace);
     }
@@ -505,8 +578,7 @@ DeclPtr Parser::parseActorDecl() {
 
     if (expect(TokenKind::LBrace)) {
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            auto member = parseDeclaration();
-            if (member) decl->members.push_back(std::move(member));
+            parseDeclarationInto(decl->members);
         }
         expect(TokenKind::RBrace);
     }
@@ -528,8 +600,7 @@ DeclPtr Parser::parseExtensionDecl() {
 
     if (expect(TokenKind::LBrace)) {
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            auto member = parseDeclaration();
-            if (member) decl->members.push_back(std::move(member));
+            parseDeclarationInto(decl->members);
         }
         expect(TokenKind::RBrace);
     }
@@ -820,6 +891,34 @@ StmtPtr Parser::parseStatement() {
         case TokenKind::KwFallthrough: return parseFallthroughStmt();
         case TokenKind::KwDefer:    return parseDeferStmt();
         case TokenKind::KwThrow:    return parseThrowStmt();
+        case TokenKind::KwLet:
+        case TokenKind::KwVar: {
+            auto varDecl = parseVariableDecl();
+            if (varDecl) {
+                auto stmt = makeNode<VariableDeclStmt>();
+                stmt->varDecl = std::move(varDecl);
+                return stmt;
+            }
+            return nullptr;
+        }
+        // Control flow declarations used as statements
+        case TokenKind::KwIf:
+        case TokenKind::KwGuard:
+        case TokenKind::KwSwitch:
+        case TokenKind::KwFor:
+        case TokenKind::KwWhile:
+        case TokenKind::KwRepeat:
+        case TokenKind::KwDo:
+        case TokenKind::KwSelect:
+        case TokenKind::KwUnsafe: {
+            auto decl = parseDeclaration();
+            if (decl) {
+                auto stmt = makeNode<DeclStmt>();
+                stmt->decl = std::move(decl);
+                return stmt;
+            }
+            return nullptr;
+        }
         default: {
             // Try expression statement
             ExprPtr expr = parseExpression();
@@ -894,7 +993,7 @@ ExprPtr Parser::parseExpression() {
 }
 
 ExprPtr Parser::parseAssignmentExpr() {
-    ExprPtr left = parseTernaryExpr();
+    ExprPtr left = parseRangeExpr();
 
     // Assignment operators
     if (peek().isAssignmentOperator()) {
@@ -1009,6 +1108,28 @@ ExprPtr Parser::parseComparisonExpr() {
         else break;
 
         ExprPtr right = parseShiftExpr();
+        auto expr = makeNode<BinaryExpr>();
+        expr->op = op;
+        expr->left = std::move(left);
+        expr->right = std::move(right);
+        left = std::move(expr);
+    }
+
+    return left;
+}
+
+ExprPtr Parser::parseRangeExpr() {
+    ExprPtr left = parseLogicalOrExpr();
+
+    // Range operators: ..< (half-open), ... (closed)
+    // Lower precedence than logical or, higher than assignment
+    while (true) {
+        TokenKind op;
+        if (match(TokenKind::Range))     op = TokenKind::Range;     // ..<
+        else if (match(TokenKind::Ellipsis)) op = TokenKind::Ellipsis; // ...
+        else break;
+
+        ExprPtr right = parseLogicalOrExpr();
         auto expr = makeNode<BinaryExpr>();
         expr->op = op;
         expr->left = std::move(left);
@@ -1139,7 +1260,8 @@ ExprPtr Parser::parsePostfixExpr() {
         } else if (check(TokenKind::Dot) || check(TokenKind::Question)) {
             bool isOptional = match(TokenKind::Question);
             if (match(TokenKind::Dot)) {
-                if (check(TokenKind::Identifier)) {
+                // Member name can be an identifier or a keyword (init, deinit, self, etc.)
+                if (check(TokenKind::Identifier) || peek().isKeyword()) {
                     auto member = makeNode<MemberAccessExpr>();
                     member->base = std::move(expr);
                     member->member = std::string(advance().stringValue);
@@ -1285,7 +1407,18 @@ ExprPtr Parser::parsePrimaryExpr() {
         }
 
         // Closure: { params -> return in body } or () => expr
+        // Set literal: {1, 2, 3} — distinguished by context
         case TokenKind::LBrace: {
+            // Heuristic: if { is followed by a literal, number, or string,
+            // it's likely a set literal, not a closure. Return nullptr to let
+            // the caller handle it as an expression statement.
+            if (peekAt(1).isOneOf({
+                TokenKind::IntegerLiteral, TokenKind::FloatLiteral,
+                TokenKind::StringLiteral, TokenKind::CharLiteral,
+                TokenKind::True, TokenKind::False, TokenKind::Nil})) {
+                return nullptr; // caller will report error
+            }
+
             auto closure = makeNode<ClosureExpr>();
             advance(); // {
 
@@ -1723,7 +1856,16 @@ std::vector<std::string> Parser::parseGenericParams() {
     expect(TokenKind::Less);
     do {
         if (check(TokenKind::Identifier)) {
-            params.push_back(std::string(advance().stringValue));
+            std::string name = std::string(advance().stringValue);
+            // Optional constraint: T: Protocol, T: A & B
+            if (match(TokenKind::Colon)) {
+                // Skip constraint types until we hit ',' or '>'
+                // TODO: parse and store constraints properly
+                while (!check(TokenKind::Comma) && !check(TokenKind::Greater) && !isAtEnd()) {
+                    advance();
+                }
+            }
+            params.push_back(name);
         } else {
             error("expected generic parameter name");
         }
