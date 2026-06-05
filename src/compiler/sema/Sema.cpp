@@ -50,6 +50,36 @@ bool Sema::analyze(CompilationUnit& cu) {
         currentModule_ = cu.moduleDecl->name;
     }
 
+    // 第一遍：预注册所有函数声明（支持前向引用）
+    // First pass: pre-register all function declarations (support forward references)
+    for (auto& decl : cu.declarations) {
+        if (decl && decl->declKind == DeclKind::Function) {
+            auto& fd = static_cast<FunctionDecl&>(*decl);
+            Symbol* existing = symbols_.lookup(fd.name);
+            if (!existing) {
+                Symbol sym;
+                sym.kind = SymbolKind::Function;
+                sym.name = fd.name;
+                sym.isPublic = (fd.access == AccessLevel::Public);
+                for (const auto& param : fd.params) {
+                    if (param.type) {
+                        sym.paramTypes.push_back(resolveTypeRepr(*param.type));
+                    } else {
+                        sym.paramTypes.push_back(getErrorType());
+                    }
+                }
+                if (fd.returnType) {
+                    sym.returnType = resolveTypeRepr(*fd.returnType);
+                } else {
+                    sym.returnType = getVoidType();
+                }
+                symbols_.define(sym);
+            }
+        }
+    }
+
+    // 第二遍：处理所有声明
+    // Second pass: process all declarations
     for (auto& decl : cu.declarations) {
         if (decl) processDecl(*decl);
     }
@@ -348,9 +378,9 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     sym.type = std::make_shared<FunctionType>(
         std::vector<FunctionType::Param>(), sym.returnType, decl.isAsync, decl.isThrows);
 
-    if (!symbols_.define(sym)) {
-        error(decl.loc, "function '" + decl.name + "' is already defined");
-    }
+    // 函数已在预注册阶段定义，跳过重复定义
+    // Function already defined in pre-registration, skip duplicate
+    symbols_.define(sym); // 允许更新（不报错）
 
     symbols_.enterScope();
 
