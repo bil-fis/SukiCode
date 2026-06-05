@@ -152,18 +152,24 @@ void Sema::processDecl(Decl& decl) {
             break;
         }
         case DeclKind::Actor: {
-            // Actor: 处理为类类型
+            // Actor: 处理为类类型，注册为 Actor
             auto& actor = static_cast<ActorDecl&>(decl);
             Symbol sym;
             sym.kind = SymbolKind::Type;
             sym.name = actor.name;
             sym.isPublic = (actor.access == AccessLevel::Public);
             symbols_.define(sym);
+            // 注册 Actor 类型 / Register actor type
+            actorTypes_.insert(actor.name);
+            // 进入 Actor 作用域 / Enter actor scope
+            std::string prevActor = currentActor_;
+            currentActor_ = actor.name;
             symbols_.enterScope();
             for (auto& member : actor.members) {
                 if (member) processDecl(*member);
             }
             symbols_.leaveScope();
+            currentActor_ = prevActor;
             break;
         }
         case DeclKind::Typealias: {
