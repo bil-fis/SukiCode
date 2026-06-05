@@ -60,7 +60,14 @@ bool Sema::analyze(CompilationUnit& cu) {
 void Sema::processDecl(Decl& decl) {
     switch (decl.declKind) {
         case DeclKind::Module: break;
-        case DeclKind::Import: break;
+        case DeclKind::Import: {
+            // 注册导入模块 / Register imported module
+            auto& imp = static_cast<ImportDecl&>(decl);
+            // TODO: 实际模块文件查找和加载
+            // 目前只记录模块名 / Currently just record module name
+            importedModules_.push_back(imp.moduleName);
+            break;
+        }
         case DeclKind::Variable:
             processVariableDecl(static_cast<VariableDecl&>(decl));
             break;

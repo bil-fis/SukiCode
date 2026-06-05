@@ -57,6 +57,7 @@ private:
     TypeChecker typeChecker_;
     std::string currentModule_;
     TypePtr currentReturnType_; // Current function's return type for checking
+    std::vector<std::string> importedModules_; // 已导入模块列表
 };
 
 } // namespace suki
