@@ -15,6 +15,8 @@ add_library(sukicompiler STATIC
     sema/Sema.cpp
     sema/TypeChecker.cpp
     sema/Scope.cpp
+    sema/Type.cpp
+    sema/SymbolTable.cpp
     # IR Generation
     codegen/IRGenerator.cpp
     codegen/TypeConverter.cpp
