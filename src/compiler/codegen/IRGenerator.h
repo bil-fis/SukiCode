@@ -111,6 +111,9 @@ private:
     // 函数注册 / Function registry
     std::unordered_map<std::string, llvm::Function*> functions_;
 
+    // 类型注册 / Type registry (struct/class/enum names -> LLVM types)
+    std::unordered_map<std::string, llvm::StructType*> structTypes_;
+
     // 泛型函数实例化 / Generic function instantiation
     std::unordered_map<std::string, const FunctionDecl*> genericFuncAsts_;
     const CompilationUnit* currentCu_ = nullptr;

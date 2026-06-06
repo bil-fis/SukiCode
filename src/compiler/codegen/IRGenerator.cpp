@@ -221,6 +221,45 @@ void IRGenerator::genDecl(const Decl& decl) {
         case DeclKind::Variable:
             genVariableDecl(static_cast<const VariableDecl&>(decl));
             break;
+        case DeclKind::Struct: {
+            auto& sd = static_cast<const StructDecl&>(decl);
+            // 生成 LLVM struct 类型 / Generate LLVM struct type
+            std::vector<llvm::Type*> fieldTypes;
+            for (const auto& member : sd.members) {
+                if (member && member->declKind == DeclKind::Variable) {
+                    auto& vd = static_cast<const VariableDecl&>(*member);
+                    fieldTypes.push_back(resolveType(vd.typeAnnotation.get()));
+                }
+            }
+            llvm::StructType* structType = llvm::StructType::create(context_, sd.name);
+            structType->setBody(fieldTypes);
+            structTypes_[sd.name] = structType;
+            break;
+        }
+        case DeclKind::Class: {
+            auto& cd = static_cast<const ClassDecl&>(decl);
+            // Class 生成指针类型（引用类型）
+            llvm::StructType* classType = llvm::StructType::create(context_, cd.name);
+            std::vector<llvm::Type*> fieldTypes;
+            for (const auto& member : cd.members) {
+                if (member && member->declKind == DeclKind::Variable) {
+                    auto& vd = static_cast<const VariableDecl&>(*member);
+                    fieldTypes.push_back(resolveType(vd.typeAnnotation.get()));
+                }
+            }
+            classType->setBody(fieldTypes);
+            structTypes_[cd.name] = classType;
+            break;
+        }
+        case DeclKind::Enum: {
+            auto& ed = static_cast<const EnumDecl&>(decl);
+            // Enum 生成 tagged union 类型
+            llvm::StructType* enumType = llvm::StructType::create(context_, ed.name);
+            // 简化：tag (i32) + payload (i64)
+            enumType->setBody({llvm::Type::getInt32Ty(context_), llvm::Type::getInt64Ty(context_)});
+            structTypes_[ed.name] = enumType;
+            break;
+        }
         case DeclKind::If:
             genIfStmt(static_cast<const IfDecl&>(decl));
             break;
@@ -1275,7 +1314,24 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
 }
 
 llvm::Value* IRGenerator::genMemberAccess(const MemberAccessExpr& expr) {
-    // TODO: 基于基类型的成员查找
+    if (!expr.base) return nullptr;
+
+    // 生成基表达式 / Generate base expression
+    llvm::Value* base = genExpr(*expr.base);
+    if (!base) return nullptr;
+
+    // 查找成员 / Find member
+    // 简化实现：通过成员名查找字段索引
+    // TODO: 完整的类型驱动成员查找
+    std::string memberName = expr.member;
+
+    // 尝试从命名值中查找 / Try to find from named values
+    auto it = namedValues_.find(memberName);
+    if (it != namedValues_.end()) {
+        return builder_->CreateLoad(namedTypes_[memberName], it->second, memberName);
+    }
+
+    // TODO: 结构体字段访问 GEP
     return nullptr;
 }
 
