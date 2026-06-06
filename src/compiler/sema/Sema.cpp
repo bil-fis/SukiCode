@@ -307,6 +307,13 @@ void Sema::processDecl(Decl& decl) {
             typeChecker_.leaveUnsafe();
             break;
         }
+        case DeclKind::Asm: {
+            // 内联汇编必须在 unsafe 块内 / Inline assembly must be in unsafe block
+            if (!typeChecker_.isInUnsafe()) {
+                error(decl.loc, "inline assembly (asm) must be inside an unsafe block");
+            }
+            break;
+        }
         default: break;
     }
 }
