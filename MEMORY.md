@@ -52,6 +52,7 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 - **数据编码**: Base64、Hex、GZip、Zlib、XML、CSV、MessagePack
 - **网络库**: URL、JSON、Socket（TCP/UDP）、URLSession HTTP 客户端
 - **国际化**: LocalizedString、NumberFormatter、CurrencyFormatter、DateFormatter
+- **宏系统**: @macro 声明、@freestanding/@attached、#macroName(args) 展开、#unique 卫生宏、沙箱执行
 - **测试**: 20/20 测试全部通过
 - **TODO**: 0 个待办事项
 - **死代码**: 已清理 Scope.h/cpp、TypeConverter.h/cpp、StringInterner.h/cpp
