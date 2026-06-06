@@ -105,4 +105,52 @@ std::vector<UnicodeScalar> String::unicodeScalars() const {
     return result;
 }
 
+std::vector<char16_t> String::utf16() const {
+    std::vector<char16_t> result;
+    for (size_t i = 0; i < data_->size(); ) {
+        unsigned char c = static_cast<unsigned char>((*data_)[i]);
+        UnicodeScalar scalar = 0;
+
+        if (c < 0x80) {
+            scalar = c;
+            i += 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            scalar = c & 0x1F;
+            if (i + 1 < data_->size()) {
+                scalar = (scalar << 6) | (static_cast<unsigned char>((*data_)[i + 1]) & 0x3F);
+            }
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            scalar = c & 0x0F;
+            if (i + 2 < data_->size()) {
+                scalar = (scalar << 6) | (static_cast<unsigned char>((*data_)[i + 1]) & 0x3F);
+                scalar = (scalar << 6) | (static_cast<unsigned char>((*data_)[i + 2]) & 0x3F);
+            }
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            scalar = c & 0x07;
+            if (i + 3 < data_->size()) {
+                scalar = (scalar << 6) | (static_cast<unsigned char>((*data_)[i + 1]) & 0x3F);
+                scalar = (scalar << 6) | (static_cast<unsigned char>((*data_)[i + 2]) & 0x3F);
+                scalar = (scalar << 6) | (static_cast<unsigned char>((*data_)[i + 3]) & 0x3F);
+            }
+            i += 4;
+        } else {
+            scalar = c;
+            i += 1;
+        }
+
+        // Encode as UTF-16
+        if (scalar < 0x10000) {
+            result.push_back(static_cast<char16_t>(scalar));
+        } else {
+            // Surrogate pair
+            scalar -= 0x10000;
+            result.push_back(static_cast<char16_t>(0xD800 + (scalar >> 10)));
+            result.push_back(static_cast<char16_t>(0xDC00 + (scalar & 0x3FF)));
+        }
+    }
+    return result;
+}
+
 } // namespace suki::stdlib

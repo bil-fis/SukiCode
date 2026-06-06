@@ -124,6 +124,13 @@ public:
     // 替换 / Replace
     String replacing(const String& target, const String& replacement) const;
 
+    // UTF-8 视图 / UTF-8 view
+    const char* utf8() const { return data_->c_str(); }
+    size_t utf8Length() const { return data_->size(); }
+
+    // UTF-16 视图 / UTF-16 view
+    std::vector<char16_t> utf16() const;
+
     // 哈希 / Hash
     size_t hash() const {
         return std::hash<std::string>{}(*data_);
