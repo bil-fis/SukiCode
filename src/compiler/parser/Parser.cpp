@@ -1690,16 +1690,21 @@ ExprPtr Parser::parsePrimaryExpr() {
         }
 
         // Closure: { params -> return in body } or () => expr
-        // Set literal: {1, 2, 3} — distinguished by context
+        // Closure or set literal: {1, 2, 3} vs { body }
         case TokenKind::LBrace: {
-            // Heuristic: if { is followed by a literal, number, or string,
-            // it's likely a set literal, not a closure. Return nullptr to let
-            // the caller handle it as an expression statement.
+            // Heuristic: if { is followed by a literal, it's a set literal
             if (peekAt(1).isOneOf({
                 TokenKind::IntegerLiteral, TokenKind::FloatLiteral,
                 TokenKind::StringLiteral, TokenKind::CharLiteral,
                 TokenKind::True, TokenKind::False, TokenKind::Nil})) {
-                return nullptr; // caller will report error
+                // Parse as set literal: {1, 2, 3}
+                advance(); // {
+                auto setLit = makeNode<SetLiteralExpr>();
+                do {
+                    setLit->elements.push_back(parseExpression());
+                } while (match(TokenKind::Comma));
+                expect(TokenKind::RBrace);
+                return setLit;
             }
 
             auto closure = makeNode<ClosureExpr>();
