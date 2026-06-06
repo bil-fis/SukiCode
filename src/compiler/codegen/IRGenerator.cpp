@@ -737,23 +737,50 @@ void IRGenerator::genSwitchStmt(const SwitchDecl& decl) {
 }
 
 void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
-    // 简化实现：只执行 do 块（不做异常处理）
+    llvm::Function* func = builder_->GetInsertBlock()->getParent();
+
+    // 创建基本块 / Create basic blocks
+    llvm::BasicBlock* doBB = llvm::BasicBlock::Create(context_, "do.body", func);
+    llvm::BasicBlock* catchBB = llvm::BasicBlock::Create(context_, "catch.body", func);
+    llvm::BasicBlock* endBB = llvm::BasicBlock::Create(context_, "do.end", func);
+
+    // 跳转到 do 块 / Jump to do block
+    builder_->CreateBr(doBB);
+    builder_->SetInsertPoint(doBB);
+
+    // 生成 do 块体 / Generate do block body
     for (const auto& s : decl.doBody) {
         if (s) genStmt(*s);
     }
+
+    // 如果 do 块没有终结指令，跳转到结束块
+    if (!builder_->GetInsertBlock()->getTerminator()) {
+        builder_->CreateBr(endBB);
+    }
+
+    // 生成 catch 块 / Generate catch block
+    builder_->SetInsertPoint(catchBB);
+    for (const auto& catchClause : decl.catches) {
+        for (const auto& s : catchClause.body) {
+            if (s) genStmt(*s);
+        }
+    }
+    if (!builder_->GetInsertBlock()->getTerminator()) {
+        builder_->CreateBr(endBB);
+    }
+
+    // 结束块 / End block
+    builder_->SetInsertPoint(endBB);
 }
 
 void IRGenerator::genThrowStmt(const ThrowDecl& decl) {
-    // 简化实现：调用 abort
-    llvm::Function* abortFunc = module_->getFunction("abort");
-    if (!abortFunc) {
-        llvm::FunctionType* abortTy = llvm::FunctionType::get(
-            llvm::Type::getVoidTy(context_), false);
-        abortFunc = llvm::Function::Create(abortTy, llvm::Function::ExternalLinkage,
-                                           "abort", module_.get());
+    // 简化实现：生成错误值并返回
+    // TODO: 完整的异常处理机制
+    if (currentFunc_->getReturnType()->isVoidTy()) {
+        builder_->CreateRetVoid();
+    } else {
+        builder_->CreateRet(llvm::Constant::getNullValue(currentFunc_->getReturnType()));
     }
-    builder_->CreateCall(abortFunc);
-    builder_->CreateUnreachable();
 }
 
 // ─── 表达式代码生成 / Expression codegen ───────────────────────────────
