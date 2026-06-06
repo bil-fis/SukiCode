@@ -37,11 +37,12 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 
 ## 项目状态 (2026-06-06)
 - **编译器前端**: 词法分析、语法分析、语义分析完整实现
-- **代码生成**: LLVM IR 生成支持所有主要特性（结构体、类、枚举、泛型单态化、异常处理、闭包、for-in 循环等）
-- **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue 等完整实现
+- **代码生成**: LLVM IR 生成支持所有主要特性（结构体、类、枚举、泛型单态化、异常处理、闭包变量捕获、for-in 循环、可选链、强制解包等）
+- **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList 等完整实现
 - **加密库**: SHA256、MD5、HMAC-SHA256、AES-128 ECB、ChaCha20 完整实现
 - **测试**: 20/20 测试全部通过
 - **TODO**: 0 个待办事项
+- **死代码**: 已清理 Scope.h/cpp、TypeConverter.h/cpp
 
 ## 相关记忆
 - [[suki-language-spec]] — SukiCode 语言规范文档 (SukiCode_Specification.md)
