@@ -164,6 +164,39 @@ llvm::Type* IRGenerator::resolveType(const TypeRepr* tr) {
 
     if (tr->typeReprKind == TypeReprKind::Named) {
         auto& n = static_cast<const NamedTypeRepr&>(*tr);
+        // 检查是否有泛型参数 / Check for generic arguments
+        if (!n.genericArgs.empty()) {
+            // 生成特化类型名 / Generate specialized type name
+            std::string specName = n.name + "<";
+            for (size_t i = 0; i < n.genericArgs.size(); i++) {
+                if (i > 0) specName += ",";
+                if (n.genericArgs[i]->typeReprKind == TypeReprKind::Named) {
+                    specName += static_cast<const NamedTypeRepr&>(*n.genericArgs[i]).name;
+                } else {
+                    specName += "?";
+                }
+            }
+            specName += ">";
+            // 检查是否已存在 / Check if already exists
+            auto it = genericTypeInstances_.find(specName);
+            if (it != genericTypeInstances_.end()) return it->second;
+            // 查找原始泛型类型 / Find original generic type
+            auto structIt = structTypes_.find(n.name);
+            if (structIt != structTypes_.end()) {
+                // 创建特化版本 / Create specialized version
+                llvm::StructType* specType = llvm::StructType::create(context_, specName);
+                // 获取原始类型的字段类型并替换泛型参数
+                std::vector<llvm::Type*> bodyTypes;
+                for (size_t i = 0; i < structIt->second->getNumElements(); i++) {
+                    bodyTypes.push_back(structIt->second->getElementType(i));
+                }
+                specType->setBody(bodyTypes);
+                genericTypeInstances_[specName] = specType;
+                return specType;
+            }
+            // 如果找不到原始类型，返回默认
+            return getLLVMType(n.name);
+        }
         return getLLVMType(n.name);
     }
     if (tr->typeReprKind == TypeReprKind::Array) {
@@ -255,6 +288,8 @@ void IRGenerator::genDecl(const Decl& decl) {
             // Class 生成指针类型（引用类型）
             llvm::StructType* classType = llvm::StructType::create(context_, cd.name);
             std::vector<llvm::Type*> fieldTypes;
+            // 第一个字段是 vtable 指针 / First field is vtable pointer
+            fieldTypes.push_back(llvm::PointerType::get(context_, 0));
             for (const auto& member : cd.members) {
                 if (member && member->declKind == DeclKind::Variable) {
                     auto& vd = static_cast<const VariableDecl&>(*member);
@@ -263,7 +298,53 @@ void IRGenerator::genDecl(const Decl& decl) {
             }
             classType->setBody(fieldTypes);
             structTypes_[cd.name] = classType;
-            // 只处理 deinit（其他成员在顶层处理）/ Only process deinit (other members processed at top level)
+
+            // 收集方法并生成 vtable / Collect methods and generate vtable
+            VTableInfo vtable;
+            std::vector<llvm::Type*> vtableFieldTypes;
+            for (const auto& member : cd.members) {
+                if (member && member->declKind == DeclKind::Function) {
+                    auto& fd = static_cast<const FunctionDecl&>(*member);
+                    // 生成函数类型 / Generate function type
+                    std::vector<llvm::Type*> paramTypes;
+                    paramTypes.push_back(llvm::PointerType::get(context_, 0)); // self
+                    for (const auto& p : fd.params) {
+                        paramTypes.push_back(resolveType(p.type.get()));
+                    }
+                    llvm::Type* retType = fd.returnType ?
+                        resolveType(fd.returnType.get()) :
+                        llvm::Type::getVoidTy(context_);
+                    llvm::FunctionType* methodTy = llvm::FunctionType::get(retType, paramTypes, false);
+                    vtableFieldTypes.push_back(llvm::PointerType::get(context_, 0));
+                    vtable.methodIndices[fd.name] = vtable.methods.size();
+                    // 预注册方法函数 / Pre-register method function
+                    std::string methodName = cd.name + "." + fd.name;
+                    llvm::Function* methodFunc = module_->getFunction(methodName);
+                    if (!methodFunc) {
+                        methodFunc = llvm::Function::Create(
+                            methodTy, llvm::Function::ExternalLinkage, methodName, module_.get());
+                        methodFunc->arg_begin()->setName("self");
+                        size_t pIdx = 1;
+                        for (auto it = std::next(methodFunc->arg_begin());
+                             it != methodFunc->arg_end(); ++it) {
+                            if (pIdx - 1 < fd.params.size()) {
+                                it->setName(fd.params[pIdx - 1].internalName);
+                            }
+                            pIdx++;
+                        }
+                        functions_[methodName] = methodFunc;
+                    }
+                    vtable.methods.push_back(methodFunc);
+                }
+            }
+            // 创建 vtable 类型 / Create vtable type
+            if (!vtableFieldTypes.empty()) {
+                vtable.vtableType = llvm::StructType::create(context_, cd.name + ".VTable");
+                vtable.vtableType->setBody(vtableFieldTypes);
+            }
+            vtables_[cd.name] = vtable;
+
+            // 只处理 deinit / Only process deinit
             std::string prevDeinitType = currentTypeNameForDeinit_;
             currentTypeNameForDeinit_ = cd.name;
             for (const auto& member : cd.members) {

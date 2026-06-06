@@ -141,6 +141,18 @@ private:
     std::unordered_map<std::string, llvm::Function*> deinitFuncs_;
     std::string currentTypeNameForDeinit_; // 当前类名（用于关联 deinit）
 
+    // vtable 注册 / VTable registry
+    struct VTableInfo {
+        llvm::StructType* vtableType = nullptr;
+        std::unordered_map<std::string, size_t> methodIndices; // 方法名 -> vtable 索引
+        std::vector<llvm::Function*> methods; // 方法函数指针
+    };
+    std::unordered_map<std::string, VTableInfo> vtables_;
+
+    // 泛型类型单态化 / Generic type monomorphization
+    // 记录泛型类型的特化版本: "Stack<Int>" -> LLVM struct type
+    std::unordered_map<std::string, llvm::StructType*> genericTypeInstances_;
+
     // 函数注册 / Function registry
     std::unordered_map<std::string, llvm::Function*> functions_;
 
