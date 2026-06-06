@@ -123,6 +123,9 @@ private:
     // 闭包计数器 / Closure counter
     int nextClosureId_ = 0;
 
+    // defer 栈 / Defer stack
+    std::vector<std::vector<const Stmt*>> deferStack_;
+
     // 控制流块 / Control flow blocks (for break/continue)
     struct LoopInfo {
         llvm::BasicBlock* condBlock;

@@ -379,9 +379,29 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
 
 void IRGenerator::genStmt(const Stmt& stmt) {
     switch (stmt.stmtKind) {
-        case StmtKind::Return:     genReturnStmt(static_cast<const ReturnStmt&>(stmt)); break;
+        case StmtKind::Return: {
+            // 执行 defer 块 / Execute defer blocks
+            for (auto it = deferStack_.rbegin(); it != deferStack_.rend(); ++it) {
+                for (const auto& deferStmt : *it) {
+                    if (deferStmt) genStmt(*deferStmt);
+                }
+            }
+            genReturnStmt(static_cast<const ReturnStmt&>(stmt));
+            break;
+        }
         case StmtKind::Expression: genExprStmt(static_cast<const ExpressionStmt&>(stmt)); break;
-        case StmtKind::Compound:   genCompoundStmt(static_cast<const CompoundStmt&>(stmt)); break;
+        case StmtKind::Compound: {
+            // 进入新的 defer 作用域 / Enter new defer scope
+            deferStack_.push_back({});
+            genCompoundStmt(static_cast<const CompoundStmt&>(stmt));
+            // 退出作用域时执行 defer / Execute defer on scope exit
+            auto& defers = deferStack_.back();
+            for (auto it = defers.rbegin(); it != defers.rend(); ++it) {
+                if (*it) genStmt(**it);
+            }
+            deferStack_.pop_back();
+            break;
+        }
         case StmtKind::VariableDecl: {
             auto& vs = static_cast<const VariableDeclStmt&>(stmt);
             if (vs.varDecl) genVariableDecl(static_cast<const VariableDecl&>(*vs.varDecl));
@@ -390,6 +410,13 @@ void IRGenerator::genStmt(const Stmt& stmt) {
         case StmtKind::DeclStmt: {
             auto& ds = static_cast<const DeclStmt&>(stmt);
             if (ds.decl) genDecl(*ds.decl);
+            break;
+        }
+        case StmtKind::Defer: {
+            // 注册 defer 块到当前作用域 / Register defer block to current scope
+            if (!deferStack_.empty()) {
+                deferStack_.back().push_back(&stmt);
+            }
             break;
         }
         case StmtKind::Break: {
