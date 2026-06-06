@@ -67,6 +67,7 @@ private:
     // ─── Conditional compilation ───────────────────────────────────────────
     bool evaluateCondition(); // 评估 #if 条件
     void skipUntilHashEnd();  // 跳过到 #endif
+    void skipUntilHashEndOrNext(); // 跳过到 #elseif/#else/#endif
 
     // ─── State ────────────────────────────────────────────────────────────
     std::string_view source_;

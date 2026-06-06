@@ -148,14 +148,20 @@ Token Lexer::scanToken() {
                 skipWhitespace();
                 bool condition = evaluateCondition();
                 if (!condition) {
-                    skipUntilHashEnd();
+                    skipUntilHashEndOrNext();
                 }
-                // 继续扫描下一个 token
                 return next();
             }
             if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
                 // #else — 在 #if 块内，跳过到 #endif
                 advance(); advance(); advance(); advance(); // skip 'else'
+                skipUntilHashEnd();
+                return next();
+            }
+            if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e' &&
+                peekAt(4) == 'i' && peekAt(5) == 'f') {
+                // #elseif — 在 #if 块内，跳过到 #endif
+                advance(); advance(); advance(); advance(); advance(); advance(); // skip 'elseif'
                 skipUntilHashEnd();
                 return next();
             }
@@ -849,9 +855,42 @@ void Lexer::skipUntilHashEnd() {
             if (peek() == 'i' && peekAt(1) == 'f') {
                 depth++;
                 advance(); advance();
+
             } else if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' &&
                        peekAt(3) == 'i' && peekAt(4) == 'f') {
                 depth--;
+                advance(); advance(); advance(); advance(); advance();
+            }
+        }
+    }
+}
+
+void Lexer::skipUntilHashEndOrNext() {
+    // 跳过到下一个 #elseif, #else, 或 #endif
+    int depth = 1;
+    while (pos_ < source_.size() && depth > 0) {
+        // 跳过到行首的 #
+        while (pos_ < source_.size() && peek() != '\n') {
+            advance();
+        }
+        if (peek() == '\n') advance(); // skip newline
+
+        skipWhitespace();
+        if (peek() == '#') {
+            advance(); // skip #
+            if (peek() == 'i' && peekAt(1) == 'f') {
+                depth++;
+                advance(); advance();
+            } else if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
+                if (depth == 1) {
+                    // Found #else or #elseif at the same level — stop here
+                    return;
+                }
+                advance(); advance(); advance(); advance();
+            } else if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' &&
+                       peekAt(3) == 'i' && peekAt(4) == 'f') {
+                depth--;
+                if (depth == 0) return; // Found #endif — stop here
                 advance(); advance(); advance(); advance(); advance();
             }
         }
