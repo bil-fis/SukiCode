@@ -18,9 +18,12 @@ struct ProcessResult {
 class Process {
 public:
     // 执行命令并等待 / Execute command and wait
+    // 通过 2>&1 同时捕获 stdout 和 stderr
     static ProcessResult exec(const std::string& command) {
         ProcessResult result;
-        FILE* pipe = popen(command.c_str(), "r");
+        // 重定向 stderr 到 stdout 以同时捕获两者
+        std::string cmd = command + " 2>&1";
+        FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
             result.exitCode = -1;
             return result;
@@ -29,7 +32,12 @@ public:
         while (fgets(buffer, sizeof(buffer), pipe)) {
             result.output += buffer;
         }
-        result.exitCode = pclose(pipe);
+        int status = pclose(pipe);
+#ifdef _WIN32
+        result.exitCode = status;
+#else
+        result.exitCode = WEXITSTATUS(status);
+#endif
         return result;
     }
 

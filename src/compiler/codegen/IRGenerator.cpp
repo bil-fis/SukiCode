@@ -623,10 +623,16 @@ void IRGenerator::genForInStmt(const ForInDecl& decl) {
         // 存储数据指针以便后续按索引访问
         seqExpr = data;
     } else if (seqExpr->getType()->isPointerTy()) {
-        // 指针类型，假设指向数组结构
-        length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 10); // fallback
+        // 指针类型：尝试从数组结构加载长度
+        // Pointer type: try to load length from array struct
+        // 如果指针指向 {data_ptr, count, capacity} 结构
+        llvm::Type* i64Ty = llvm::Type::getInt64Ty(context_);
+        llvm::Value* countPtr = builder_->CreateGEP(i64Ty, seqExpr,
+            llvm::ConstantInt::get(i64Ty, 1), "arr.count.ptr");
+        length = builder_->CreateLoad(i64Ty, countPtr, "arr.count");
     } else {
-        length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 10);
+        // 其他类型：默认空迭代
+        length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 0);
     }
 
     // 创建循环变量 / Create loop variable
@@ -1084,7 +1090,10 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             for (auto* ty : capturedTypes) {
                 paramTypes.push_back(llvm::PointerType::get(context_, 0));
             }
-            llvm::Type* retType = llvm::Type::getVoidTy(context_);
+            // 确定闭包返回类型 / Determine closure return type
+            llvm::Type* retType = closure.returnType ?
+                resolveType(closure.returnType.get()) :
+                llvm::Type::getVoidTy(context_);
             llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
             llvm::Function* func = llvm::Function::Create(
                 funcType, llvm::Function::InternalLinkage, funcName, module_.get());

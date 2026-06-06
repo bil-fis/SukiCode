@@ -98,6 +98,56 @@ public:
         return write(line + "\n");
     }
 
+    // 写入字节 / Write bytes
+    bool writeBytes(const std::vector<uint8_t>& data) {
+        if (!isOpen_) return false;
+        stream_->write(reinterpret_cast<const char*>(data.data()), data.size());
+        return stream_->good();
+    }
+
+    // 读取字节 / Read bytes
+    std::vector<uint8_t> readBytes(size_t count) {
+        std::vector<uint8_t> result(count);
+        if (!isOpen_) return result;
+        stream_->read(reinterpret_cast<char*>(result.data()), count);
+        result.resize(static_cast<size_t>(stream_->gcount()));
+        return result;
+    }
+
+    // 读取所有字节 / Read all bytes
+    std::vector<uint8_t> readAllBytes() {
+        if (!isOpen_) return {};
+        auto pos = stream_->tellg();
+        stream_->seekg(0, std::ios::end);
+        auto size = stream_->tellg();
+        stream_->seekg(pos);
+        return readBytes(static_cast<size_t>(size - pos));
+    }
+
+    // 定位 / Seek
+    bool seek(long long offset, std::ios::seekdir origin = std::ios::beg) {
+        if (!isOpen_) return false;
+        stream_->seekg(offset, origin);
+        stream_->seekp(offset, origin);
+        return stream_->good();
+    }
+
+    // 当前位置 / Tell
+    long long tell() {
+        if (!isOpen_) return -1;
+        return static_cast<long long>(stream_->tellg());
+    }
+
+    // 文件大小 / File size
+    long long fileSize() {
+        if (!isOpen_) return -1;
+        auto pos = stream_->tellg();
+        stream_->seekg(0, std::ios::end);
+        auto size = stream_->tellg();
+        stream_->seekg(pos);
+        return static_cast<long long>(size);
+    }
+
     // 关闭 / Close
     void close() {
         if (stream_) {

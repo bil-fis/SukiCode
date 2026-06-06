@@ -77,6 +77,39 @@ public:
         return std::vector<T>(data_.begin(), data_.end());
     }
 
+    // 是否是子集 / Is subset
+    bool isSubsetOf(const Set& other) const {
+        for (const auto& item : data_) {
+            if (!other.contains(item)) return false;
+        }
+        return true;
+    }
+
+    // 是否是超集 / Is superset
+    bool isSupersetOf(const Set& other) const {
+        return other.isSubsetOf(*this);
+    }
+
+    // 是否不相交 / Is disjoint
+    bool isDisjointWith(const Set& other) const {
+        for (const auto& item : data_) {
+            if (other.contains(item)) return false;
+        }
+        return true;
+    }
+
+    // 对称差集 / Symmetric difference
+    Set symmetricDifference(const Set& other) const {
+        Set result;
+        for (const auto& item : data_) {
+            if (!other.contains(item)) result.insert(item);
+        }
+        for (const auto& item : other.data_) {
+            if (!contains(item)) result.insert(item);
+        }
+        return result;
+    }
+
     // 迭代 / Iteration
     auto begin() const { return data_.begin(); }
     auto end() const { return data_.end(); }

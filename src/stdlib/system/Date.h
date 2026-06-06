@@ -7,6 +7,10 @@
 #include <chrono>
 #include <thread>
 #include <functional>
+#include <sstream>
+#include <iomanip>
+#include <atomic>
+#include <memory>
 
 namespace suki::stdlib {
 
@@ -54,6 +58,43 @@ public:
         return timestamp() - other.timestamp();
     }
 
+    // 日期算术 / Date arithmetic
+    Date operator+(const TimeInterval& interval) const {
+        Date d;
+        d.timePoint_ = timePoint_ + std::chrono::milliseconds((int)interval.milliseconds());
+        return d;
+    }
+
+    Date operator-(const TimeInterval& interval) const {
+        Date d;
+        d.timePoint_ = timePoint_ - std::chrono::milliseconds((int)interval.milliseconds());
+        return d;
+    }
+
+    TimeInterval operator-(const Date& other) const {
+        return TimeInterval::seconds(timeIntervalSince(other));
+    }
+
+    // ISO 8601 格式 / ISO 8601 format
+    std::string iso8601() const {
+        return formatted("%Y-%m-%dT%H:%M:%SZ");
+    }
+
+    // 从字符串解析 / Parse from string (basic: "YYYY-MM-DD HH:MM:SS")
+    static Date fromString(const std::string& str, const std::string& fmt = "%Y-%m-%d %H:%M:%S") {
+        Date d;
+        std::tm tm = {};
+#ifdef _WIN32
+        std::istringstream ss(str);
+        ss >> std::get_time(&tm, fmt.c_str());
+#else
+        strptime(str.c_str(), fmt.c_str(), &tm);
+#endif
+        auto time = std::mktime(&tm);
+        d.timePoint_ = std::chrono::system_clock::from_time_t(time);
+        return d;
+    }
+
     // 比较 / Comparison
     bool operator==(const Date& other) const { return timePoint_ == other.timePoint_; }
     bool operator!=(const Date& other) const { return timePoint_ != other.timePoint_; }
@@ -94,11 +135,26 @@ public:
     TimeInterval operator/(double factor) const { return TimeInterval(seconds_ / factor); }
 
     bool operator==(const TimeInterval& other) const { return seconds_ == other.seconds_; }
+    bool operator!=(const TimeInterval& other) const { return seconds_ != other.seconds_; }
     bool operator<(const TimeInterval& other) const { return seconds_ < other.seconds_; }
+    bool operator>(const TimeInterval& other) const { return seconds_ > other.seconds_; }
+    bool operator<=(const TimeInterval& other) const { return seconds_ <= other.seconds_; }
+    bool operator>=(const TimeInterval& other) const { return seconds_ >= other.seconds_; }
 
 private:
     explicit TimeInterval(double s) : seconds_(s) {}
     double seconds_;
+};
+
+// 定时器句柄 / Timer handle (for cancellation)
+class TimerHandle {
+public:
+    TimerHandle() : cancelled_(std::make_shared<std::atomic<bool>>(false)) {}
+    void cancel() { *cancelled_ = true; }
+    bool isCancelled() const { return *cancelled_; }
+    std::shared_ptr<std::atomic<bool>> token() const { return cancelled_; }
+private:
+    std::shared_ptr<std::atomic<bool>> cancelled_;
 };
 
 // 定时器 / Timer
@@ -107,21 +163,27 @@ public:
     using Callback = std::function<void()>;
 
     // 一次性定时器 / One-shot timer
-    static void scheduleAfter(TimeInterval delay, Callback callback) {
-        std::thread([delay, callback]() {
+    static TimerHandle scheduleAfter(TimeInterval delay, Callback callback) {
+        TimerHandle handle;
+        auto token = handle.token();
+        std::thread([delay, callback, token]() {
             std::this_thread::sleep_for(std::chrono::milliseconds((int)delay.milliseconds()));
-            callback();
+            if (!*token) callback();
         }).detach();
+        return handle;
     }
 
     // 重复定时器 / Repeating timer
-    static void scheduleRepeating(TimeInterval interval, Callback callback) {
-        std::thread([interval, callback]() {
-            while (true) {
+    static TimerHandle scheduleRepeating(TimeInterval interval, Callback callback) {
+        TimerHandle handle;
+        auto token = handle.token();
+        std::thread([interval, callback, token]() {
+            while (!*token) {
                 std::this_thread::sleep_for(std::chrono::milliseconds((int)interval.milliseconds()));
-                callback();
+                if (!*token) callback();
             }
         }).detach();
+        return handle;
     }
 };
 

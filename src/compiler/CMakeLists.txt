@@ -21,8 +21,6 @@ add_library(sukicompiler STATIC
     codegen/ObjectEmitter.cpp
     # Diagnostics
     diag/Diagnostic.cpp
-    # Utilities
-    util/StringInterner.cpp
 )
 
 target_include_directories(sukicompiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

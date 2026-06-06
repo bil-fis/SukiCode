@@ -4,6 +4,8 @@
 
 #include <string>
 #include <sstream>
+#include <vector>
+#include <cstdio>
 
 namespace suki::stdlib {
 
@@ -51,6 +53,59 @@ public:
     // 检查 / Checks
     bool isValid() const { return !scheme_.empty() && !host_.empty(); }
     bool isSecure() const { return scheme_ == "https" || scheme_ == "wss"; }
+
+    // 百分号编码 / Percent encoding
+    static std::string percentEncode(const std::string& str) {
+        std::string result;
+        for (unsigned char c : str) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                result += static_cast<char>(c);
+            } else {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%%%02X", c);
+                result += buf;
+            }
+        }
+        return result;
+    }
+
+    // 百分号解码 / Percent decoding
+    static std::string percentDecode(const std::string& str) {
+        std::string result;
+        for (size_t i = 0; i < str.size(); i++) {
+            if (str[i] == '%' && i + 2 < str.size()) {
+                int val = 0;
+                if (sscanf(str.c_str() + i + 1, "%2x", &val) == 1) {
+                    result += static_cast<char>(val);
+                    i += 2;
+                } else {
+                    result += str[i];
+                }
+            } else if (str[i] == '+') {
+                result += ' ';
+            } else {
+                result += str[i];
+            }
+        }
+        return result;
+    }
+
+    // 查询参数 / Query parameters
+    std::vector<std::pair<std::string, std::string>> queryParameters() const {
+        std::vector<std::pair<std::string, std::string>> params;
+        std::istringstream stream(query_);
+        std::string pair;
+        while (std::getline(stream, pair, '&')) {
+            size_t eq = pair.find('=');
+            if (eq != std::string::npos) {
+                params.push_back({percentDecode(pair.substr(0, eq)),
+                                  percentDecode(pair.substr(eq + 1))});
+            } else {
+                params.push_back({percentDecode(pair), ""});
+            }
+        }
+        return params;
+    }
 
 private:
     void parse() {

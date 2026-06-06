@@ -45,6 +45,40 @@ public:
     void remove(const K& key) { ensureUnique(); data_->erase(key); }
     void removeAll() { ensureUnique(); data_->clear(); }
 
+    // 合并 / Merge
+    void merge(const Dictionary& other) {
+        ensureUnique();
+        for (const auto& [key, val] : *other.data_) {
+            (*data_)[key] = val;
+        }
+    }
+
+    // 映射值 / Map values
+    template<typename U>
+    Dictionary<K, U> mapValues(std::function<U(const K&, const V&)> transform) const {
+        Dictionary<K, U> result;
+        for (const auto& [key, val] : *data_) {
+            result.set(key, transform(key, val));
+        }
+        return result;
+    }
+
+    // 过滤 / Filter
+    Dictionary filter(std::function<bool(const K&, const V&)> predicate) const {
+        Dictionary result;
+        for (const auto& [key, val] : *data_) {
+            if (predicate(key, val)) result.set(key, val);
+        }
+        return result;
+    }
+
+    // 遍历 / ForEach
+    void forEach(std::function<void(const K&, const V&)> visitor) const {
+        for (const auto& [key, val] : *data_) {
+            visitor(key, val);
+        }
+    }
+
     // 键值对 / Keys and Values
     std::vector<K> keys() const {
         std::vector<K> result;

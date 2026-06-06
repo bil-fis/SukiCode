@@ -93,8 +93,65 @@ public:
     // 排序 / Sort
     void sort() { ensureUnique(); std::sort(data_->begin(), data_->end()); }
 
+    // 带比较器排序 / Sort with comparator
+    void sorted(std::function<bool(const T&, const T&)> comparator) {
+        ensureUnique();
+        std::sort(data_->begin(), data_->end(), comparator);
+    }
+
     // 反转 / Reverse
     void reverse() { ensureUnique(); std::reverse(data_->begin(), data_->end()); }
+
+    // 移除第一个 / Remove first
+    T removeFirst() {
+        if (isEmpty()) throw std::runtime_error("array is empty");
+        ensureUnique();
+        T val = std::move(data_->front());
+        data_->erase(data_->begin());
+        return val;
+    }
+
+    // 移除最后一个 / Remove last
+    T removeLast() {
+        if (isEmpty()) throw std::runtime_error("array is empty");
+        ensureUnique();
+        T val = std::move(data_->back());
+        data_->pop_back();
+        return val;
+    }
+
+    // 弹出第一个 / Pop first (returns Optional-like)
+    T popFirst() { return removeFirst(); }
+
+    // 弹出最后一个 / Pop last
+    T popLast() { return removeLast(); }
+
+    // 平坦映射 / Flat map
+    template<typename U>
+    Array<U> flatMap(std::function<Array<U>(const T&)> transform) const {
+        Array<U> result;
+        for (const auto& item : *data_) {
+            auto mapped = transform(item);
+            for (const auto& m : mapped) {
+                result.append(m);
+            }
+        }
+        return result;
+    }
+
+    // 连接 / Joined
+    Array<T> joined() const {
+        // 适用于 Array<Array<T>> 的展平
+        // This is a placeholder - actual implementation needs type specialization
+        return *this;
+    }
+
+    // 交换元素 / Swap elements
+    void swapAt(size_t i, size_t j) {
+        if (i >= data_->size() || j >= data_->size()) return;
+        ensureUnique();
+        std::swap((*data_)[i], (*data_)[j]);
+    }
 
     // 迭代 / Iteration
     auto begin() const { return data_->begin(); }

@@ -100,11 +100,20 @@ private:
                 break;
             case Type::String:
                 oss << "\"";
-                for (char c : stringValue_) {
+                for (unsigned char c : stringValue_) {
                     if (c == '"') oss << "\\\"";
                     else if (c == '\\') oss << "\\\\";
                     else if (c == '\n') oss << "\\n";
                     else if (c == '\t') oss << "\\t";
+                    else if (c == '\r') oss << "\\r";
+                    else if (c == '\b') oss << "\\b";
+                    else if (c == '\f') oss << "\\f";
+                    else if (c < 0x20) {
+                        // Control characters: \u00XX
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        oss << buf;
+                    }
                     else oss << c;
                 }
                 oss << "\"";
@@ -167,8 +176,43 @@ private:
                     switch (str[pos]) {
                         case 'n': value += '\n'; break;
                         case 't': value += '\t'; break;
+                        case 'r': value += '\r'; break;
+                        case 'b': value += '\b'; break;
+                        case 'f': value += '\f'; break;
                         case '\\': value += '\\'; break;
                         case '"': value += '"'; break;
+                        case '/': value += '/'; break;
+                        case 'u': {
+                            // Unicode escape: \uXXXX
+                            if (pos + 4 < str.size()) {
+                                uint32_t codepoint = 0;
+                                for (int i = 1; i <= 4; i++) {
+                                    char c = str[pos + i];
+                                    codepoint <<= 4;
+                                    if (c >= '0' && c <= '9') codepoint += c - '0';
+                                    else if (c >= 'a' && c <= 'f') codepoint += c - 'a' + 10;
+                                    else if (c >= 'A' && c <= 'F') codepoint += c - 'A' + 10;
+                                }
+                                pos += 4;
+                                // UTF-8 encoding
+                                if (codepoint < 0x80) {
+                                    value += static_cast<char>(codepoint);
+                                } else if (codepoint < 0x800) {
+                                    value += static_cast<char>(0xC0 | (codepoint >> 6));
+                                    value += static_cast<char>(0x80 | (codepoint & 0x3F));
+                                } else if (codepoint < 0x10000) {
+                                    value += static_cast<char>(0xE0 | (codepoint >> 12));
+                                    value += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                                    value += static_cast<char>(0x80 | (codepoint & 0x3F));
+                                } else {
+                                    value += static_cast<char>(0xF0 | (codepoint >> 18));
+                                    value += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+                                    value += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                                    value += static_cast<char>(0x80 | (codepoint & 0x3F));
+                                }
+                            }
+                            break;
+                        }
                         default: value += str[pos]; break;
                     }
                 }
@@ -183,10 +227,19 @@ private:
 
     static JSON parseNumber(const std::string& str, size_t& pos) {
         size_t start = pos;
-        if (str[pos] == '-') pos++;
+        // 符号 / Sign
+        if (pos < str.size() && str[pos] == '-') pos++;
+        // 整数部分 / Integer part
         while (pos < str.size() && str[pos] >= '0' && str[pos] <= '9') pos++;
+        // 小数部分 / Fractional part
         if (pos < str.size() && str[pos] == '.') {
             pos++;
+            while (pos < str.size() && str[pos] >= '0' && str[pos] <= '9') pos++;
+        }
+        // 指数部分 / Exponent part (e/E with optional +/-)
+        if (pos < str.size() && (str[pos] == 'e' || str[pos] == 'E')) {
+            pos++;
+            if (pos < str.size() && (str[pos] == '+' || str[pos] == '-')) pos++;
             while (pos < str.size() && str[pos] >= '0' && str[pos] <= '9') pos++;
         }
         return JSON(std::stod(str.substr(start, pos - start)));

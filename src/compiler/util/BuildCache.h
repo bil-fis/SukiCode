@@ -66,7 +66,7 @@ public:
     size_t entryCount() const {
         size_t count = 0;
         for (const auto& entry : fs::directory_iterator(cacheDir_)) {
-            if (entry.path().extension() == ".json") count++;
+            if (entry.path().extension() == ".hash") count++;
         }
         return count;
     }
