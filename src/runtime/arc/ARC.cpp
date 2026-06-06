@@ -1,6 +1,7 @@
 // ARC runtime implementation.
 #include "ARC.h"
 #include <unordered_set>
+#include <vector>
 #include <mutex>
 
 namespace suki::runtime {
@@ -53,6 +54,36 @@ void weakRelease(void* obj) {
     if (!obj) return;
     auto* header = reinterpret_cast<ARCHeader*>(obj);
     header->weakRefCount.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// ─── AutoreleasePool ────────────────────────────────────────────────────
+
+struct AutoreleasePool::Impl {
+    std::vector<void*> objects;
+    std::mutex mutex;
+};
+
+AutoreleasePool::AutoreleasePool() : impl_(new Impl()) {}
+AutoreleasePool::~AutoreleasePool() { drain(); delete impl_; }
+
+void AutoreleasePool::add(void* obj) {
+    if (!obj) return;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->objects.push_back(obj);
+}
+
+void AutoreleasePool::drain() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (void* obj : impl_->objects) {
+        release(obj);
+    }
+    impl_->objects.clear();
+}
+
+static AutoreleasePool* g_currentPool = nullptr;
+
+AutoreleasePool* currentAutoreleasePool() {
+    return g_currentPool;
 }
 
 void arcInit() {

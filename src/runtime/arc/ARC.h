@@ -24,6 +24,26 @@ void release(void* obj);
 void* weakRetain(void* obj);
 void weakRelease(void* obj);
 
+// Autorelease pool / 自动释放池
+class AutoreleasePool {
+public:
+    AutoreleasePool();
+    ~AutoreleasePool();
+
+    // 添加对象到池 / Add object to pool
+    void add(void* obj);
+
+    // 释放池中所有对象 / Release all objects in pool
+    void drain();
+
+private:
+    struct Impl;
+    Impl* impl_;
+};
+
+// 全局 autorelease pool / Global autorelease pool
+AutoreleasePool* currentAutoreleasePool();
+
 // Initialize the ARC runtime
 void arcInit();
 
