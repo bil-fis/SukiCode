@@ -802,6 +802,10 @@ TypePtr Sema::inferExprType(Expr& expr) {
         }
         case ExprKind::InterpolatedString:
             return getStringType();
+        case ExprKind::SelfRef:
+            return nullptr; // TODO: self 类型
+        case ExprKind::SuperRef:
+            return nullptr; // TODO: super 类型
         default:
             return nullptr;
     }
