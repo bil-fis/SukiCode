@@ -2,6 +2,7 @@
 // SukiLSP - SukiCode Language Server Protocol 实现
 // LSP server for IDE integration.
 
+#include "SymbolIndex.h"
 #include <string>
 #include <functional>
 #include <unordered_map>
@@ -96,6 +97,7 @@ private:
 
     // ─── 状态 / State ──────────────────────────────────────────────────
     std::unordered_map<std::string, Document> documents_;
+    SymbolIndex symbolIndex_;
     bool running_ = true;
 };
 

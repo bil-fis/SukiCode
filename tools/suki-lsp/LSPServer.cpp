@@ -183,6 +183,15 @@ std::string LSPServer::handleCompletion(const std::string& id, const std::string
 
     auto items = getCompletions(uri, position);
 
+    // 添加索引中的符号
+    for (const auto& sym : symbolIndex_.findByFile(uri)) {
+        CompletionItem item;
+        item.label = sym->name;
+        item.kind = static_cast<int>(sym->kind) + 1;
+        item.detail = sym->typeName;
+        items.push_back(item);
+    }
+
     std::ostringstream oss;
     oss << "{\"isIncomplete\":false,\"items\":[";
     for (size_t i = 0; i < items.size(); i++) {
@@ -207,12 +216,26 @@ std::string LSPServer::handleDefinition(const std::string& id, const std::string
     std::string uri;
     if (td["uri"].isString()) uri = td["uri"].stringValue();
 
-    Position position;
-    if (pos["line"].isNumber()) position.line = pos["line"].intValue();
-    if (pos["character"].isNumber()) position.character = pos["character"].intValue();
+    int line = pos["line"].isNumber() ? pos["line"].intValue() : 0;
+    int character = pos["character"].isNumber() ? pos["character"].intValue() : 0;
 
-    // TODO: implement actual go-to-definition
-    // For now, return the same position (no-op)
+    // 查找位置处的符号
+    const SymbolInfo* sym = symbolIndex_.findAtPosition(uri, line + 1, character + 1);
+    if (sym) {
+        // 查找符号定义
+        auto defs = symbolIndex_.findByName(sym->name);
+        if (!defs.empty()) {
+            std::ostringstream oss;
+            oss << "{\"uri\":\"" << defs[0]->file
+                << "\",\"range\":{\"start\":{\"line\":" << (defs[0]->line - 1)
+                << ",\"character\":" << (defs[0]->column - 1)
+                << "},\"end\":{\"line\":" << (defs[0]->line - 1)
+                << ",\"character\":" << (defs[0]->column - 1 + defs[0]->name.size())
+                << "}}}";
+            return createResponse(id, oss.str());
+        }
+    }
+
     return createResponse(id, "null");
 }
 
@@ -237,6 +260,77 @@ std::string LSPServer::handleHover(const std::string& id, const std::string& par
 void LSPServer::analyzeDocument(const std::string& uri) {
     auto it = documents_.find(uri);
     if (it == documents_.end()) return;
+
+    // 清除旧符号
+    symbolIndex_.clearFile(uri);
+
+    // 解析并索引符号
+    DiagnosticEngine diag;
+    Lexer lexer(it->second.content, uri, diag);
+    auto tokens = lexer.lexAll();
+    Parser parser(std::move(tokens), it->second.content, uri, diag);
+    auto ast = parser.parse();
+
+    // 索引顶层声明
+    if (ast) {
+        for (const auto& decl : ast->declarations) {
+            if (!decl) continue;
+            SymbolInfo sym;
+            sym.file = uri;
+
+            switch (decl->declKind) {
+                case DeclKind::Function: {
+                    auto& fd = static_cast<const FunctionDecl&>(*decl);
+                    sym.kind = SymbolKind::Function;
+                    sym.name = fd.name;
+                    sym.line = fd.loc.line;
+                    sym.column = fd.loc.column;
+                    symbolIndex_.addSymbol(sym);
+                    break;
+                }
+                case DeclKind::Variable: {
+                    auto& vd = static_cast<const VariableDecl&>(*decl);
+                    sym.kind = SymbolKind::Variable;
+                    if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
+                        sym.name = static_cast<const IdentifierPattern*>(vd.pattern.get())->name;
+                    }
+                    sym.line = vd.loc.line;
+                    sym.column = vd.loc.column;
+                    symbolIndex_.addSymbol(sym);
+                    break;
+                }
+                case DeclKind::Struct: {
+                    auto& sd = static_cast<const StructDecl&>(*decl);
+                    sym.kind = SymbolKind::Type;
+                    sym.name = sd.name;
+                    sym.line = sd.loc.line;
+                    sym.column = sd.loc.column;
+                    symbolIndex_.addSymbol(sym);
+                    break;
+                }
+                case DeclKind::Class: {
+                    auto& cd = static_cast<const ClassDecl&>(*decl);
+                    sym.kind = SymbolKind::Type;
+                    sym.name = cd.name;
+                    sym.line = cd.loc.line;
+                    sym.column = cd.loc.column;
+                    symbolIndex_.addSymbol(sym);
+                    break;
+                }
+                case DeclKind::Enum: {
+                    auto& ed = static_cast<const EnumDecl&>(*decl);
+                    sym.kind = SymbolKind::Type;
+                    sym.name = ed.name;
+                    sym.line = ed.loc.line;
+                    sym.column = ed.loc.column;
+                    symbolIndex_.addSymbol(sym);
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
 
     auto diagnostics = diagnose(it->second.content, uri);
     publishDiagnostics(uri, diagnostics);
