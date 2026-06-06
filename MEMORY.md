@@ -37,13 +37,22 @@ Lexer → Parser → AST → Sema → LLVM IR → Object File → Executable
 | 词法分析器 | **95%** | 核心功能完成 |
 | 语法分析器 | **92%** | 所有声明/语句/表达式类型均有 AST 定义 |
 | 类型系统 | **65%** | 基本类型和复合类型，泛型单态化 |
-| 语义分析 | **50%** | 类型推断、类型检查、作用域 |
+| 语义分析 | **50%** | 类型推断、类型检查、作用域、unsafe 检查 |
 | LLVM IR 代码生成 | **55%** | 函数/变量/控制流/表达式/泛型单态化/ARC 插入 |
 | 编译器驱动 | **50%** | 可产出可执行文件，交叉编译，调试信息 |
 | 运行时库 | **45%** | ARC、Pool、Collection、Channel、Atomic、Mutex、Coroutine |
 | 标准库 | **30%** | Core + System + Test + Network + Crypto + Data + CLI |
 | 工具链 | **60%** | sukipm + suki-fmt + suki-lsp + suki-doc |
 | **整体** | **~55%** | |
+
+## 待完成任务
+- 完整协程状态机转换（await 挂起点处理）
+- 跨 Actor 调用自动 await
+- 泛型构造调用 Channel<Int>(capacity: 10)
+- 集合字面量在更多上下文中的支持
+- suki-lsp 完善（符号索引、定义跳转）
+- 属性观察器 willSet/didSet IR 生成
+- 更多标准库模块（Network Socket、Crypto 完整实现）
 
 ## 测试文件约定
 - 所有测试文件（test_*.suki）放到 `moduleTest/` 目录
