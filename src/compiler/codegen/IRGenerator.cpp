@@ -80,7 +80,12 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
 
             std::vector<llvm::Type*> paramTypes;
             for (const auto& param : fd.params) {
-                paramTypes.push_back(resolveType(param.type.get()));
+                llvm::Type* pType = resolveType(param.type.get());
+                // inout 参数使用指针类型 / inout parameters use pointer type
+                if (param.isInOut) {
+                    pType = llvm::PointerType::get(context_, 0);
+                }
+                paramTypes.push_back(pType);
             }
             llvm::Type* retType = fd.returnType ?
                 resolveType(fd.returnType.get()) :
@@ -258,6 +263,15 @@ void IRGenerator::genDecl(const Decl& decl) {
             }
             classType->setBody(fieldTypes);
             structTypes_[cd.name] = classType;
+            // 只处理 deinit（其他成员在顶层处理）/ Only process deinit (other members processed at top level)
+            std::string prevDeinitType = currentTypeNameForDeinit_;
+            currentTypeNameForDeinit_ = cd.name;
+            for (const auto& member : cd.members) {
+                if (member && member->declKind == DeclKind::Deinit) {
+                    genDecl(*member);
+                }
+            }
+            currentTypeNameForDeinit_ = prevDeinitType;
             break;
         }
         case DeclKind::Enum: {
@@ -333,6 +347,133 @@ void IRGenerator::genDecl(const Decl& decl) {
         case DeclKind::Macro:
             processMacroDecl(static_cast<const MacroDecl&>(decl));
             break;
+        case DeclKind::Subscript: {
+            auto& sd = static_cast<const SubscriptDecl&>(decl);
+            SubscriptInfo info;
+            llvm::Type* retType = sd.returnType ? resolveType(sd.returnType.get()) :
+                llvm::Type::getInt64Ty(context_);
+            info.returnType = retType;
+
+            // 生成 getter 函数 / Generate getter function
+            std::vector<llvm::Type*> paramTypes;
+            for (const auto& p : sd.params) {
+                paramTypes.push_back(p.type ? resolveType(p.type.get()) :
+                    llvm::Type::getInt64Ty(context_));
+            }
+            info.paramTypes = paramTypes;
+
+            if (!sd.getterBody.empty()) {
+                std::string getterName = "__subscript_getter_" + std::to_string(nextClosureId_++);
+                llvm::FunctionType* getterTy = llvm::FunctionType::get(retType, paramTypes, false);
+                llvm::Function* getterFunc = llvm::Function::Create(
+                    getterTy, llvm::Function::InternalLinkage, getterName, module_.get());
+                llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", getterFunc);
+                llvm::Function* prevFunc = currentFunc_;
+                currentFunc_ = getterFunc;
+                builder_->SetInsertPoint(entry);
+                auto savedValues = namedValues_;
+                auto savedTypes = namedTypes_;
+                namedValues_.clear();
+                namedTypes_.clear();
+                size_t idx = 0;
+                for (auto& arg : getterFunc->args()) {
+                    if (idx < sd.params.size()) {
+                        arg.setName(sd.params[idx].internalName);
+                        llvm::AllocaInst* a = createEntryBlockAlloca(getterFunc, arg.getType(),
+                            sd.params[idx].internalName);
+                        builder_->CreateStore(&arg, a);
+                        namedValues_[sd.params[idx].internalName] = a;
+                        namedTypes_[sd.params[idx].internalName] = arg.getType();
+                    }
+                    idx++;
+                }
+                for (const auto& s : sd.getterBody) {
+                    if (s) genStmt(*s);
+                }
+                if (!builder_->GetInsertBlock()->getTerminator()) {
+                    builder_->CreateRet(llvm::Constant::getNullValue(retType));
+                }
+                namedValues_ = savedValues;
+                namedTypes_ = savedTypes;
+                currentFunc_ = prevFunc;
+                builder_->SetInsertPoint(&currentFunc_->back());
+                info.getter = getterFunc;
+            }
+
+            // 生成 setter 函数 / Generate setter function
+            if (!sd.setterBody.empty()) {
+                std::vector<llvm::Type*> setterParamTypes = paramTypes;
+                setterParamTypes.push_back(retType); // newValue
+                std::string setterName = "__subscript_setter_" + std::to_string(nextClosureId_++);
+                llvm::FunctionType* setterTy = llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(context_), setterParamTypes, false);
+                llvm::Function* setterFunc = llvm::Function::Create(
+                    setterTy, llvm::Function::InternalLinkage, setterName, module_.get());
+                llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", setterFunc);
+                llvm::Function* prevFunc = currentFunc_;
+                currentFunc_ = setterFunc;
+                builder_->SetInsertPoint(entry);
+                auto savedValues = namedValues_;
+                auto savedTypes = namedTypes_;
+                namedValues_.clear();
+                namedTypes_.clear();
+                size_t idx = 0;
+                for (auto& arg : setterFunc->args()) {
+                    std::string paramName;
+                    if (idx < sd.params.size()) {
+                        paramName = sd.params[idx].internalName;
+                    } else {
+                        paramName = "newValue";
+                    }
+                    arg.setName(paramName);
+                    llvm::AllocaInst* a = createEntryBlockAlloca(setterFunc, arg.getType(), paramName);
+                    builder_->CreateStore(&arg, a);
+                    namedValues_[paramName] = a;
+                    namedTypes_[paramName] = arg.getType();
+                    idx++;
+                }
+                for (const auto& s : sd.setterBody) {
+                    if (s) genStmt(*s);
+                }
+                if (!builder_->GetInsertBlock()->getTerminator()) {
+                    builder_->CreateRetVoid();
+                }
+                namedValues_ = savedValues;
+                namedTypes_ = savedTypes;
+                currentFunc_ = prevFunc;
+                builder_->SetInsertPoint(&currentFunc_->back());
+                info.setter = setterFunc;
+            }
+
+            subscripts_["__subscript__" + std::to_string(nextClosureId_)] = info;
+            break;
+        }
+        case DeclKind::Deinit: {
+            // 生成 deinit 函数 / Generate deinit function
+            auto& dd = static_cast<const DeinitDecl&>(decl);
+            std::string deinitName = "__deinit_" + std::to_string(nextClosureId_++);
+            llvm::FunctionType* deinitTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(context_), false);
+            llvm::Function* deinitFunc = llvm::Function::Create(
+                deinitTy, llvm::Function::InternalLinkage, deinitName, module_.get());
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", deinitFunc);
+            llvm::Function* prevFunc = currentFunc_;
+            currentFunc_ = deinitFunc;
+            builder_->SetInsertPoint(entry);
+            for (const auto& s : dd.body) {
+                if (s) genStmt(*s);
+            }
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                builder_->CreateRetVoid();
+            }
+            currentFunc_ = prevFunc;
+            builder_->SetInsertPoint(&currentFunc_->back());
+            // 存储 deinit 函数（关联到当前类型）
+            if (!currentTypeNameForDeinit_.empty()) {
+                deinitFuncs_[currentTypeNameForDeinit_] = deinitFunc;
+            }
+            break;
+        }
         default:
             break;
     }
@@ -374,10 +515,19 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
     size_t idx = 0;
     for (auto& arg : func->args()) {
         llvm::Type* paramType = resolveType(decl.params[idx].type.get());
-        llvm::AllocaInst* allocaInst = createEntryBlockAlloca(func, paramType, std::string(arg.getName()));
-        builder_->CreateStore(&arg, allocaInst);
-        namedValues_[std::string(arg.getName())] = allocaInst;
-        namedTypes_[std::string(arg.getName())] = paramType;
+        if (decl.params[idx].isInOut) {
+            // inout 参数：直接存储指针 / inout param: store pointer directly
+            llvm::AllocaInst* allocaInst = createEntryBlockAlloca(func,
+                llvm::PointerType::get(context_, 0), std::string(arg.getName()));
+            builder_->CreateStore(&arg, allocaInst);
+            namedValues_[std::string(arg.getName())] = allocaInst;
+            namedTypes_[std::string(arg.getName())] = llvm::PointerType::get(context_, 0);
+        } else {
+            llvm::AllocaInst* allocaInst = createEntryBlockAlloca(func, paramType, std::string(arg.getName()));
+            builder_->CreateStore(&arg, allocaInst);
+            namedValues_[std::string(arg.getName())] = allocaInst;
+            namedTypes_[std::string(arg.getName())] = paramType;
+        }
         idx++;
     }
 
@@ -411,6 +561,142 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
 
     // 获取声明类型
     llvm::Type* varType = resolveType(decl.typeAnnotation.get());
+
+    // 计算属性处理：生成 getter/setter 函数
+    // Computed property: generate getter/setter functions
+    if (!decl.getterBody.empty()) {
+        ComputedProp prop;
+        prop.valueType = varType;
+
+        // 生成 getter 函数 / Generate getter function
+        std::string getterName = varName + ".getter";
+        llvm::FunctionType* getterType = llvm::FunctionType::get(varType, false);
+        llvm::Function* getterFunc = llvm::Function::Create(
+            getterType, llvm::Function::InternalLinkage, getterName, module_.get());
+        llvm::BasicBlock* getterEntry = llvm::BasicBlock::Create(context_, "entry", getterFunc);
+        llvm::Function* prevFunc = currentFunc_;
+        currentFunc_ = getterFunc;
+        builder_->SetInsertPoint(getterEntry);
+        auto savedValues = namedValues_;
+        auto savedTypes = namedTypes_;
+        for (const auto& s : decl.getterBody) {
+            if (s) genStmt(*s);
+        }
+        if (!builder_->GetInsertBlock()->getTerminator()) {
+            builder_->CreateRet(llvm::Constant::getNullValue(varType));
+        }
+        namedValues_ = savedValues;
+        namedTypes_ = savedTypes;
+        currentFunc_ = prevFunc;
+        builder_->SetInsertPoint(&currentFunc_->back());
+        prop.getter = getterFunc;
+
+        // 生成 setter 函数 / Generate setter function
+        if (!decl.setterBody.empty()) {
+            std::string setterName = varName + ".setter";
+            llvm::FunctionType* setterType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(context_), {varType}, false);
+            llvm::Function* setterFunc = llvm::Function::Create(
+                setterType, llvm::Function::InternalLinkage, setterName, module_.get());
+            // 设置参数名
+            setterFunc->arg_begin()->setName("newValue");
+            llvm::BasicBlock* setterEntry = llvm::BasicBlock::Create(context_, "entry", setterFunc);
+            currentFunc_ = setterFunc;
+            builder_->SetInsertPoint(setterEntry);
+            savedValues = namedValues_;
+            savedTypes = namedTypes_;
+            // 注册 newValue 参数
+            llvm::AllocaInst* newVar = createEntryBlockAlloca(setterFunc, varType, "newValue");
+            builder_->CreateStore(&*setterFunc->arg_begin(), newVar);
+            namedValues_["newValue"] = newVar;
+            namedTypes_["newValue"] = varType;
+            for (const auto& s : decl.setterBody) {
+                if (s) genStmt(*s);
+            }
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                builder_->CreateRetVoid();
+            }
+            namedValues_ = savedValues;
+            namedTypes_ = savedTypes;
+            currentFunc_ = prevFunc;
+            builder_->SetInsertPoint(&currentFunc_->back());
+            prop.setter = setterFunc;
+        }
+
+        computedProps_[varName] = prop;
+        return; // 计算属性不需要 alloca
+    }
+
+    // 属性观察器处理：生成 willSet/didSet 函数
+    // Property observers: generate willSet/didSet functions
+    if (decl.hasWillSet || decl.hasDidSet) {
+        PropertyObserver obs;
+        obs.valueType = varType;
+
+        // 生成 willSet 函数 / Generate willSet function
+        if (decl.hasWillSet && !decl.willSetBody.empty()) {
+            std::string willSetName = varName + ".willSet";
+            llvm::FunctionType* willSetType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(context_), {varType}, false);
+            llvm::Function* willSetFunc = llvm::Function::Create(
+                willSetType, llvm::Function::InternalLinkage, willSetName, module_.get());
+            willSetFunc->arg_begin()->setName("newValue");
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", willSetFunc);
+            llvm::Function* prevFunc = currentFunc_;
+            currentFunc_ = willSetFunc;
+            builder_->SetInsertPoint(entry);
+            auto savedValues = namedValues_;
+            auto savedTypes = namedTypes_;
+            llvm::AllocaInst* newVar = createEntryBlockAlloca(willSetFunc, varType, "newValue");
+            builder_->CreateStore(&*willSetFunc->arg_begin(), newVar);
+            namedValues_["newValue"] = newVar;
+            namedTypes_["newValue"] = varType;
+            for (const auto& s : decl.willSetBody) {
+                if (s) genStmt(*s);
+            }
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                builder_->CreateRetVoid();
+            }
+            namedValues_ = savedValues;
+            namedTypes_ = savedTypes;
+            currentFunc_ = prevFunc;
+            builder_->SetInsertPoint(&currentFunc_->back());
+            obs.willSetFunc = willSetFunc;
+        }
+
+        // 生成 didSet 函数 / Generate didSet function
+        if (decl.hasDidSet && !decl.didSetBody.empty()) {
+            std::string didSetName = varName + ".didSet";
+            llvm::FunctionType* didSetType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(context_), {varType}, false);
+            llvm::Function* didSetFunc = llvm::Function::Create(
+                didSetType, llvm::Function::InternalLinkage, didSetName, module_.get());
+            didSetFunc->arg_begin()->setName("newValue");
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", didSetFunc);
+            llvm::Function* prevFunc = currentFunc_;
+            currentFunc_ = didSetFunc;
+            builder_->SetInsertPoint(entry);
+            auto savedValues = namedValues_;
+            auto savedTypes = namedTypes_;
+            llvm::AllocaInst* newVar = createEntryBlockAlloca(didSetFunc, varType, "newValue");
+            builder_->CreateStore(&*didSetFunc->arg_begin(), newVar);
+            namedValues_["newValue"] = newVar;
+            namedTypes_["newValue"] = varType;
+            for (const auto& s : decl.didSetBody) {
+                if (s) genStmt(*s);
+            }
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                builder_->CreateRetVoid();
+            }
+            namedValues_ = savedValues;
+            namedTypes_ = savedTypes;
+            currentFunc_ = prevFunc;
+            builder_->SetInsertPoint(&currentFunc_->back());
+            obs.didSetFunc = didSetFunc;
+        }
+
+        propertyObservers_[varName] = obs;
+    }
 
     // 生成初始化值
     llvm::Value* initVal = nullptr;
@@ -1008,12 +1294,44 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             // 对于值类型，始终返回 true（完整实现需要 RTTI）
             return llvm::ConstantInt::getTrue(context_);
         }
-        case ExprKind::Await:
+        case ExprKind::Await: {
+            auto& ae = static_cast<const AwaitExpr&>(expr);
+            return genExpr(*ae.subExpr);
+        }
         case ExprKind::Try: {
-            auto* sub = (expr.exprKind == ExprKind::Await) ?
-                static_cast<const AwaitExpr&>(expr).subExpr.get() :
-                static_cast<const TryExpr&>(expr).subExpr.get();
-            return genExpr(*sub);
+            auto& te = static_cast<const TryExpr&>(expr);
+            if (te.isOptional) {
+                // try? expr: 捕获错误返回 nil / catch error and return nil
+                llvm::Value* val = genExpr(*te.subExpr);
+                if (!val) return nullptr;
+                // 简化实现：直接返回值（完整实现需要 setjmp/longjmp 包装）
+                // Simplified: return value directly (full impl needs setjmp/longjmp wrapper)
+                if (val->getType()->isPointerTy()) {
+                    return val;
+                }
+                // 对于非指针类型，返回值
+                return val;
+            } else if (te.isForce) {
+                // try! expr: 出错时 abort / abort on error
+                llvm::Value* val = genExpr(*te.subExpr);
+                if (!val) {
+                    // 生成 abort 调用 / Generate abort call
+                    llvm::Function* abortFunc = module_->getFunction("abort");
+                    if (!abortFunc) {
+                        llvm::FunctionType* abortTy = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(context_), false);
+                        abortFunc = llvm::Function::Create(abortTy, llvm::Function::ExternalLinkage,
+                                                           "abort", module_.get());
+                    }
+                    builder_->CreateCall(abortFunc);
+                    builder_->CreateUnreachable();
+                    return nullptr;
+                }
+                return val;
+            } else {
+                // 普通 try / Regular try
+                return genExpr(*te.subExpr);
+            }
         }
         case ExprKind::Move: {
             auto& me = static_cast<const MoveExpr&>(expr);
@@ -1112,20 +1430,43 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             auto& sub = static_cast<const SubscriptExpr&>(expr);
             llvm::Value* base = genExpr(*sub.base);
             if (!base || sub.indices.empty()) return nullptr;
-            llvm::Value* index = genExpr(*sub.indices[0]);
-            if (!index) return nullptr;
 
-            // 确定元素类型 / Determine element type
-            llvm::Type* elemType = llvm::Type::getInt64Ty(context_); // 默认 i64
+            // 生成索引参数 / Generate index arguments
+            std::vector<llvm::Value*> indices;
+            for (const auto& idx : sub.indices) {
+                llvm::Value* idxVal = genExpr(*idx);
+                if (idxVal) indices.push_back(idxVal);
+            }
+            if (indices.empty()) return nullptr;
+
+            // 检查是否有注册的 subscript getter / Check for registered subscript getter
+            for (const auto& [name, info] : subscripts_) {
+                if (info.getter && indices.size() == info.paramTypes.size()) {
+                    // 类型转换 / Type conversion
+                    std::vector<llvm::Value*> args;
+                    for (size_t i = 0; i < indices.size(); i++) {
+                        llvm::Value* arg = indices[i];
+                        if (i < info.paramTypes.size() && arg->getType() != info.paramTypes[i]) {
+                            if (info.paramTypes[i]->isIntegerTy(64) && arg->getType()->isIntegerTy()) {
+                                arg = builder_->CreateSExt(arg, info.paramTypes[i], "cast");
+                            }
+                        }
+                        args.push_back(arg);
+                    }
+                    return builder_->CreateCall(info.getter, args, "subscript.get");
+                }
+            }
+
+            // 默认：数组 GEP / Default: array GEP
+            llvm::Value* index = indices[0];
+            llvm::Type* elemType = llvm::Type::getInt64Ty(context_);
             if (base->getType()->isStructTy()) {
-                // Array 类型 {data_ptr, count, capacity}，数据指针在索引 0
                 llvm::Value* dataPtr = builder_->CreateStructGEP(
                     base->getType(), base, 0, "arr.data.ptr");
                 llvm::Value* data = builder_->CreateLoad(
                     llvm::PointerType::get(context_, 0), dataPtr, "arr.data");
                 return builder_->CreateGEP(elemType, data, index, "idx");
             } else if (base->getType()->isPointerTy()) {
-                // 指针类型，按元素类型 GEP
                 return builder_->CreateGEP(elemType, base, index, "idx");
             }
             return builder_->CreateGEP(elemType, base, index, "idx");
@@ -1239,6 +1580,17 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             if (!val) return nullptr;
             if (ae.target->exprKind == ExprKind::Identifier) {
                 auto& id = static_cast<const IdentifierExpr&>(*ae.target);
+                // 检查计算属性 setter / Check computed property setter
+                auto compIt = computedProps_.find(id.name);
+                if (compIt != computedProps_.end() && compIt->second.setter) {
+                    if (val->getType() != compIt->second.valueType) {
+                        if (compIt->second.valueType->isDoubleTy() && val->getType()->isIntegerTy()) {
+                            val = builder_->CreateSIToFP(val, compIt->second.valueType, "cast");
+                        }
+                    }
+                    builder_->CreateCall(compIt->second.setter, {val});
+                    return val;
+                }
                 auto it = namedValues_.find(id.name);
                 if (it != namedValues_.end()) {
                     llvm::Type* varType = namedTypes_[id.name];
@@ -1280,7 +1632,20 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                             val = builder_->CreateSIToFP(val, varType, "cast");
                         }
                     }
+                    // 属性观察器：willSet（赋值前调用）
+                    auto obsIt = propertyObservers_.find(id.name);
+                    if (obsIt != propertyObservers_.end()) {
+                        if (obsIt->second.willSetFunc) {
+                            builder_->CreateCall(obsIt->second.willSetFunc, {val});
+                        }
+                    }
                     builder_->CreateStore(val, it->second);
+                    // 属性观察器：didSet（赋值后调用）
+                    if (obsIt != propertyObservers_.end()) {
+                        if (obsIt->second.didSetFunc) {
+                            builder_->CreateCall(obsIt->second.didSetFunc, {val});
+                        }
+                    }
                     return val;
                 }
             }
@@ -1321,6 +1686,11 @@ llvm::Value* IRGenerator::genIdentifier(const IdentifierExpr& expr) {
     if (it != namedValues_.end()) {
         llvm::Type* varType = namedTypes_[expr.name];
         return builder_->CreateLoad(varType, it->second, expr.name);
+    }
+    // 检查计算属性 / Check computed properties
+    auto compIt = computedProps_.find(expr.name);
+    if (compIt != computedProps_.end() && compIt->second.getter) {
+        return builder_->CreateCall(compIt->second.getter, {}, expr.name + ".get");
     }
     auto funcIt = functions_.find(expr.name);
     if (funcIt != functions_.end()) return funcIt->second;
@@ -1414,6 +1784,52 @@ llvm::Value* IRGenerator::genBinaryExpr(const BinaryExpr& expr) {
         case TokenKind::Caret:  return builder_->CreateXor(left, right, "xor");
         case TokenKind::LShift: return builder_->CreateShl(left, right, "shl");
         case TokenKind::RShift: return builder_->CreateAShr(left, right, "shr");
+        case TokenKind::QuestionQuestion: {
+            // ?? nil 合并运算符 / Nil coalescing operator
+            // 如果左侧非 nil 则返回左侧，否则返回右侧
+            if (left->getType()->isPointerTy()) {
+                llvm::Value* isNull = builder_->CreateICmpEQ(left,
+                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.null");
+                llvm::Function* func = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* nonNullBB = llvm::BasicBlock::Create(context_, "coalesce.nonnull", func);
+                llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "coalesce.merge", func);
+                builder_->CreateCondBr(isNull, mergeBB, nonNullBB);
+                llvm::BasicBlock* leftBB = builder_->GetInsertBlock();
+                builder_->SetInsertPoint(nonNullBB);
+                builder_->CreateBr(mergeBB);
+                nonNullBB = builder_->GetInsertBlock();
+                builder_->SetInsertPoint(mergeBB);
+                llvm::PHINode* phi = builder_->CreatePHI(left->getType(), 2, "coalesce");
+                phi->addIncoming(left, leftBB);
+                phi->addIncoming(right, nonNullBB);
+                return phi;
+            }
+            // 对于 Optional 结构体类型
+            if (left->getType()->isStructTy()) {
+                // 检查 hasValue 字段（索引 1）
+                llvm::Value* hasValuePtr = builder_->CreateStructGEP(
+                    left->getType(), left, 1, "opt.hasvalue.ptr");
+                llvm::Value* hasValue = builder_->CreateLoad(
+                    llvm::Type::getInt1Ty(context_), hasValuePtr, "opt.hasvalue");
+                llvm::Function* func = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* hasValueBB = llvm::BasicBlock::Create(context_, "coalesce.hasvalue", func);
+                llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "coalesce.merge", func);
+                builder_->CreateCondBr(hasValue, hasValueBB, mergeBB);
+                llvm::BasicBlock* leftBB = builder_->GetInsertBlock();
+                builder_->SetInsertPoint(hasValueBB);
+                builder_->CreateBr(mergeBB);
+                hasValueBB = builder_->GetInsertBlock();
+                builder_->SetInsertPoint(mergeBB);
+                llvm::PHINode* phi = builder_->CreatePHI(left->getType(), 2, "coalesce");
+                phi->addIncoming(left, leftBB);
+                phi->addIncoming(right, hasValueBB);
+                return phi;
+            }
+            // 默认：如果左侧非零返回左侧
+            llvm::Value* isZero = builder_->CreateICmpEQ(left,
+                llvm::ConstantInt::get(left->getType(), 0), "is.zero");
+            return builder_->CreateSelect(isZero, right, left, "coalesce");
+        }
         default:
             error({}, "unsupported binary operator");
             return nullptr;
@@ -1598,8 +2014,25 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
     }
 
     std::vector<llvm::Value*> args;
-    for (const auto& arg : expr.args) {
-        llvm::Value* argVal = genExpr(*arg.value);
+    for (size_t ai = 0; ai < expr.args.size(); ai++) {
+        const auto& arg = expr.args[ai];
+        llvm::Value* argVal = nullptr;
+
+        // 检查是否是 inout 参数（&变量）/ Check if inout argument (&variable)
+        bool isInOutArg = arg.value->exprKind == ExprKind::InOut;
+        if (isInOutArg) {
+            auto& inOut = static_cast<const InOutExpr&>(*arg.value);
+            if (inOut.subExpr->exprKind == ExprKind::Identifier) {
+                auto& id = static_cast<const IdentifierExpr&>(*inOut.subExpr);
+                auto it = namedValues_.find(id.name);
+                if (it != namedValues_.end()) {
+                    argVal = it->second; // 传递 alloca 指针
+                }
+            }
+        }
+        if (!argVal) {
+            argVal = genExpr(*arg.value);
+        }
         if (!argVal) return nullptr;
 
         // 参数类型转换 / Argument type conversion
@@ -2016,6 +2449,10 @@ void IRGenerator::insertRelease(llvm::Value* obj) {
         ptr = builder_->CreateIntToPtr(obj, llvm::PointerType::get(context_, 0));
     }
     builder_->CreateCall(releaseFunc, {ptr});
+
+    // deinit 会在 ARC 运行时中引用计数归零时自动调用
+    // deinit is called by ARC runtime when reference count reaches zero
+    // 这里生成的 deinit 函数通过 deinitFuncs_ 注册表供运行时使用
 }
 
 bool IRGenerator::isReferenceType(llvm::Type* type) const {

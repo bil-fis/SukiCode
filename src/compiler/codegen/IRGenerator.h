@@ -112,6 +112,35 @@ private:
     std::unordered_map<std::string, llvm::Value*> namedValues_;
     std::unordered_map<std::string, llvm::Type*> namedTypes_;
 
+    // 计算属性 / Computed properties (name -> getter/setter functions)
+    struct ComputedProp {
+        llvm::Function* getter = nullptr;
+        llvm::Function* setter = nullptr;
+        llvm::Type* valueType = nullptr;
+    };
+    std::unordered_map<std::string, ComputedProp> computedProps_;
+
+    // 属性观察器 / Property observers (willSet/didSet)
+    struct PropertyObserver {
+        llvm::Function* willSetFunc = nullptr;
+        llvm::Function* didSetFunc = nullptr;
+        llvm::Type* valueType = nullptr;
+    };
+    std::unordered_map<std::string, PropertyObserver> propertyObservers_;
+
+    // subscript 注册 / Subscript registry
+    struct SubscriptInfo {
+        llvm::Function* getter = nullptr;
+        llvm::Function* setter = nullptr;
+        llvm::Type* returnType = nullptr;
+        std::vector<llvm::Type*> paramTypes;
+    };
+    std::unordered_map<std::string, SubscriptInfo> subscripts_;
+
+    // deinit 函数注册 / Deinit function registry
+    std::unordered_map<std::string, llvm::Function*> deinitFuncs_;
+    std::string currentTypeNameForDeinit_; // 当前类名（用于关联 deinit）
+
     // 函数注册 / Function registry
     std::unordered_map<std::string, llvm::Function*> functions_;
 
