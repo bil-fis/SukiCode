@@ -1297,42 +1297,126 @@ test("性能") {
 
 ## 13. 与 C / Objective-C 互操作
 
-### 13.1 导入 C 头文件
+SukiCode 的 C/ObjC 互操作采用 **声明 + 链接** 模型，不依赖 Clang 集成。用户通过 `extern` 声明告诉编译器外部函数的签名，编译器生成正确的调用代码，最后由链接器连接 C/ObjC 编译好的目标文件。
+
+### 13.1 extern 声明语法
+
+#### 13.1.1 单个 extern 函数
 
 ```swift
-@cImport({
-    #include <stdio.h>
-    #include "my_header.h"
-})
+extern "C" func printf(fmt: UnsafePointer<Int8>, ...) -> Int32
+extern "C" func malloc(size: UInt64) -> UnsafeMutablePointer<Void>
+extern "C" func free(ptr: UnsafeMutablePointer<Void>)
 ```
 
-自动生成 SukiCode 函数、结构体、常量的绑定。`my_header.h` 中的函数可在 Suki 中调用：
+编译器会为这些声明生成 LLVM IR 中的 `declare` 语句，不生成函数体。链接时由系统 C 库提供实现。
+
+#### 13.1.2 extern 块
+
+可以将多个 extern 声明组织在一个块中：
 
 ```swift
-let result = C.my_function(10)
+extern "C" {
+    func printf(fmt: UnsafePointer<Int8>, ...) -> Int32
+    func scanf(fmt: UnsafePointer<Int8>, ...) -> Int32
+    func strlen(s: UnsafePointer<Int8>) -> UInt64
+    func memcpy(dest: UnsafeMutablePointer<Void>, src: UnsafePointer<Void>, n: UInt64) -> UnsafeMutablePointer<Void>
+}
 ```
 
-`@cImport` 块内的内容会被 Clang 预处理和解析。**不支持 C++ 头文件**（只能导入 C 或 Objective-C）。C 宏默认不展开；如果需要使用宏定义的值，应在头文件中使用 `const` 或 `enum` 代替。可变参数函数（如 `printf`）通过 `CVarArg` 和 `va_list` 的封装支持，类似于 Swift。
+#### 13.1.3 可变参数
+
+使用 `...` 声明可变参数函数：
+
+```swift
+extern "C" func printf(fmt: UnsafePointer<Int8>, ...) -> Int32
+```
+
+#### 13.1.4 调用约定
+
+默认调用约定为 `"C"`。支持的调用约定：
+- `"C"` — C 调用约定（默认）
+- `"stdcall"` — Windows stdcall 调用约定
+
+```swift
+extern "stdcall" func SomeWindowsAPI(hWnd: UnsafeMutablePointer<Void>, msg: UInt32, wParam: UInt64, lParam: UInt64) -> Int64
+```
 
 ### 13.2 与 Objective-C 交互
 
-SukiCode 可直接导入 Objective-C 类（通过 Clang 桥接），支持消息语法糖（可选用）：
+Objective-C 的方法调用本质上是调用运行时库（`libobjc`）的函数。SukiCode 通过 extern 声明 `objc_msgSend` 等运行时函数来实现 ObjC 互操作。
+
+#### 13.2.1 ObjC 运行时函数预声明
+
+编译器自动预声明以下 ObjC 运行时函数，用户无需手动声明：
 
 ```swift
-// 传统点语法（推荐）
-let array = NSMutableArray()
-array.add(1)
+// 消息发送
+extern "C" func objc_msgSend(self: UnsafeMutablePointer<Void>, _cmd: UnsafeMutablePointer<Void>, ...) -> UnsafeMutablePointer<Void>
+extern "C" func objc_msgSend_stret(self: UnsafeMutablePointer<Void>, _cmd: UnsafeMutablePointer<Void>, ...)
 
-// 可选的消息语法（仅在导入 ObjC 头文件后可用）
-let array = NSMutableArray()
-[array addObject: 1]
+// 选择器
+extern "C" func sel_registerName(name: UnsafePointer<Int8>) -> UnsafeMutablePointer<Void>
+
+// 类
+extern "C" func objc_getClass(name: UnsafePointer<Int8>) -> UnsafeMutablePointer<Void>
+extern "C" func objc_getProtocol(name: UnsafePointer<Int8>) -> UnsafeMutablePointer<Void>
+
+// 引用计数
+extern "C" func objc_retain(obj: UnsafeMutablePointer<Void>) -> UnsafeMutablePointer<Void>
+extern "C" func objc_release(obj: UnsafeMutablePointer<Void>)
+extern "C" func objc_storeStrong(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>, obj: UnsafeMutablePointer<Void>)
+
+// 弱引用
+extern "C" func objc_initWeak(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>, obj: UnsafeMutablePointer<Void>)
+extern "C" func objc_loadWeakRetained(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>) -> UnsafeMutablePointer<Void>
+extern "C" func objc_destroyWeak(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>)
+
+// 类操作
+extern "C" func class_getMethodImplementation(cls: UnsafeMutablePointer<Void>, name: UnsafeMutablePointer<Void>) -> UnsafeMutablePointer<Void>
+extern "C" func class_addMethod(cls: UnsafeMutablePointer<Void>, name: UnsafeMutablePointer<Void>, imp: UnsafeMutablePointer<Void>, types: UnsafePointer<Int8>) -> Bool
+extern "C" func objc_allocateClassPair(superclass: UnsafeMutablePointer<Void>, name: UnsafePointer<Int8>, extraBytes: UInt64) -> UnsafeMutablePointer<Void>
+extern "C" func objc_registerClassPair(cls: UnsafeMutablePointer<Void>)
 ```
 
-当点语法和消息语法同时存在时，点语法优先级更高（先尝试解析为属性/方法调用，若失败则回退到消息发送）。ARC 自动管理 ObjC 对象的引用计数，`weak`/`unowned` 同样适用。Objective-C 的方法选择器可以通过 `#selector(methodName)` 语法创建。支持 Objective-C 的轻量级泛型。
+#### 13.2.2 调用 ObjC 方法
+
+通过 `objc_msgSend` 调用 ObjC 方法：
+
+```swift
+// 获取 NSString 类
+let nsStringClass = objc_getClass("NSString")
+
+// 注册选择器
+let sel = sel_registerName("stringWithUTF8String:")
+
+// 调用类方法
+let str = objc_msgSend(nsStringClass, sel, "Hello, ObjC!")
+
+// 注册实例方法选择器
+let lengthSel = sel_registerName("length")
+
+// 调用实例方法
+let length = objc_msgSend(str, lengthSel)
+```
+
+#### 13.2.3 ARC 管理
+
+SukiCode 的 ARC 运行时自动管理 ObjC 对象的引用计数。`weak`/`unowned` 同样适用于 ObjC 对象。
+
+#### 13.2.4 #selector 语法
+
+`#selector` 语法用于创建方法选择器：
+
+```swift
+let sel = #selector(myMethod)
+// 等价于
+let sel = sel_registerName("myMethod")
+```
 
 ### 13.3 导出 SukiCode 给 C 使用
 
-通过 `@_cdecl("exported_function")` 导出 **自由函数**（不能是结构体/类的方法），使其可从 C 调用。也可生成动态库供外部链接。导出的函数使用 C 调用约定，参数和返回值必须是 C 兼容的类型（基本类型、指针、`OpaquePointer`）。
+通过 `@_cdecl("exported_function")` 导出 **自由函数**（不能是结构体/类的方法），使其可从 C 调用。导出的函数使用 C 调用约定，参数和返回值必须是 C 兼容的类型（基本类型、指针、`OpaquePointer`）。
 
 ```swift
 @_cdecl("add_numbers")
@@ -1346,6 +1430,31 @@ public func addNumbers(a: Int, b: Int) -> Int {
 ```c
 int add_numbers(int a, int b);
 ```
+
+### 13.4 链接
+
+编译器生成的目标文件（`.o` / `.obj`）包含对外部符号的引用。链接时需要提供包含这些符号的库：
+
+```bash
+# 编译 SukiCode 源文件
+sukic -c main.suki -o main.o
+
+# 编译 C 源文件
+gcc -c mylib.c -o mylib.o
+
+# 链接在一起
+gcc main.o mylib.o -o main -lobjc -framework Foundation
+```
+
+### 13.5 设计原则
+
+SukiCode 的 C/ObjC 互操作遵循以下设计原则：
+
+1. **不依赖 Clang**：编译器不需要解析 C/ObjC 源代码，只需要知道函数签名。
+2. **声明即契约**：用户通过 `extern` 声明告诉编译器外部函数的存在和签名。
+3. **链接器负责解析**：编译器生成对外部符号的引用，链接器负责连接实现。
+4. **零运行时开销**：extern 函数调用与 C 函数调用完全相同，没有额外的包装层。
+5. **类型安全**：extern 声明的参数类型在编译时检查，确保类型安全。
 
 ---
 
