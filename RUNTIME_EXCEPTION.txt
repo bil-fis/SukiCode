@@ -1,0 +1,46 @@
+SukiCode Runtime Library Exception to Apache 2.0
+Version 1.0, 2026
+
+This file defines the SukiCode Runtime Library Exception ("the Exception")
+to the Apache License, Version 2.0 ("the License").
+
+As an additional permission to the terms of the Apache License 2.0, the
+copyright holders of the SukiCode project grant you the following
+exception:
+
+    Linking or using the SukiCode runtime library (including but not
+    limited to libSukiCore, libSukiSystem, libSukiConcurrency, and the
+    ARC runtime) with software that is not itself part of the SukiCode
+    compiler or runtime ("Your Software") does not cause Your Software
+    to become subject to the Apache License 2.0, nor does it require
+    Your Software to be made available under the Apache License 2.0 or
+    any compatible license.
+
+    In other words:
+
+    1. Programs compiled by the SukiCode compiler ("Compiled Programs")
+       are not considered Derivative Works of the SukiCode compiler or
+       runtime. You may distribute Compiled Programs under any license
+       of your choosing, including proprietary and closed-source licenses.
+
+    2. The SukiCode runtime library may be linked (statically or
+       dynamically) with Compiled Programs without imposing the Apache
+       License 2.0 on those programs.
+
+    3. If you modify the SukiCode compiler, runtime, or standard library
+       itself, those modifications must be made available under the
+       Apache License 2.0 with this same Runtime Library Exception.
+
+This Exception applies only to the SukiCode runtime library and standard
+library as distributed as part of the SukiCode project. It does not
+apply to modifications you make to the compiler itself, which remain
+subject to the Apache License 2.0.
+
+Definitions:
+- "SukiCode runtime library" refers to the C/C++ code in the src/runtime/
+  and src/stdlib/ directories, compiled into libSukiCore, libSukiSystem,
+  libSukiConcurrency, or equivalent static/dynamic libraries.
+- "Compiled Programs" refers to executables, libraries, or other binary
+  artifacts produced by the SukiCode compiler (sukic) from SukiCode
+  source code (.suki files).
+- "Derivative Work" has the meaning given in the Apache License 2.0.
