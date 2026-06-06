@@ -47,19 +47,24 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
   - 计算属性 getter/setter、属性观察器 willSet/didSet
   - subscript 代码生成、deinit 代码生成
   - vtable 方法调度、inout 参数指针传递
-  - try?/try! 代码生成、?? nil 合并运算符
+  - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
   - 泛型类型单态化、async/await 协程帧
   - select 语句、泛型 where 子句、-O 优化级别
-  - 访问控制链接类型
-- **语义检查**: 协议符合性、switch 穷举性、修饰符传播、let/var 可变性
+  - 访问控制链接类型、Opaque/Existential 类型
+- **语义检查**: override/final 检查、required/convenience init 检查、协议符合性、switch 穷举性、修饰符传播、let/var 可变性、代码风格检查（命名规范）
+- **类型系统**: UnsafePointer/UnsafeMutablePointer 类型支持
+- **Actor**: ActorDecl 代码生成、executor 注册、方法注册
+- **互操作**: extern "C" 声明语法、@_cdecl 链接
 - **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList
-- **系统库**: MemoryLayout、DynamicLibrary、SystemInfo、Process、File、Path、Date/Timer、sys 模块
+- **系统库**: MemoryLayout、DynamicLibrary、SystemInfo、Process、File、Path、Date/Timer、sys 模块、MMapRegion
 - **并发库**: ThreadPool、DispatchQueue、Channel、Atomic、Mutex/RWLock/Semaphore
 - **加密库**: SHA256、MD5、HMAC-SHA256、AES-128 ECB、ChaCha20、RSA、Ed25519
 - **数据编码**: Base64、Hex、GZip、Zlib、XML、CSV、MessagePack
 - **网络库**: URL、JSON、Socket（TCP/UDP）、URLSession HTTP 客户端
 - **国际化**: LocalizedString、NumberFormatter、CurrencyFormatter、DateFormatter
 - **宏系统**: @macro 声明、@freestanding/@attached、#macroName(args) 展开、#unique 卫生宏、沙箱执行
+- **工具链**: suki-fmt 增强表达式格式化
+- **bare-metal**: --target bare-metal 支持
 - **测试**: 20/20 测试全部通过
 - **TODO**: 0 个待办事项
 - **死代码**: 已清理 Scope.h/cpp、TypeConverter.h/cpp、StringInterner.h/cpp
