@@ -165,7 +165,16 @@ let value = await ch.receive()
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+SukiCode uses multiple licenses for different components:
+
+- **Compiler, Runtime, Standard Library**: Apache 2.0 + Runtime Library Exception
+- **Tools** (sukipm, suki-lsp, suki-fmt, suki-doc): MIT
+- **Language Specification**: CC BY 4.0
+- **Examples and Tests**: MIT
+
+**Programs written in SukiCode can use any license, including proprietary and closed-source licenses.**
+
+See [LICENSE](LICENSE) and [LICENSES/](LICENSES/) for details.
 
 ---
 
