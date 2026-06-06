@@ -235,6 +235,24 @@ llvm::Type* IRGenerator::resolveType(const TypeRepr* tr) {
     if (tr->typeReprKind == TypeReprKind::Function) {
         return llvm::PointerType::get(context_, 0);
     }
+    if (tr->typeReprKind == TypeReprKind::Opaque) {
+        // some Protocol: 解析约束类型 / Resolve constraint type
+        auto& o = static_cast<const OpaqueTypeRepr&>(*tr);
+        return resolveType(o.constraint.get());
+    }
+    if (tr->typeReprKind == TypeReprKind::Existential) {
+        // any Protocol: 类型擦除为指针 / Type erase to pointer
+        return llvm::PointerType::get(context_, 0);
+    }
+    if (tr->typeReprKind == TypeReprKind::Owned) {
+        // Owned<T>: 与内部类型相同 / Same as inner type
+        auto& o = static_cast<const OwnedTypeRepr&>(*tr);
+        return resolveType(o.inner.get());
+    }
+    if (tr->typeReprKind == TypeReprKind::Self) {
+        // Self: 返回当前类型 / Return current type
+        return llvm::PointerType::get(context_, 0);
+    }
     return llvm::Type::getInt64Ty(context_);
 }
 

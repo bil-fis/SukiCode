@@ -10,6 +10,7 @@
 #include "Type.h"
 #include <memory>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace suki {
 
@@ -53,6 +54,11 @@ private:
     void error(SourceLocation loc, const std::string& message);
     void warning(SourceLocation loc, const std::string& message);
 
+    // ─── 代码风格检查 / Code style checking ────────────────────────────
+    bool isUpperCamelCase(const std::string& name) const;
+    bool isLowerCamelCase(const std::string& name) const;
+    void checkNamingConvention(const std::string& name, bool isType, SourceLocation loc);
+
     DiagnosticEngine& diag_;
     SymbolTable symbols_;
     TypeChecker typeChecker_;
@@ -64,6 +70,12 @@ private:
     std::string currentActor_; // 当前 Actor 名称（如果在 Actor 内部）
     std::string currentTypeName_; // 当前处理的类型名称（用于 self/super 引用）
     std::string currentSuperclassName_; // 当前类的父类名称（用于 super 引用）
+
+    // 类方法跟踪（用于 override/final 检查）/ Class method tracking for override/final checks
+    // className -> { methodName -> isFinal }
+    std::unordered_map<std::string, std::unordered_map<std::string, bool>> classMethods_;
+    // className -> parentClassName
+    std::unordered_map<std::string, std::string> classParent_;
 };
 
 } // namespace suki

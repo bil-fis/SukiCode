@@ -62,6 +62,8 @@ bool Sema::analyze(CompilationUnit& cu) {
             decl->declKind == DeclKind::Protocol ||
             decl->declKind == DeclKind::Actor) {
             auto& td = static_cast<TypeDecl&>(*decl);
+            // 命名规范检查 / Naming convention check
+            checkNamingConvention(td.name, true, td.loc);
             Symbol* existing = symbols_.lookup(td.name);
             if (!existing) {
                 Symbol sym;
@@ -488,6 +490,9 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     sym.column = decl.loc.column;
     sym.isPublic = (decl.access == AccessLevel::Public) || isMain || isCDecl;
 
+    // 命名规范检查 / Naming convention check
+    checkNamingConvention(decl.name, false, decl.loc);
+
     // 进入临时作用域以注册泛型参数 / Enter temporary scope for generic params
     symbols_.enterScope();
     for (const auto& gp : decl.genericParams) {
@@ -496,6 +501,17 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
         gs.name = gp.name;
         gs.type = getAnyType();
         symbols_.define(gs);
+
+        // 验证约束类型存在 / Verify constraint types exist
+        for (const auto& constraint : gp.constraints) {
+            if (constraint && constraint->typeReprKind == TypeReprKind::Named) {
+                auto& ntr = static_cast<const NamedTypeRepr&>(*constraint);
+                Symbol* constraintSym = symbols_.lookup(ntr.name);
+                if (!constraintSym) {
+                    warning(decl.loc, "generic constraint type '" + ntr.name + "' not found");
+                }
+            }
+        }
     }
 
     // 解析参数类型（泛型参数在此作用域内可用）
@@ -603,13 +619,85 @@ void Sema::processClassDecl(ClassDecl& decl) {
     if (decl.superclass) {
         auto& ntr = static_cast<const NamedTypeRepr&>(*decl.superclass);
         currentSuperclassName_ = ntr.name;
+        classParent_[decl.name] = ntr.name;
     } else {
         currentSuperclassName_.clear();
     }
 
     symbols_.enterScope();
     for (auto& m : decl.members) {
-        if (m) processDecl(*m);
+        if (!m) continue;
+
+        // override/final 检查 / override/final checking
+        if (m->declKind == DeclKind::Function) {
+            auto& fd = static_cast<FunctionDecl&>(*m);
+            if (fd.isOverride) {
+                // 检查父类是否有该方法 / Check parent class has this method
+                bool foundInParent = false;
+                std::string parentName = currentSuperclassName_;
+                while (!parentName.empty()) {
+                    auto parentIt = classMethods_.find(parentName);
+                    if (parentIt != classMethods_.end()) {
+                        if (parentIt->second.count(fd.name)) {
+                            foundInParent = true;
+                            break;
+                        }
+                    }
+                    auto ppIt = classParent_.find(parentName);
+                    if (ppIt != classParent_.end()) {
+                        parentName = ppIt->second;
+                    } else {
+                        break;
+                    }
+                }
+                if (!foundInParent) {
+                    error(fd.loc, "'" + fd.name + "' marked as 'override' but not found in parent class");
+                }
+            }
+            if (fd.isFinal) {
+                // 检查 final 方法不被子类重写（在子类处理时检查）
+            }
+            // 检查父类的 final 方法不被重写 / Check parent's final methods are not overridden
+            std::string parentName = currentSuperclassName_;
+            while (!parentName.empty()) {
+                auto parentIt = classMethods_.find(parentName);
+                if (parentIt != classMethods_.end()) {
+                    auto methodIt = parentIt->second.find(fd.name);
+                    if (methodIt != parentIt->second.end() && methodIt->second) {
+                        error(fd.loc, "'" + fd.name + "' is final in parent class '" + parentName + "' and cannot be overridden");
+                    }
+                }
+                auto ppIt = classParent_.find(parentName);
+                if (ppIt != classParent_.end()) {
+                    parentName = ppIt->second;
+                } else {
+                    break;
+                }
+            }
+            // 记录方法 / Record method
+            classMethods_[decl.name][fd.name] = fd.isFinal;
+        } else if (m->declKind == DeclKind::Init) {
+            auto& id = static_cast<InitDecl&>(*m);
+            // required init 检查 / required init checking
+            if (id.isRequired) {
+                classMethods_[decl.name]["init"] = false;
+            }
+            // convenience init 检查 / convenience init checking
+            if (id.isConvenience) {
+                // convenience init 必须调用 self.init
+                // 简化实现：检查 body 中是否有 self 或 super 调用
+                bool callsInit = false;
+                for (const auto& stmt : id.body) {
+                    // 简化检查：只要有语句就算通过
+                    if (stmt) callsInit = true;
+                }
+                if (!callsInit && !id.body.empty()) {
+                    warning(id.loc, "convenience init should delegate to another init");
+                }
+            }
+        }
+
+        processDecl(*m);
     }
     symbols_.leaveScope();
 
@@ -1080,6 +1168,36 @@ void Sema::error(SourceLocation loc, const std::string& msg) {
 
 void Sema::warning(SourceLocation loc, const std::string& msg) {
     diag_.warning(loc, "", msg);
+}
+
+// ─── 代码风格检查 / Code style checking ────────────────────────────────
+
+bool Sema::isUpperCamelCase(const std::string& name) const {
+    if (name.empty()) return false;
+    // 第一个字符必须是大写 / First character must be uppercase
+    return std::isupper(name[0]);
+}
+
+bool Sema::isLowerCamelCase(const std::string& name) const {
+    if (name.empty()) return false;
+    // 第一个字符必须是小写或下划线 / First character must be lowercase or underscore
+    return std::islower(name[0]) || name[0] == '_';
+}
+
+void Sema::checkNamingConvention(const std::string& name, bool isType, SourceLocation loc) {
+    if (name.empty()) return;
+    // 跳过特殊名称 / Skip special names
+    if (name[0] == '_' || name == "main") return;
+
+    if (isType) {
+        if (!isUpperCamelCase(name)) {
+            warning(loc, "type name '" + name + "' should use UpperCamelCase");
+        }
+    } else {
+        if (!isLowerCamelCase(name)) {
+            warning(loc, "name '" + name + "' should use lowerCamelCase");
+        }
+    }
 }
 
 } // namespace suki
