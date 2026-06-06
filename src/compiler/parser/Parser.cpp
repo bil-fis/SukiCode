@@ -788,8 +788,16 @@ DeclPtr Parser::parseSwitchDecl() {
                 // Parse case labels
                 do {
                     SwitchCase::Label label;
-                    // Try to parse as pattern first, fall back to expression
-                    label.expression = parseExpression();
+                    // Handle enum case pattern: .caseName
+                    if (check(TokenKind::Dot) && peekAt(1).is(TokenKind::Identifier)) {
+                        advance(); // .
+                        auto pat = makeNode<EnumCasePattern>();
+                        pat->caseName = std::string(advance().stringValue);
+                        label.pattern = std::move(pat);
+                    } else {
+                        // Try to parse as expression
+                        label.expression = parseExpression();
+                    }
                     sc.labels.push_back(std::move(label));
                 } while (match(TokenKind::Comma));
             } else if (match(TokenKind::KwDefault)) {

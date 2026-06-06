@@ -50,6 +50,27 @@ bool Sema::analyze(CompilationUnit& cu) {
         currentModule_ = cu.moduleDecl->name;
     }
 
+    // 第零遍：预注册所有类型声明
+    // Zeroth pass: pre-register all type declarations
+    for (auto& decl : cu.declarations) {
+        if (!decl) continue;
+        if (decl->declKind == DeclKind::Struct ||
+            decl->declKind == DeclKind::Class ||
+            decl->declKind == DeclKind::Enum ||
+            decl->declKind == DeclKind::Protocol ||
+            decl->declKind == DeclKind::Actor) {
+            auto& td = static_cast<TypeDecl&>(*decl);
+            Symbol* existing = symbols_.lookup(td.name);
+            if (!existing) {
+                Symbol sym;
+                sym.kind = SymbolKind::Type;
+                sym.name = td.name;
+                sym.isPublic = (td.access == AccessLevel::Public);
+                symbols_.define(sym);
+            }
+        }
+    }
+
     // 第一遍：预注册所有函数声明（支持前向引用）
     // First pass: pre-register all function declarations (support forward references)
     for (auto& decl : cu.declarations) {
@@ -466,16 +487,8 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
 }
 
 void Sema::processStructDecl(StructDecl& decl) {
-    Symbol sym;
-    sym.kind = SymbolKind::Type;
-    sym.name = decl.name;
-    sym.line = decl.loc.line;
-    sym.column = decl.loc.column;
-    sym.isPublic = (decl.access == AccessLevel::Public);
-
-    if (!symbols_.define(sym)) {
-        error(decl.loc, "type '" + decl.name + "' is already defined");
-    }
+    // 类型已在预注册阶段定义，跳过重复定义
+    // Type already defined in pre-registration, skip duplicate
 
     symbols_.enterScope();
     for (auto& m : decl.members) {
@@ -485,17 +498,7 @@ void Sema::processStructDecl(StructDecl& decl) {
 }
 
 void Sema::processClassDecl(ClassDecl& decl) {
-    Symbol sym;
-    sym.kind = SymbolKind::Type;
-    sym.name = decl.name;
-    sym.line = decl.loc.line;
-    sym.column = decl.loc.column;
-    sym.isPublic = (decl.access == AccessLevel::Public);
-
-    if (!symbols_.define(sym)) {
-        error(decl.loc, "type '" + decl.name + "' is already defined");
-    }
-
+    // 类型已在预注册阶段定义，跳过重复定义
     symbols_.enterScope();
     for (auto& m : decl.members) {
         if (m) processDecl(*m);
@@ -504,23 +507,15 @@ void Sema::processClassDecl(ClassDecl& decl) {
 }
 
 void Sema::processEnumDecl(EnumDecl& decl) {
-    Symbol sym;
-    sym.kind = SymbolKind::Type;
-    sym.name = decl.name;
-    sym.line = decl.loc.line;
-    sym.column = decl.loc.column;
-    sym.isPublic = (decl.access == AccessLevel::Public);
-
-    if (!symbols_.define(sym)) {
-        error(decl.loc, "type '" + decl.name + "' is already defined");
-    }
-
+    // 类型已在预注册阶段定义，跳过重复定义
+    // 注册枚举 case
+    bool isPublic = (decl.access == AccessLevel::Public);
     for (auto& c : decl.cases) {
         if (c) {
             Symbol cs;
             cs.kind = SymbolKind::EnumCase;
             cs.name = c->name;
-            cs.isPublic = sym.isPublic;
+            cs.isPublic = isPublic;
             symbols_.define(cs);
         }
     }
