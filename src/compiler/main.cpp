@@ -113,6 +113,7 @@ struct Options {
     bool debugInfo = false;
     bool incremental = false;
     bool verbose = false;
+    bool bareMetal = false; // --target bare-metal
     std::vector<std::string> defines;
 };
 
@@ -351,7 +352,18 @@ int main(int argc, char* argv[]) {
         // 链接
         if (opts.verbose) std::cerr << "sukic: linking " << outputPath << "...\n";
         std::vector<std::string> objFiles = {objPath};
-        if (!suki::ObjectEmitter::linkExecutable(objFiles, outputPath, opts.target)) {
+        // bare-metal 模式：不链接标准库，使用 freestanding 链接
+        if (opts.bareMetal) {
+            // 使用 lld 链接，不链接 libc
+            std::string cmd = "lld-link /entry:_start /nodefaultlib /out:\"" + outputPath + "\"";
+            for (const auto& obj : objFiles) cmd += " \"" + obj + "\"";
+            if (opts.verbose) std::cerr << "sukic: bare-metal linking: " << cmd << "\n";
+            int result = std::system(cmd.c_str());
+            if (result != 0) {
+                std::cerr << "sukic: bare-metal linking failed\n";
+                return 1;
+            }
+        } else if (!suki::ObjectEmitter::linkExecutable(objFiles, outputPath, opts.target)) {
             std::cerr << "sukic: linking failed\n";
             return 1;
         }

@@ -61,6 +61,7 @@ private:
     DeclPtr parseUnsafeDecl();
     DeclPtr parseAsmDecl();
     DeclPtr parseMacroDecl(MacroKind kind);
+    DeclPtr parseExternDecl();
 
     // ─── Statements ───────────────────────────────────────────────────────
     StmtPtr parseStatement();

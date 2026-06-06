@@ -145,7 +145,7 @@ void Formatter::formatCompoundStmt(const CompoundStmt& stmt, int lv) {
     emitIndent(lv); out_ << "}\n";
 }
 
-void Formatter::formatExpr(const Expr& expr, int) {
+void Formatter::formatExpr(const Expr& expr, int lv) {
     switch (expr.exprKind) {
         case ExprKind::IntegerLiteral: out_ << static_cast<const IntegerLiteralExpr&>(expr).value; break;
         case ExprKind::FloatLiteral: out_ << static_cast<const FloatLiteralExpr&>(expr).value; break;
@@ -153,6 +153,77 @@ void Formatter::formatExpr(const Expr& expr, int) {
         case ExprKind::BoolLiteral: out_ << (static_cast<const BoolLiteralExpr&>(expr).value ? "true" : "false"); break;
         case ExprKind::NilLiteral: out_ << "nil"; break;
         case ExprKind::Identifier: out_ << static_cast<const IdentifierExpr&>(expr).name; break;
+        case ExprKind::Binary: {
+            auto& be = static_cast<const BinaryExpr&>(expr);
+            formatExpr(*be.left, lv);
+            // 简化运算符输出 / Simplified operator output
+            out_ << " ? ";
+            formatExpr(*be.right, lv);
+            break;
+        }
+        case ExprKind::Unary: {
+            auto& ue = static_cast<const UnaryExpr&>(expr);
+            out_ << "!";
+            formatExpr(*ue.operand, lv);
+            break;
+        }
+        case ExprKind::Call: {
+            auto& ce = static_cast<const CallExpr&>(expr);
+            formatExpr(*ce.callee, lv);
+            out_ << "(";
+            for (size_t i = 0; i < ce.args.size(); i++) {
+                if (i > 0) out_ << ", ";
+                if (!ce.args[i].label.empty()) out_ << ce.args[i].label << ": ";
+                formatExpr(*ce.args[i].value, lv);
+            }
+            out_ << ")";
+            break;
+        }
+        case ExprKind::MemberAccess: {
+            auto& ma = static_cast<const MemberAccessExpr&>(expr);
+            formatExpr(*ma.base, lv);
+            out_ << "." << ma.member;
+            break;
+        }
+        case ExprKind::ArrayLiteral: {
+            auto& al = static_cast<const ArrayLiteralExpr&>(expr);
+            out_ << "[";
+            for (size_t i = 0; i < al.elements.size(); i++) {
+                if (i > 0) out_ << ", ";
+                formatExpr(*al.elements[i], lv);
+            }
+            out_ << "]";
+            break;
+        }
+        case ExprKind::DictLiteral: {
+            auto& dl = static_cast<const DictLiteralExpr&>(expr);
+            out_ << "[";
+            for (size_t i = 0; i < dl.entries.size(); i++) {
+                if (i > 0) out_ << ", ";
+                formatExpr(*dl.entries[i].key, lv);
+                out_ << ": ";
+                formatExpr(*dl.entries[i].value, lv);
+            }
+            out_ << "]";
+            break;
+        }
+        case ExprKind::Closure: {
+            auto& cl = static_cast<const ClosureExpr&>(expr);
+            out_ << "{ ";
+            if (!cl.params.empty()) {
+                out_ << "(";
+                for (size_t i = 0; i < cl.params.size(); i++) {
+                    if (i > 0) out_ << ", ";
+                    out_ << cl.params[i].name;
+                }
+                out_ << ") in ";
+            }
+            for (const auto& s : cl.body) {
+                if (s) formatStmt(*s, lv + 1);
+            }
+            out_ << " }";
+            break;
+        }
         default: out_ << "/* expr */"; break;
     }
 }

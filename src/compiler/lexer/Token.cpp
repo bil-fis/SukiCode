@@ -93,6 +93,7 @@ static const std::unordered_map<std::string_view, TokenKind> keywordTable = {
     {"unowned",      TokenKind::KwUnowned},
     {"move",         TokenKind::KwMove},
     {"unsafe",       TokenKind::KwUnsafe},
+    {"extern",       TokenKind::KwExtern},
     {"asm",          TokenKind::KwAsm},
 
     // Type-related

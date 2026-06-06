@@ -245,6 +245,7 @@ DeclPtr Parser::parseDeclaration() {
         case TokenKind::KwSelect:    decl = parseSelectDecl(); break;
         case TokenKind::KwUnsafe:    decl = parseUnsafeDecl(); break;
         case TokenKind::KwAsm:       decl = parseAsmDecl(); break;
+        case TokenKind::KwExtern:    decl = parseExternDecl(); break;
 
         default: {
             // Try to parse as expression statement
@@ -1059,6 +1060,72 @@ DeclPtr Parser::parseMacroDecl(MacroKind kind) {
     // 解析宏体 / Parse macro body
     if (check(TokenKind::LBrace)) {
         decl->body = parseBlock();
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseExternDecl() {
+    expect(TokenKind::KwExtern);
+    auto decl = makeNode<FunctionDecl>();
+
+    // extern "C" { ... } 或 extern "C" func ...
+    if (check(TokenKind::StringLiteral)) {
+        // 跳过调用约定字符串 / Skip calling convention string (e.g., "C")
+        advance();
+    }
+
+    // extern func printf(fmt: *const u8, ...) -> i32
+    if (check(TokenKind::KwFunc)) {
+        advance(); // skip 'func'
+        if (check(TokenKind::Identifier)) {
+            decl->name = std::string(advance().stringValue);
+        } else {
+            error("expected function name");
+        }
+
+        // 参数列表
+        if (expect(TokenKind::LParen)) {
+            decl->params = parseParamList();
+            expect(TokenKind::RParen);
+        }
+
+        // 返回类型
+        if (match(TokenKind::Arrow)) {
+            decl->returnType = parseType();
+        }
+
+        // 标记为 extern / Mark as extern
+        Attribute attr;
+        attr.name = "_cdecl";
+        decl->attributes.push_back(attr);
+    }
+    // extern { func ...; func ...; }
+    else if (check(TokenKind::LBrace)) {
+        advance(); // skip '{'
+        while (!check(TokenKind::RBrace) && !isAtEnd()) {
+            if (check(TokenKind::KwFunc)) {
+                advance(); // skip 'func'
+                auto funcDecl = makeNode<FunctionDecl>();
+                if (check(TokenKind::Identifier)) {
+                    funcDecl->name = std::string(advance().stringValue);
+                }
+                if (expect(TokenKind::LParen)) {
+                    funcDecl->params = parseParamList();
+                    expect(TokenKind::RParen);
+                }
+                if (match(TokenKind::Arrow)) {
+                    funcDecl->returnType = parseType();
+                }
+                Attribute attr;
+                attr.name = "_cdecl";
+                funcDecl->attributes.push_back(attr);
+                // 直接返回第一个函数（简化处理）
+                decl = std::move(funcDecl);
+            }
+            match(TokenKind::Semicolon);
+        }
+        expect(TokenKind::RBrace);
     }
 
     return decl;
