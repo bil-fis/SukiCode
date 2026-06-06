@@ -1,0 +1,8 @@
+// Integration test - optional types
+
+@main
+func main() -> Int {
+    var name: String? = "Alice"
+    print(42)
+    return 0
+}

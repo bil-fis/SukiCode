@@ -1,0 +1,26 @@
+// Integration test - error handling
+
+enum MyError {
+    case notFound
+    case permissionDenied
+}
+
+func risky() throws -> Int {
+    return 42
+}
+
+func safe() -> Int {
+    do {
+        let result = try risky()
+        return result
+    } catch {
+        return -1
+    }
+}
+
+@main
+func main() -> Int {
+    let result = safe()
+    print(result)
+    return 0
+}

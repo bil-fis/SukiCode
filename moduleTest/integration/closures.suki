@@ -1,0 +1,7 @@
+// Integration test - closures
+
+@main
+func main() -> Int {
+    print(42)
+    return 0
+}

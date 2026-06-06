@@ -19,6 +19,11 @@ bool Type::canImplicitlyConvertTo(const Type& target) const {
     if (equals(target)) return true;
     // Any 类型接受所有类型 / Any type accepts all types
     if (target.kind_ == TypeKind::Any) return true;
+    // 任何类型可以转换为 Optional / Any type can convert to Optional
+    if (target.kind_ == TypeKind::Optional) {
+        const auto& opt = static_cast<const OptionalType&>(target);
+        return canImplicitlyConvertTo(*opt.baseType());
+    }
     // 数值类型隐式转换 / Numeric type implicit conversion
     if (kind_ == TypeKind::Int && target.kind_ == TypeKind::Double) return true;
     if (kind_ == TypeKind::Int && target.kind_ == TypeKind::Float) return true;
