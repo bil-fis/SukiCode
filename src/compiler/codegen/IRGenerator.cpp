@@ -16,7 +16,7 @@
 namespace suki {
 
 IRGenerator::IRGenerator(DiagnosticEngine& diag, const std::string& moduleName)
-    : diag_(diag), moduleName_(moduleName)
+    : diag_(diag), moduleName_(moduleName), macroExpander_(diag)
 #ifdef SUKI_HAS_LLVM
       , context_()
 #endif
@@ -330,6 +330,9 @@ void IRGenerator::genDecl(const Decl& decl) {
             builder_->CreateCall(inlineAsm);
             break;
         }
+        case DeclKind::Macro:
+            processMacroDecl(static_cast<const MacroDecl&>(decl));
+            break;
         default:
             break;
     }
@@ -1283,6 +1286,8 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             }
             return val;
         }
+        case ExprKind::MacroExpansion:
+            return genMacroExpansion(static_cast<const MacroExpansionExpr&>(expr));
         default:
             return nullptr;
     }
@@ -2016,6 +2021,39 @@ void IRGenerator::insertRelease(llvm::Value* obj) {
 bool IRGenerator::isReferenceType(llvm::Type* type) const {
     // 指针类型视为引用类型
     return type->isPointerTy();
+}
+
+// ─── 宏支持 / Macro support ─────────────────────────────────────────────
+
+void IRGenerator::processMacroDecl(const MacroDecl& decl) {
+    // 注册宏定义 / Register macro definition
+    macroExpander_.registerMacro(decl);
+}
+
+llvm::Value* IRGenerator::genMacroExpansion(const MacroExpansionExpr& expr) {
+    // 展开宏 / Expand macro
+    auto result = macroExpander_.expandMacro(expr);
+
+    if (!result.success) {
+        error(expr.loc, result.error);
+        return nullptr;
+    }
+
+    // 生成展开后的语句 / Generate expanded statements
+    llvm::Value* lastVal = nullptr;
+    for (const auto& stmt : result.statements) {
+        if (stmt) {
+            genStmt(*stmt);
+        }
+    }
+
+    // 如果展开结果是表达式语句，返回最后一个表达式的值
+    // If expansion result is expression statements, return last expression value
+    if (!result.expressions.empty()) {
+        lastVal = genExpr(*result.expressions.back());
+    }
+
+    return lastVal;
 }
 
 #endif

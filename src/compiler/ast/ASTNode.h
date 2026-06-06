@@ -219,6 +219,7 @@ enum class ExprKind : uint8_t {
     SuperRef,        // super.method
     SelfRef,         // self
     InterpolatedString, // "text \(expr) more"
+    MacroExpansion,    // #macroName(args)
 };
 
 struct Expr : ASTNode {
@@ -527,6 +528,8 @@ enum class DeclKind : uint8_t {
     Unsafe,
     Asm,            // asm("..." : outputs : inputs : clobbers)
     Attribute,
+    Macro,          // @macro declaration
+    MacroExpansion, // #macroName(args) expansion
 };
 
 enum class AccessLevel : uint8_t {
@@ -704,6 +707,29 @@ struct InitDecl : Decl {
 struct DeinitDecl : Decl {
     std::vector<StmtPtr> body;
     DeinitDecl() : Decl(DeclKind::Deinit) {}
+};
+
+// 宏声明 / Macro declaration
+enum class MacroKind : uint8_t {
+    Freestanding,  // @freestanding - 独立宏，可以作为表达式或语句
+    Attached,      // @attached - 附加到声明上的宏
+};
+
+struct MacroDecl : Decl {
+    std::string name;
+    MacroKind macroKind = MacroKind::Freestanding;
+    std::vector<FunctionParam> params; // 宏参数
+    std::vector<StmtPtr> body;         // 宏体（编译时执行的代码）
+    std::vector<StmtPtr> expansion;    // 宏展开模板（生成的代码）
+    MacroDecl() : Decl(DeclKind::Macro) {}
+};
+
+// 宏展开表达式 / Macro expansion expression
+struct MacroExpansionExpr : Expr {
+    std::string macroName;
+    std::vector<ExprPtr> args;         // 宏参数
+    std::vector<StmtPtr> expandedBody; // 展开后的语句（填充后）
+    MacroExpansionExpr() : Expr(ExprKind::MacroExpansion) {}
 };
 
 // ─── Control Flow Declarations (statements that act like declarations) ────

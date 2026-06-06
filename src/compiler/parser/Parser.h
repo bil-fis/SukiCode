@@ -60,6 +60,7 @@ private:
     DeclPtr parseSelectDecl();
     DeclPtr parseUnsafeDecl();
     DeclPtr parseAsmDecl();
+    DeclPtr parseMacroDecl(MacroKind kind);
 
     // ─── Statements ───────────────────────────────────────────────────────
     StmtPtr parseStatement();
@@ -124,6 +125,7 @@ private:
     std::string_view filename_;
     DiagnosticEngine& diag_;
     NodeID nextNodeId_ = 1;
+    uint64_t uniqueIdCounter_ = 0; // 用于 #unique 生成唯一标识符
     // Multi-variable declarations: var x, y: Double produces extra decls
     std::vector<DeclPtr> multiDecls_;
 

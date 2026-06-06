@@ -395,6 +395,21 @@ void Sema::processDecl(Decl& decl) {
             }
             break;
         }
+        case DeclKind::Macro: {
+            // 宏声明：注册宏名称到符号表 / Macro declaration: register macro name
+            auto& macroDecl = static_cast<MacroDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Function; // 宏作为函数类型注册
+            sym.name = macroDecl.name;
+            sym.isPublic = (decl.access == AccessLevel::Public);
+            sym.isInitialized = true;
+            symbols_.define(sym);
+            break;
+        }
+        case DeclKind::MacroExpansion: {
+            // 宏展开：在语义分析阶段记录，代码生成阶段展开
+            break;
+        }
         default: break;
     }
 }
@@ -947,6 +962,13 @@ TypePtr Sema::inferExprType(Expr& expr) {
                 Symbol* typeSym = symbols_.lookup(currentTypeName_);
                 if (typeSym) return typeSym->type;
             }
+            return getAnyType();
+        }
+        case ExprKind::MacroExpansion: {
+            // 宏展开类型：从宏定义推断 / Macro expansion type: infer from macro definition
+            auto& me = static_cast<const MacroExpansionExpr&>(expr);
+            // 简化实现：返回 Any 类型 / Simplified: return Any type
+            // 实际应该分析宏展开结果的类型
             return getAnyType();
         }
         default:

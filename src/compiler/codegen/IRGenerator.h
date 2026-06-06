@@ -15,6 +15,7 @@
 
 #include "compiler/ast/ASTNode.h"
 #include "compiler/diag/Diagnostic.h"
+#include "compiler/macro/MacroExpander.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -75,6 +76,11 @@ private:
     llvm::Value* genUnaryExpr(const UnaryExpr& expr);
     llvm::Value* genIfExpr(const IfExpr& expr);
     llvm::Value* genInterpolatedString(const InterpolatedStringExpr& expr);
+    llvm::Value* genMacroExpansion(const MacroExpansionExpr& expr);
+
+    // ─── 宏支持 / Macro support ─────────────────────────────────────────
+    MacroExpander macroExpander_;
+    void processMacroDecl(const MacroDecl& decl);
 
     // ─── ARC 支持 / ARC support ─────────────────────────────────────────
     void insertRetain(llvm::Value* obj);

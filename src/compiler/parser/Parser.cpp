@@ -204,7 +204,20 @@ DeclPtr Parser::parseDeclaration() {
 
     DeclPtr decl;
 
-    switch (peek().kind) {
+    // 检查是否是宏声明 / Check if this is a macro declaration
+    bool isMacro = false;
+    MacroKind macroKind = MacroKind::Freestanding;
+    for (const auto& attr : attrs) {
+        if (attr.name == "macro") { isMacro = true; break; }
+    }
+    for (const auto& attr : attrs) {
+        if (attr.name == "freestanding") { macroKind = MacroKind::Freestanding; break; }
+        if (attr.name == "attached") { macroKind = MacroKind::Attached; break; }
+    }
+
+    if (isMacro) {
+        decl = parseMacroDecl(macroKind);
+    } else switch (peek().kind) {
         case TokenKind::KwModule:    decl = parseModuleDecl(); break;
         case TokenKind::KwImport:    decl = parseImportDecl(); break;
         case TokenKind::KwLet:
@@ -1004,6 +1017,38 @@ DeclPtr Parser::parseAsmDecl() {
         }
 
         expect(TokenKind::RParen);
+    }
+
+    return decl;
+}
+
+DeclPtr Parser::parseMacroDecl(MacroKind kind) {
+    auto decl = makeNode<MacroDecl>();
+    decl->macroKind = kind;
+
+    // 期望 func 关键字 / Expect func keyword
+    if (!check(TokenKind::KwFunc)) {
+        error("expected 'func' after @macro");
+        return decl;
+    }
+    advance(); // skip 'func'
+
+    // 解析宏名称 / Parse macro name
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected macro name");
+    }
+
+    // 解析参数 / Parse parameters
+    if (expect(TokenKind::LParen)) {
+        decl->params = parseParamList();
+        expect(TokenKind::RParen);
+    }
+
+    // 解析宏体 / Parse macro body
+    if (check(TokenKind::LBrace)) {
+        decl->body = parseBlock();
     }
 
     return decl;
@@ -1855,22 +1900,49 @@ ExprPtr Parser::parsePrimaryExpr() {
             break;
         }
 
-        // Selector: #selector(method)
+        // Selector: #selector(method) or Macro: #macroName(args)
         case TokenKind::Hash: {
             advance(); // #
             if (check(TokenKind::Identifier)) {
                 auto& name = advance().stringValue;
                 if (name == "selector") {
                     if (expect(TokenKind::LParen)) {
-                        // 解析 #selector(method) 表达式
                         auto sel = makeNode<SelectorExpr>();
                         sel->method = parseExpression();
                         expect(TokenKind::RParen);
                         return sel;
                     }
+                } else if (name == "unique") {
+                    // #unique("base") 生成全局唯一标识符
+                    // Generate globally unique identifier
+                    if (expect(TokenKind::LParen)) {
+                        std::string base;
+                        if (check(TokenKind::StringLiteral)) {
+                            base = std::string(advance().stringValue);
+                        }
+                        expect(TokenKind::RParen);
+                        // 返回一个字符串字面量，包含唯一标识符
+                        auto result = makeNode<StringLiteralExpr>();
+                        result->value = base + "$" + std::to_string(uniqueIdCounter_++);
+                        return result;
+                    }
+                } else {
+                    // 宏展开表达式 / Macro expansion expression
+                    auto macro = makeNode<MacroExpansionExpr>();
+                    macro->macroName = std::string(name);
+                    if (check(TokenKind::LParen)) {
+                        advance(); // (
+                        while (!check(TokenKind::RParen) && !isAtEnd()) {
+                            auto arg = parseExpression();
+                            if (arg) macro->args.push_back(std::move(arg));
+                            if (!match(TokenKind::Comma)) break;
+                        }
+                        expect(TokenKind::RParen);
+                    }
+                    return macro;
                 }
             }
-            error("expected '#selector(...)'");
+            error("expected '#selector(...)', '#unique(...)', or '#macroName(...)'");
             return nullptr;
         }
 
