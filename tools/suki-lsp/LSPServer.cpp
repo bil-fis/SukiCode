@@ -1,13 +1,13 @@
 // SukiLSP implementation - Language Server Protocol server.
 
 #include "LSPServer.h"
+#include "JsonParser.h"
 #include "compiler/lexer/Lexer.h"
 #include "compiler/parser/Parser.h"
 #include "compiler/diag/Diagnostic.h"
 
 #include <iostream>
 #include <sstream>
-#include <algorithm>
 
 namespace suki::lsp {
 
@@ -19,40 +19,18 @@ void LSPServer::run() {
         std::string raw = readMessage();
         if (raw.empty()) continue;
 
-        // Parse JSON-RPC message
-        // Simple parser: look for "method" and "id" fields
+        auto json = JsonParser::parse(raw);
+        if (!json.isObject()) continue;
+
         Message msg;
+        const auto& methodVal = json["method"];
+        if (methodVal.isString()) msg.method = methodVal.stringValue();
 
-        // Extract method
-        size_t methodPos = raw.find("\"method\"");
-        if (methodPos != std::string::npos) {
-            size_t start = raw.find('"', methodPos + 8);
-            size_t end = raw.find('"', start + 1);
-            if (start != std::string::npos && end != std::string::npos) {
-                msg.method = raw.substr(start + 1, end - start - 1);
-            }
-        }
+        const auto& idVal = json["id"];
+        if (idVal.isNumber()) msg.id = std::to_string(idVal.intValue());
+        else if (idVal.isString()) msg.id = idVal.stringValue();
 
-        // Extract id
-        size_t idPos = raw.find("\"id\"");
-        if (idPos != std::string::npos) {
-            size_t start = raw.find_first_of("0123456789\"", idPos + 4);
-            if (start != std::string::npos) {
-                if (raw[start] == '"') {
-                    size_t end = raw.find('"', start + 1);
-                    msg.id = raw.substr(start + 1, end - start - 1);
-                } else {
-                    size_t end = raw.find_first_not_of("0123456789", start);
-                    msg.id = raw.substr(start, end - start);
-                }
-            }
-        }
-
-        // Extract params (everything after "params":)
-        size_t paramsPos = raw.find("\"params\"");
-        if (paramsPos != std::string::npos) {
-            msg.params = raw.substr(paramsPos + 8);
-        }
+        msg.params = json.hasKey("params") ? json["params"].dump() : "";
 
         processMessage(msg);
     }
@@ -138,66 +116,119 @@ std::string LSPServer::handleShutdown(const std::string& id, const std::string&)
 }
 
 std::string LSPServer::handleDidOpen(const std::string& params) {
-    // Extract URI and text from params
-    // Simple extraction for now
+    auto json = JsonParser::parse(params);
+    const auto& td = json["textDocument"];
+    if (!td.isObject()) return "";
+
     Document doc;
-    // TODO: proper JSON parsing
+    if (td["uri"].isString()) doc.uri = td["uri"].stringValue();
+    if (td["text"].isString()) doc.content = td["text"].stringValue();
+    if (td["version"].isNumber()) doc.version = td["version"].intValue();
+
     documents_[doc.uri] = doc;
     analyzeDocument(doc.uri);
     return "";
 }
 
 std::string LSPServer::handleDidChange(const std::string& params) {
-    // Update document content
-    // TODO: proper JSON parsing and incremental updates
+    auto json = JsonParser::parse(params);
+    const auto& td = json["textDocument"];
+    const auto& changes = json["contentChanges"];
+    if (!td.isObject() || !changes.isArray()) return "";
+
+    std::string uri;
+    if (td["uri"].isString()) uri = td["uri"].stringValue();
+
+    auto it = documents_.find(uri);
+    if (it == documents_.end()) return "";
+
+    // Apply changes (full document sync)
+    if (changes.size() > 0) {
+        const auto& change = changes[0];
+        if (change.hasKey("text") && change["text"].isString()) {
+            it->second.content = change["text"].stringValue();
+        }
+    }
+
+    if (td["version"].isNumber()) {
+        it->second.version = td["version"].intValue();
+    }
+
+    analyzeDocument(uri);
     return "";
 }
 
 std::string LSPServer::handleDidClose(const std::string& params) {
-    // Remove document
-    // TODO: proper JSON parsing
+    auto json = JsonParser::parse(params);
+    const auto& td = json["textDocument"];
+    if (!td.isObject()) return "";
+
+    std::string uri;
+    if (td["uri"].isString()) uri = td["uri"].stringValue();
+    documents_.erase(uri);
     return "";
 }
 
 std::string LSPServer::handleCompletion(const std::string& id, const std::string& params) {
-    // TODO: proper completion based on context
-    std::vector<CompletionItem> items;
+    auto json = JsonParser::parse(params);
+    const auto& td = json["textDocument"];
+    const auto& pos = json["position"];
 
-    // Add keywords
-    std::vector<std::string> keywords = {
-        "func", "let", "var", "if", "else", "for", "in", "while",
-        "return", "struct", "class", "enum", "protocol", "actor",
-        "import", "module", "async", "await", "throws", "try",
-        "true", "false", "nil", "self", "super"
-    };
+    std::string uri;
+    if (td["uri"].isString()) uri = td["uri"].stringValue();
 
-    for (const auto& kw : keywords) {
-        CompletionItem item;
-        item.label = kw;
-        item.kind = 14; // Keyword
-        items.push_back(item);
-    }
+    Position position;
+    if (pos["line"].isNumber()) position.line = pos["line"].intValue();
+    if (pos["character"].isNumber()) position.character = pos["character"].intValue();
 
-    // Build response
+    auto items = getCompletions(uri, position);
+
     std::ostringstream oss;
-    oss << "[";
+    oss << "{\"isIncomplete\":false,\"items\":[";
     for (size_t i = 0; i < items.size(); i++) {
         if (i > 0) oss << ",";
         oss << "{\"label\":\"" << items[i].label
-            << "\",\"kind\":" << items[i].kind << "}";
+            << "\",\"kind\":" << items[i].kind;
+        if (!items[i].detail.empty()) {
+            oss << ",\"detail\":\"" << items[i].detail << "\"";
+        }
+        oss << "}";
     }
-    oss << "]";
+    oss << "]}";
 
     return createResponse(id, oss.str());
 }
 
-std::string LSPServer::handleDefinition(const std::string& id, const std::string&) {
-    // TODO: implement go-to-definition
+std::string LSPServer::handleDefinition(const std::string& id, const std::string& params) {
+    auto json = JsonParser::parse(params);
+    const auto& td = json["textDocument"];
+    const auto& pos = json["position"];
+
+    std::string uri;
+    if (td["uri"].isString()) uri = td["uri"].stringValue();
+
+    Position position;
+    if (pos["line"].isNumber()) position.line = pos["line"].intValue();
+    if (pos["character"].isNumber()) position.character = pos["character"].intValue();
+
+    // TODO: implement actual go-to-definition
+    // For now, return the same position (no-op)
     return createResponse(id, "null");
 }
 
-std::string LSPServer::handleHover(const std::string& id, const std::string&) {
-    // TODO: implement hover information
+std::string LSPServer::handleHover(const std::string& id, const std::string& params) {
+    auto json = JsonParser::parse(params);
+    const auto& td = json["textDocument"];
+    const auto& pos = json["position"];
+
+    std::string uri;
+    if (td["uri"].isString()) uri = td["uri"].stringValue();
+
+    Position position;
+    if (pos["line"].isNumber()) position.line = pos["line"].intValue();
+    if (pos["character"].isNumber()) position.character = pos["character"].intValue();
+
+    // TODO: implement actual hover information
     return createResponse(id, "null");
 }
 
@@ -214,20 +245,18 @@ void LSPServer::analyzeDocument(const std::string& uri) {
 std::vector<Diagnostic> LSPServer::diagnose(const std::string& content, const std::string& uri) {
     std::vector<Diagnostic> diags;
 
-    // Lex and parse
     DiagnosticEngine diag;
     Lexer lexer(content, uri, diag);
     auto tokens = lexer.lexAll();
     Parser parser(std::move(tokens), content, uri, diag);
     auto ast = parser.parse();
 
-    // Convert compiler diagnostics to LSP diagnostics
     for (const auto& d : diag.diagnostics()) {
         Diagnostic ld;
-        ld.range.start.line = d.loc.line - 1;
-        ld.range.start.character = d.loc.column - 1;
-        ld.range.end.line = d.loc.line - 1;
-        ld.range.end.character = d.loc.column;
+        ld.range.start.line = d.loc.line > 0 ? d.loc.line - 1 : 0;
+        ld.range.start.character = d.loc.column > 0 ? d.loc.column - 1 : 0;
+        ld.range.end.line = ld.range.start.line;
+        ld.range.end.character = ld.range.start.character + 1;
         ld.message = d.message;
         ld.severity = (d.level == DiagnosticLevel::Error) ? 1 :
                       (d.level == DiagnosticLevel::Warning) ? 2 : 3;
@@ -238,13 +267,88 @@ std::vector<Diagnostic> LSPServer::diagnose(const std::string& content, const st
 }
 
 std::vector<CompletionItem> LSPServer::getCompletions(const std::string&, Position) {
-    return {};
+    std::vector<CompletionItem> items;
+
+    // Keywords
+    std::vector<std::pair<std::string, std::string>> keywords = {
+        {"func", "Function declaration"},
+        {"let", "Constant declaration"},
+        {"var", "Variable declaration"},
+        {"if", "If statement"},
+        {"else", "Else clause"},
+        {"for", "For loop"},
+        {"in", "In keyword"},
+        {"while", "While loop"},
+        {"return", "Return statement"},
+        {"struct", "Struct declaration"},
+        {"class", "Class declaration"},
+        {"enum", "Enum declaration"},
+        {"protocol", "Protocol declaration"},
+        {"actor", "Actor declaration"},
+        {"import", "Import declaration"},
+        {"module", "Module declaration"},
+        {"async", "Async function"},
+        {"await", "Await expression"},
+        {"throws", "Throwing function"},
+        {"try", "Try expression"},
+        {"true", "Boolean true"},
+        {"false", "Boolean false"},
+        {"nil", "Nil literal"},
+        {"self", "Self reference"},
+        {"super", "Super reference"},
+        {"guard", "Guard statement"},
+        {"switch", "Switch statement"},
+        {"case", "Case label"},
+        {"default", "Default case"},
+        {"break", "Break statement"},
+        {"continue", "Continue statement"},
+        {"fallthrough", "Fallthrough"},
+        {"defer", "Defer statement"},
+        {"select", "Select statement"},
+        {"unsafe", "Unsafe block"},
+        {"extension", "Extension declaration"},
+        {"typealias", "Type alias"},
+        {"init", "Initializer"},
+        {"deinit", "Deinitializer"},
+        {"subscript", "Subscript"},
+        {"static", "Static member"},
+        {"mutating", "Mutating method"},
+        {"override", "Override"},
+        {"final", "Final"},
+        {"required", "Required"},
+        {"convenience", "Convenience init"},
+    };
+
+    for (const auto& [kw, doc] : keywords) {
+        CompletionItem item;
+        item.label = kw;
+        item.kind = 14; // Keyword
+        item.detail = doc;
+        items.push_back(item);
+    }
+
+    // Types
+    std::vector<std::string> types = {
+        "Int", "Int8", "Int16", "Int32", "Int64",
+        "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
+        "Float", "Double", "Bool", "String", "Char", "Void",
+        "Array", "Dictionary", "Set", "Optional", "Result",
+        "Any", "AnyObject", "Self",
+    };
+
+    for (const auto& ty : types) {
+        CompletionItem item;
+        item.label = ty;
+        item.kind = 7; // Type
+        items.push_back(item);
+    }
+
+    return items;
 }
 
 // ─── IO ──────────────────────────────────────────────────────────────────
 
 std::string LSPServer::readMessage() {
-    // Read Content-Length header
     std::string line;
     int contentLength = 0;
 
@@ -257,7 +361,6 @@ std::string LSPServer::readMessage() {
 
     if (contentLength <= 0) return "";
 
-    // Read content
     std::string content(contentLength, '\0');
     std::cin.read(&content[0], contentLength);
     return content;

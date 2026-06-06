@@ -3,6 +3,7 @@
 add_executable(suki-lsp
     main.cpp
     LSPServer.cpp
+    JsonParser.cpp
 )
 
 target_include_directories(suki-lsp PRIVATE ${CMAKE_SOURCE_DIR}/src/compiler/..)
