@@ -1367,6 +1367,44 @@ ExprPtr Parser::parsePostfixExpr() {
     if (!expr) return nullptr;
 
     while (true) {
+        // Generic type arguments: Identifier<Type>(args)
+        if (check(TokenKind::Less) && expr->exprKind == ExprKind::Identifier) {
+            // Lookahead: check if < is followed by a type pattern
+            size_t save = pos_;
+            pos_++; // skip <
+            bool isGeneric = false;
+            if (pos_ < tokens_.size() && tokens_[pos_].is(TokenKind::Identifier)) {
+                // Check for Type> or Type, pattern
+                while (pos_ < tokens_.size() && !tokens_[pos_].is(TokenKind::Greater) &&
+                       !tokens_[pos_].is(TokenKind::Eof)) {
+                    pos_++;
+                }
+                if (pos_ < tokens_.size() && tokens_[pos_].is(TokenKind::Greater)) {
+                    pos_++; // skip >
+                    // Check if followed by (
+                    if (pos_ < tokens_.size() && tokens_[pos_].is(TokenKind::LParen)) {
+                        isGeneric = true;
+                    }
+                }
+            }
+            pos_ = save; // restore
+
+            if (isGeneric) {
+                // Parse generic type arguments
+                advance(); // <
+                std::vector<TypeReprPtr> genericArgs;
+                do {
+                    genericArgs.push_back(parseType());
+                } while (match(TokenKind::Comma));
+                expect(TokenKind::Greater);
+
+                // Create a generic call expression
+                // For now, just skip the generic args and parse the call
+                if (check(TokenKind::LParen)) {
+                    expr = parseCallExpr(std::move(expr));
+                }
+            }
+        }
         if (check(TokenKind::LParen)) {
             expr = parseCallExpr(std::move(expr));
             // Trailing closure: call() { params in body }
