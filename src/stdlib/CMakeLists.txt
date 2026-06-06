@@ -7,6 +7,7 @@ add_library(sukistd STATIC
     core/Print.cpp
     core/Assert.cpp
     core/String.cpp
+    # System 模块是 header-only，不需要编译
 )
 
 target_include_directories(sukistd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
