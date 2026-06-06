@@ -21,9 +21,10 @@ public:
 
     // 输出目标文件 / Emit object file
     // Returns true on success
+    // optLevel: 0=none, 1=less, 2=default, 3=aggressive, s=size, z=size+no-vectorize
 #ifdef SUKI_HAS_LLVM
     bool emitObjectFile(llvm::Module& module, const std::string& outputPath,
-                        const std::string& targetTriple = "");
+                        const std::string& targetTriple = "", int optLevel = 2);
 
     // 输出汇编文件 / Emit assembly file
     bool emitAssembly(llvm::Module& module, const std::string& outputPath,

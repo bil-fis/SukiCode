@@ -321,7 +321,11 @@ int main(int argc, char* argv[]) {
         if (opts.verbose) std::cerr << "sukic: emitting object file to " << outputPath << "\n";
         auto llvmModule = codegen.releaseModule();
         suki::ObjectEmitter emitter;
-        if (!emitter.emitObjectFile(*llvmModule, outputPath, opts.target)) {
+        // 映射优化级别 / Map optimization level
+        int mappedOpt = opts.optLevel;
+        if (opts.optLevel == 4) mappedOpt = -1; // -Os
+        else if (opts.optLevel == 5) mappedOpt = -2; // -Oz
+        if (!emitter.emitObjectFile(*llvmModule, outputPath, opts.target, mappedOpt)) {
             diag.printAll(source, opts.inputFile);
             return 1;
         }
@@ -336,7 +340,10 @@ int main(int argc, char* argv[]) {
         if (opts.verbose) std::cerr << "sukic: generating object file...\n";
         auto llvmModule = codegen.releaseModule();
         suki::ObjectEmitter emitter;
-        if (!emitter.emitObjectFile(*llvmModule, objPath, opts.target)) {
+        int mappedOpt = opts.optLevel;
+        if (opts.optLevel == 4) mappedOpt = -1; // -Os
+        else if (opts.optLevel == 5) mappedOpt = -2; // -Oz
+        if (!emitter.emitObjectFile(*llvmModule, objPath, opts.target, mappedOpt)) {
             diag.printAll(source, opts.inputFile);
             return 1;
         }

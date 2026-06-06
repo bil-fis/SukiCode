@@ -455,6 +455,16 @@ DeclPtr Parser::parseFunctionDecl() {
         decl->genericParams = parseGenericParams();
     }
 
+    // Where clause (泛型约束补充)
+    if (check(TokenKind::KwWhere)) {
+        advance(); // skip 'where'
+        // 解析约束表达式 / Parse constraint expressions
+        // 简化：跳过到 { 或 -> / Simplified: skip to { or ->
+        while (!check(TokenKind::LBrace) && !check(TokenKind::Arrow) && !isAtEnd()) {
+            advance();
+        }
+    }
+
     // Parameter list
     if (expect(TokenKind::LParen)) {
         decl->params = parseParamList();

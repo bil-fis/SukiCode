@@ -49,7 +49,7 @@ std::string ObjectEmitter::getDefaultTargetTriple() {
 }
 
 bool ObjectEmitter::emitObjectFile(llvm::Module& module, const std::string& outputPath,
-                                    const std::string& targetTriple) {
+                                    const std::string& targetTriple, int optLevel) {
     std::string tripleStr = targetTriple.empty() ? getDefaultTargetTriple() : targetTriple;
     llvm::Triple triple(tripleStr);
     module.setTargetTriple(triple);
@@ -85,14 +85,29 @@ bool ObjectEmitter::emitObjectFile(llvm::Module& module, const std::string& outp
     // 生成目标文件 / Generate object file
     llvm::legacy::PassManager pass;
 
-    // 添加优化 passes / Add optimization passes
-    // 标准优化级别：mem2reg, instcombine, reassociate, GVN, simplifycfg
-    // Standard optimization level: mem2reg, instcombine, reassociate, GVN, simplifycfg
-    pass.add(llvm::createPromoteMemoryToRegisterPass());
-    pass.add(llvm::createInstructionCombiningPass());
-    pass.add(llvm::createReassociatePass());
-    pass.add(llvm::createGVNPass());
-    pass.add(llvm::createCFGSimplificationPass());
+    // 根据优化级别添加 passes / Add passes based on optimization level
+    if (optLevel >= 1) {
+        pass.add(llvm::createPromoteMemoryToRegisterPass());
+    }
+    if (optLevel >= 2) {
+        pass.add(llvm::createInstructionCombiningPass());
+        pass.add(llvm::createReassociatePass());
+        pass.add(llvm::createCFGSimplificationPass());
+    }
+    if (optLevel >= 3) {
+        pass.add(llvm::createGVNPass());
+    }
+    if (optLevel == -1) {
+        // -Os: size optimization
+        pass.add(llvm::createPromoteMemoryToRegisterPass());
+        pass.add(llvm::createInstructionCombiningPass());
+        pass.add(llvm::createCFGSimplificationPass());
+    }
+    if (optLevel == -2) {
+        // -Oz: aggressive size optimization
+        pass.add(llvm::createPromoteMemoryToRegisterPass());
+        pass.add(llvm::createCFGSimplificationPass());
+    }
 
     auto fileType = llvm::CodeGenFileType::ObjectFile;
 

@@ -91,8 +91,13 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
                 resolveType(fd.returnType.get()) :
                 llvm::Type::getVoidTy(context_);
             llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
+            // 根据访问级别设置链接类型 / Set linkage based on access level
+            llvm::GlobalValue::LinkageTypes linkage = llvm::Function::ExternalLinkage;
+            if (fd.access == AccessLevel::Private || fd.access == AccessLevel::FilePrivate) {
+                linkage = llvm::Function::InternalLinkage;
+            }
             llvm::Function* func = llvm::Function::Create(
-                funcType, llvm::Function::ExternalLinkage, fd.name, module_.get());
+                funcType, linkage, fd.name, module_.get());
             // 设置参数名称 / Set parameter names
             size_t argIdx = 0;
             for (auto& arg : func->args()) {
@@ -212,12 +217,12 @@ llvm::Type* IRGenerator::resolveType(const TypeRepr* tr) {
         auto& o = static_cast<const OptionalTypeRepr&>(*tr);
         llvm::Type* baseType = resolveType(o.base.get());
         // Optional 使用 {value, hasValue} 标记结构体
-        // Optional uses {value, hasValue} tagged struct
+        // Optional uses {value, hasValue} tagged struct (hasValue as i8 for alignment)
         std::string typeName = "Optional." + std::to_string(reinterpret_cast<uintptr_t>(o.base.get()));
         llvm::StructType* optType = llvm::StructType::getTypeByName(context_, typeName);
         if (!optType) {
             optType = llvm::StructType::create(context_, typeName);
-            optType->setBody({baseType, llvm::Type::getInt1Ty(context_)});
+            optType->setBody({baseType, llvm::Type::getInt8Ty(context_)});
         }
         return optType;
     }
@@ -410,6 +415,50 @@ void IRGenerator::genDecl(const Decl& decl) {
         case DeclKind::DoCatch:
             genDoCatchStmt(static_cast<const DoCatchDecl&>(decl));
             break;
+        case DeclKind::Select: {
+            // select 语句：channel 多路复用
+            // select statement: channel multiplexing
+            auto& sd = static_cast<const SelectDecl&>(decl);
+            // 生成每个 case 分支 / Generate each case branch
+            llvm::Function* func = builder_->GetInsertBlock()->getParent();
+            llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "select.end", func);
+            llvm::BasicBlock* defaultBB = nullptr;
+
+            // 创建所有 case 块 / Create all case blocks
+            std::vector<llvm::BasicBlock*> caseBBs;
+            for (size_t i = 0; i < sd.cases.size(); i++) {
+                caseBBs.push_back(llvm::BasicBlock::Create(context_, "select.case", func));
+            }
+
+            // 查找 default 分支 / Find default branch
+            for (size_t i = 0; i < sd.cases.size(); i++) {
+                if (sd.cases[i].kind == SelectCase::Kind::Default) {
+                    defaultBB = caseBBs[i];
+                }
+            }
+            if (!defaultBB) defaultBB = mergeBB;
+
+            // 简化实现：直接跳转到第一个 case
+            // Simplified: jump to first case directly
+            // 完整实现需要轮询 channel 状态
+            if (!caseBBs.empty()) {
+                builder_->CreateBr(caseBBs[0]);
+            }
+
+            // 生成每个 case 的代码 / Generate code for each case
+            for (size_t i = 0; i < sd.cases.size(); i++) {
+                builder_->SetInsertPoint(caseBBs[i]);
+                for (const auto& s : sd.cases[i].body) {
+                    if (s) genStmt(*s);
+                }
+                if (!builder_->GetInsertBlock()->getTerminator()) {
+                    builder_->CreateBr(mergeBB);
+                }
+            }
+
+            builder_->SetInsertPoint(mergeBB);
+            break;
+        }
         case DeclKind::Throw:
             genThrowStmt(static_cast<const ThrowDecl&>(decl));
             break;
@@ -591,6 +640,17 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
     awaitPointCount_ = 0;
     namedValues_.clear();
     namedTypes_.clear();
+
+    // async 函数：生成协程帧 / async function: generate coroutine frame
+    if (decl.isAsync) {
+        // 创建协程状态变量 / Create coroutine state variable
+        llvm::AllocaInst* stateVar = createEntryBlockAlloca(func,
+            llvm::Type::getInt32Ty(context_), "__coro_state");
+        builder_->CreateStore(llvm::ConstantInt::get(
+            llvm::Type::getInt32Ty(context_), 0), stateVar);
+        namedValues_["__coro_state"] = stateVar;
+        namedTypes_["__coro_state"] = llvm::Type::getInt32Ty(context_);
+    }
 
     // 为参数创建 alloca / Create allocas for parameters
     size_t idx = 0;
@@ -794,38 +854,32 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
             bool isNil = initVal->getType()->isPointerTy() &&
                 llvm::isa<llvm::ConstantPointerNull>(initVal);
             if (isNil) {
-                // nil: 创建 {default, false}
-                llvm::Value* undef = llvm::UndefValue::get(optType->getElementType(0));
-                std::vector<llvm::Constant*> elems = {
-                    llvm::cast<llvm::Constant>(undef),
-                    llvm::ConstantInt::getFalse(context_)
-                };
-                initVal = llvm::ConstantStruct::get(optType, elems);
+                // nil: 创建零初始化的 Optional / Create zero-initialized Optional
+                initVal = llvm::Constant::getNullValue(optType);
             } else {
-                // 非 nil: 包装为 {value, true}
+                // 非 nil: 使用 alloca + GEP + store 构建 / Build with alloca + GEP + store
+                llvm::AllocaInst* optAlloca = builder_->CreateAlloca(optType, nullptr, "opt.tmp");
+                // 存储值到第一个字段 / Store value to first field
+                llvm::Value* valFieldPtr = builder_->CreateStructGEP(optType, optAlloca, 0, "opt.val.ptr");
                 llvm::Value* val = initVal;
-                if (val->getType() != optType->getElementType(0)) {
-                    if (optType->getElementType(0)->isDoubleTy() && val->getType()->isIntegerTy()) {
-                        val = builder_->CreateSIToFP(val, optType->getElementType(0), "opt.cast");
-                    } else if (optType->getElementType(0)->isIntegerTy(64) && val->getType()->isIntegerTy()) {
-                        val = builder_->CreateSExt(val, optType->getElementType(0), "opt.cast");
+                llvm::Type* fieldType = optType->getElementType(0);
+                if (val->getType() != fieldType) {
+                    if (fieldType->isDoubleTy() && val->getType()->isIntegerTy()) {
+                        val = builder_->CreateSIToFP(val, fieldType, "opt.cast");
+                    } else if (fieldType->isIntegerTy(64) && val->getType()->isIntegerTy()) {
+                        val = builder_->CreateSExt(val, fieldType, "opt.cast");
                     }
                 }
-                std::vector<llvm::Constant*> elems = {
-                    llvm::UndefValue::get(optType->getElementType(0)),
-                    llvm::ConstantInt::getTrue(context_)
-                };
-                initVal = llvm::ConstantStruct::get(optType, elems);
-                initVal = builder_->CreateInsertValue(initVal, val, 0, "opt.wrap");
+                builder_->CreateStore(val, valFieldPtr);
+                // 存储 hasValue = 1 到第二个字段 / Store hasValue = 1 to second field
+                llvm::Value* hasFieldPtr = builder_->CreateStructGEP(optType, optAlloca, 1, "opt.has.ptr");
+                builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 1), hasFieldPtr);
+                // 加载整个 Optional / Load entire Optional
+                initVal = builder_->CreateLoad(optType, optAlloca, "opt.val");
             }
         } else {
-            // 无初始化值: 创建 {default, false}
-            llvm::Value* undef = llvm::UndefValue::get(optType->getElementType(0));
-            std::vector<llvm::Constant*> elems = {
-                llvm::cast<llvm::Constant>(undef),
-                llvm::ConstantInt::getFalse(context_)
-            };
-            initVal = llvm::ConstantStruct::get(optType, elems);
+            // 无初始化值: 创建零初始化的 Optional
+            initVal = llvm::Constant::getNullValue(optType);
         }
     } else if (initVal && initVal->getType() != varType) {
         // 非 Optional 类型的类型转换
@@ -1377,7 +1431,22 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
         }
         case ExprKind::Await: {
             auto& ae = static_cast<const AwaitExpr&>(expr);
-            return genExpr(*ae.subExpr);
+            llvm::Value* val = genExpr(*ae.subExpr);
+            if (!val) return nullptr;
+            // async 上下文中：创建挂起点 / In async context: create suspension point
+            if (isInAsyncFunc_) {
+                // 递增状态 / Increment state
+                llvm::Value* stateVar = namedValues_["__coro_state"];
+                if (stateVar) {
+                    llvm::Value* currentState = builder_->CreateLoad(
+                        llvm::Type::getInt32Ty(context_), stateVar, "coro.state");
+                    llvm::Value* nextState = builder_->CreateAdd(currentState,
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 1), "coro.next");
+                    builder_->CreateStore(nextState, stateVar);
+                    awaitPointCount_++;
+                }
+            }
+            return val;
         }
         case ExprKind::Try: {
             auto& te = static_cast<const TryExpr&>(expr);

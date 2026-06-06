@@ -9,6 +9,7 @@ moduleTest/build/
 
 # Claude session memory (not for version control)
 MEMORY.md
+.claude/
 
 # IDE
 .vs/
