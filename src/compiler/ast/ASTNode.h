@@ -177,6 +177,12 @@ struct AsTypePattern : Pattern {
     AsTypePattern() : Pattern(PatternKind::AsType) {}
 };
 
+// 表达式模式（用于 switch case 中的常量匹配）/ Expression pattern (for constant matching in switch cases)
+struct ExpressionPattern : Pattern {
+    ExprPtr expression; // 匹配的表达式 / The expression to match against
+    ExpressionPattern() : Pattern(PatternKind::Expression) {}
+};
+
 // ─── Expressions ──────────────────────────────────────────────────────────
 
 enum class ExprKind : uint8_t {
@@ -414,6 +420,12 @@ struct SuperRefExpr : Expr {
 
 struct SelfRefExpr : Expr {
     SelfRefExpr() : Expr(ExprKind::SelfRef) {}
+};
+
+// #selector(method) 表达式 / #selector(method) expression
+struct SelectorExpr : Expr {
+    ExprPtr method; // 被引用的方法表达式 / The referenced method expression
+    SelectorExpr() : Expr(ExprKind::Selector) {}
 };
 
 // ─── Statements ───────────────────────────────────────────────────────────

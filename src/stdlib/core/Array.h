@@ -55,7 +55,7 @@ public:
         return false;
     }
 
-    size_t firstIndex(of: const T& value) const {
+    size_t firstIndex(const T& value) const {
         for (size_t i = 0; i < data_->size(); i++) {
             if ((*data_)[i] == value) return i;
         }

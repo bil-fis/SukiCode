@@ -135,6 +135,9 @@ private:
         llvm::BasicBlock* afterBlock;
     };
     std::vector<LoopInfo> loopStack_;
+
+    // Catch 块栈（用于 setjmp/longjmp 异常处理）/ Catch block stack (for setjmp/longjmp exception handling)
+    std::vector<llvm::Value*> catchStack_;
 #endif
 
     DiagnosticEngine& diag_;

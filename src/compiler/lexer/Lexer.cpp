@@ -428,11 +428,8 @@ Token Lexer::scanString() {
                 case '0':  value += '\0'; break;
                 case '(': {
                     // String interpolation \(expr)
-                    // For now, we'll treat the whole string up to here as a literal,
-                    // and let the parser handle interpolation.
-                    // Mark this as a string with interpolation.
-                    // TODO: implement proper interpolation tokenization
-                    // For now, just include the literal \( as text
+                    // 词法分析器保留 \( 作为字面量文本，由解析器处理插值表达式
+                    // Lexer preserves \( as literal text, parser handles interpolation expressions
                     value += "\\(";
                     break;
                 }

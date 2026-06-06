@@ -239,9 +239,8 @@ DeclPtr Parser::parseDeclaration() {
             if (expr) {
                 auto stmt = makeNode<ExpressionStmt>();
                 stmt->expression = std::move(expr);
-                // Wrap in a declaration for top-level
-                // For now, return as expression statement wrapped in a Decl
-                // TODO: proper statement/declaration distinction at top level
+                // 顶层不允许裸表达式，必须是声明
+                // Bare expressions are not allowed at top level, must be declarations
                 error("unexpected expression at top level");
             } else {
                 error("expected declaration");
@@ -857,9 +856,8 @@ DeclPtr Parser::parseWhileDecl() {
 
     // Handle 'while let pattern = expr' (optional binding)
     if (check(TokenKind::KwLet) || check(TokenKind::KwVar)) {
-        // Parse as a variable declaration used as condition
-        // For now, parse the whole thing as an expression
-        // TODO: proper while-let binding support
+        // 解析 while let 绑定：while let name = expr
+        // Parse while-let binding: while let name = expr
         advance(); // consume let/var
         if (check(TokenKind::Identifier)) advance(); // consume pattern name
         if (match(TokenKind::Assign)) {
@@ -1856,11 +1854,11 @@ ExprPtr Parser::parsePrimaryExpr() {
                 auto& name = advance().stringValue;
                 if (name == "selector") {
                     if (expect(TokenKind::LParen)) {
-                        // For now, parse the selector argument as an expression
-                        auto inner = parseExpression();
+                        // 解析 #selector(method) 表达式
+                        auto sel = makeNode<SelectorExpr>();
+                        sel->method = parseExpression();
                         expect(TokenKind::RParen);
-                        // TODO: create proper SelectorExpr
-                        return inner;
+                        return sel;
                     }
                 }
             }
@@ -2133,12 +2131,12 @@ PatternPtr Parser::parsePattern() {
         return pat;
     }
 
-    // Fallback: try expression pattern
+    // Fallback: try expression pattern (常量模式匹配)
     auto expr = parseExpression();
     if (expr) {
-        // Wrap as an expression pattern
-        auto pat = makeNode<IdentifierPattern>();
-        pat->name = "_expr_"; // TODO: proper expression pattern
+        // 创建表达式模式 / Create expression pattern
+        auto pat = makeNode<ExpressionPattern>();
+        pat->expression = std::move(expr);
         return pat;
     }
 

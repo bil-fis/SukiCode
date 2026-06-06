@@ -3,13 +3,35 @@
 
 #include "Coroutine.h"
 #include <mutex>
+#include <csetjmp>
 
 namespace suki::runtime {
+
+// 协程上下文 / Coroutine context
+struct CoroutineContext {
+    std::jmp_buf jumpBuf;
+    bool hasContext = false;
+};
 
 void CoroutineHandle::resume() {
     if (state != CoroutineState::Suspended && state != CoroutineState::Initial) return;
     state = CoroutineState::Running;
-    // TODO: 实际恢复协程执行 / Actually resume coroutine execution
+
+    // 恢复协程执行 / Resume coroutine execution
+    // 如果有保存的上下文，使用 longjmp 恢复
+    // If there is a saved context, use longjmp to resume
+    if (address) {
+        auto* ctx = static_cast<CoroutineContext*>(address);
+        if (ctx->hasContext) {
+            // 使用 longjmp 恢复到协程暂停点
+            // Use longjmp to resume at coroutine suspension point
+            std::longjmp(ctx->jumpBuf, 1);
+        }
+    }
+
+    // 如果没有保存的上下文，协程已完成
+    // If no saved context, coroutine is complete
+    state = CoroutineState::Completed;
 }
 
 void CoroutineHandle::destroy() {

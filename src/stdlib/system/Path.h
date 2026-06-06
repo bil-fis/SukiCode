@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <cstdlib>
 
 namespace suki::stdlib {
 
@@ -107,7 +108,20 @@ public:
     }
 
     static Path homeDirectory() {
-        return Path(fs::path("~").string()); // TODO: proper home dir
+#ifdef _WIN32
+        // Windows: 使用 USERPROFILE 环境变量 / Use USERPROFILE environment variable
+        const char* home = std::getenv("USERPROFILE");
+        if (home) return Path(home);
+        const char* drive = std::getenv("HOMEDRIVE");
+        const char* path = std::getenv("HOMEPATH");
+        if (drive && path) return Path(std::string(drive) + path);
+        return Path("C:\\");
+#else
+        // Unix: 使用 HOME 环境变量 / Use HOME environment variable
+        const char* home = std::getenv("HOME");
+        if (home) return Path(home);
+        return Path("/");
+#endif
     }
 
     static Path tempDirectory() {

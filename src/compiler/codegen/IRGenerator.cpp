@@ -609,9 +609,28 @@ void IRGenerator::genForInStmt(const ForInDecl& decl) {
     }
     if (!seqExpr) return;
 
+    // 获取序列长度 / Get sequence length
+    // 如果序列是 Array 类型 {i8*, i64, i64}，第二个元素是 count
+    llvm::Value* length = nullptr;
+    llvm::Type* elemType = llvm::Type::getInt64Ty(context_);
+    if (seqExpr->getType()->isStructTy()) {
+        // Array 类型: { data_ptr, count, capacity }
+        llvm::Value* countPtr = builder_->CreateStructGEP(seqExpr->getType(), seqExpr, 1, "arr.count.ptr");
+        length = builder_->CreateLoad(llvm::Type::getInt64Ty(context_), countPtr, "arr.count");
+        // 数据指针
+        llvm::Value* dataPtr = builder_->CreateStructGEP(seqExpr->getType(), seqExpr, 0, "arr.data.ptr");
+        llvm::Value* data = builder_->CreateLoad(llvm::PointerType::get(context_, 0), dataPtr, "arr.data");
+        // 存储数据指针以便后续按索引访问
+        seqExpr = data;
+    } else if (seqExpr->getType()->isPointerTy()) {
+        // 指针类型，假设指向数组结构
+        length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 10); // fallback
+    } else {
+        length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 10);
+    }
+
     // 创建循环变量 / Create loop variable
-    llvm::Type* varType = llvm::Type::getInt64Ty(context_);
-    llvm::AllocaInst* loopVar = createEntryBlockAlloca(currentFunc_, varType, varName);
+    llvm::AllocaInst* loopVar = createEntryBlockAlloca(currentFunc_, elemType, varName);
 
     // 创建索引变量 / Create index variable
     llvm::AllocaInst* indexVar = createEntryBlockAlloca(currentFunc_, llvm::Type::getInt64Ty(context_), "__for_idx");
@@ -631,18 +650,22 @@ void IRGenerator::genForInStmt(const ForInDecl& decl) {
     // 条件块: index < length / Condition block: index < length
     builder_->SetInsertPoint(condBB);
     llvm::Value* index = builder_->CreateLoad(llvm::Type::getInt64Ty(context_), indexVar, "idx");
-    // 简化：假设序列长度为 10（实际应从序列类型获取）
-    llvm::Value* length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 10);
     llvm::Value* cond = builder_->CreateICmpSLT(index, length, "for.cond");
     builder_->CreateCondBr(cond, bodyBB, endBB);
 
     // 循环体 / Loop body
     builder_->SetInsertPoint(bodyBB);
 
-    // 设置循环变量（简化：使用索引值）
-    builder_->CreateStore(index, loopVar);
+    // 从数组中加载元素 / Load element from array
+    if (seqExpr && seqExpr->getType()->isPointerTy()) {
+        llvm::Value* elemPtr = builder_->CreateGEP(elemType, seqExpr, index, "elem.ptr");
+        llvm::Value* elem = builder_->CreateLoad(elemType, elemPtr, "elem");
+        builder_->CreateStore(elem, loopVar);
+    } else {
+        builder_->CreateStore(index, loopVar);
+    }
     namedValues_[varName] = loopVar;
-    namedTypes_[varName] = varType;
+    namedTypes_[varName] = elemType;
 
     // 生成循环体 / Generate loop body
     for (const auto& s : decl.body) {
@@ -739,26 +762,55 @@ void IRGenerator::genSwitchStmt(const SwitchDecl& decl) {
 void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
     llvm::Function* func = builder_->GetInsertBlock()->getParent();
 
+    // 声明 setjmp / Declare setjmp
+    llvm::Function* setjmpFunc = module_->getFunction("setjmp");
+    if (!setjmpFunc) {
+        llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+        llvm::FunctionType* setjmpTy = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(context_), {ptrTy}, false);
+        setjmpFunc = llvm::Function::Create(setjmpTy, llvm::Function::ExternalLinkage,
+                                            "setjmp", module_.get());
+    }
+
+    // 分配 jmp_buf / Allocate jmp_buf (256 bytes should be enough)
+    llvm::AllocaInst* jmpBuf = builder_->CreateAlloca(
+        llvm::Type::getInt8Ty(context_),
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 256), "jmpbuf");
+
     // 创建基本块 / Create basic blocks
     llvm::BasicBlock* doBB = llvm::BasicBlock::Create(context_, "do.body", func);
     llvm::BasicBlock* catchBB = llvm::BasicBlock::Create(context_, "catch.body", func);
     llvm::BasicBlock* endBB = llvm::BasicBlock::Create(context_, "do.end", func);
 
-    // 跳转到 do 块 / Jump to do block
-    builder_->CreateBr(doBB);
+    // 调用 setjmp / Call setjmp
+    llvm::Value* jmpResult = builder_->CreateCall(setjmpFunc, {jmpBuf}, "setjmp.result");
+    llvm::Value* isThrow = builder_->CreateICmpNE(jmpResult,
+        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0), "is.throw");
+
+    // 如果 setjmp 返回 0，正常执行 do 块；否则跳转到 catch
+    // If setjmp returns 0, execute do block normally; otherwise jump to catch
+    builder_->CreateCondBr(isThrow, catchBB, doBB);
+
+    // Do 块 / Do block
     builder_->SetInsertPoint(doBB);
+
+    // 将 jmp_buf 压入 catch 栈 / Push jmp_buf to catch stack
+    catchStack_.push_back(jmpBuf);
 
     // 生成 do 块体 / Generate do block body
     for (const auto& s : decl.doBody) {
         if (s) genStmt(*s);
     }
 
+    // 弹出 catch 栈 / Pop catch stack
+    if (!catchStack_.empty()) catchStack_.pop_back();
+
     // 如果 do 块没有终结指令，跳转到结束块
     if (!builder_->GetInsertBlock()->getTerminator()) {
         builder_->CreateBr(endBB);
     }
 
-    // 生成 catch 块 / Generate catch block
+    // Catch 块 / Catch block
     builder_->SetInsertPoint(catchBB);
     for (const auto& catchClause : decl.catches) {
         for (const auto& s : catchClause.body) {
@@ -774,12 +826,37 @@ void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
 }
 
 void IRGenerator::genThrowStmt(const ThrowDecl& decl) {
-    // 简化实现：生成错误值并返回
-    // TODO: 完整的异常处理机制
-    if (currentFunc_->getReturnType()->isVoidTy()) {
-        builder_->CreateRetVoid();
+    // 使用 longjmp 进行异常跳转 / Use longjmp for exception jumping
+    // 如果有 catch 块，跳转到 catch 块；否则直接返回
+    // If there is a catch block, jump to it; otherwise return directly
+
+    // 生成错误值 / Generate error value
+    llvm::Value* errorVal = nullptr;
+    if (decl.value) {
+        errorVal = genExpr(*decl.value);
+    }
+
+    // 如果有活跃的 catch 块，使用 longjmp 跳转
+    // If there is an active catch block, use longjmp to jump
+    if (!catchStack_.empty()) {
+        // 调用 longjmp 跳转到 catch 块
+        llvm::Function* longjmpFunc = module_->getFunction("longjmp");
+        if (!longjmpFunc) {
+            llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+            llvm::FunctionType* longjmpTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(context_), {ptrTy, llvm::Type::getInt32Ty(context_)}, false);
+            longjmpFunc = llvm::Function::Create(longjmpTy, llvm::Function::ExternalLinkage,
+                                                 "longjmp", module_.get());
+        }
+        builder_->CreateCall(longjmpFunc, {catchStack_.back(),
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 1)});
     } else {
-        builder_->CreateRet(llvm::Constant::getNullValue(currentFunc_->getReturnType()));
+        // 没有 catch 块，直接返回 / No catch block, return directly
+        if (currentFunc_->getReturnType()->isVoidTy()) {
+            builder_->CreateRetVoid();
+        } else {
+            builder_->CreateRet(llvm::Constant::getNullValue(currentFunc_->getReturnType()));
+        }
     }
 }
 
@@ -862,9 +939,24 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             }
             return genExpr(*ie.subExpr);
         }
-        case ExprKind::SelfRef:
-        case ExprKind::SuperRef:
-            return nullptr; // TODO
+        case ExprKind::SelfRef: {
+            // self 引用当前实例 / self references current instance
+            auto it = namedValues_.find("self");
+            if (it != namedValues_.end()) {
+                llvm::Type* ty = namedTypes_["self"];
+                return builder_->CreateLoad(ty, it->second, "self");
+            }
+            return nullptr;
+        }
+        case ExprKind::SuperRef: {
+            // super 引用父类（简化为 self）/ super references parent class (simplified as self)
+            auto it = namedValues_.find("self");
+            if (it != namedValues_.end()) {
+                llvm::Type* ty = namedTypes_["self"];
+                return builder_->CreateLoad(ty, it->second, "super");
+            }
+            return nullptr;
+        }
         case ExprKind::ForceUnwrap: {
             auto& fu = static_cast<const ForceUnwrapExpr&>(expr);
             return genExpr(*fu.subExpr); // 简化
@@ -1347,10 +1439,97 @@ llvm::Value* IRGenerator::genMemberAccess(const MemberAccessExpr& expr) {
     llvm::Value* base = genExpr(*expr.base);
     if (!base) return nullptr;
 
-    // 查找成员 / Find member
-    // 简化实现：通过成员名查找字段索引
-    // TODO: 完整的类型驱动成员查找
     std::string memberName = expr.member;
+
+    // 如果基表达式是结构体类型，使用 GEP 访问字段
+    // If base is a struct type, use GEP to access field
+    if (base->getType()->isStructTy()) {
+        llvm::StructType* structTy = llvm::cast<llvm::StructType>(base->getType());
+        // 查找字段索引 / Find field index
+        // 遍历当前 CU 的声明找到对应的结构体定义
+        if (currentCu_) {
+            for (const auto& decl : currentCu_->declarations) {
+                if (!decl) continue;
+                if (decl->declKind == DeclKind::Struct) {
+                    auto& sd = static_cast<const StructDecl&>(*decl);
+                    if (sd.name == structTy->getName().str()) {
+                        for (size_t i = 0; i < sd.members.size(); i++) {
+                            if (sd.members[i] && sd.members[i]->declKind == DeclKind::Variable) {
+                                auto& vd = static_cast<const VariableDecl&>(*sd.members[i]);
+                                std::string fieldName;
+                                if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
+                                    fieldName = static_cast<const IdentifierPattern*>(vd.pattern.get())->name;
+                                }
+                                if (fieldName == memberName) {
+                                    llvm::Value* fieldPtr = builder_->CreateStructGEP(
+                                        structTy, base, (unsigned)i, memberName + ".ptr");
+                                    return builder_->CreateLoad(
+                                        structTy->getElementType(i), fieldPtr, memberName);
+                                }
+                            }
+                        }
+                    }
+                } else if (decl->declKind == DeclKind::Class) {
+                    auto& cd = static_cast<const ClassDecl&>(*decl);
+                    if (cd.name == structTy->getName().str()) {
+                        for (size_t i = 0; i < cd.members.size(); i++) {
+                            if (cd.members[i] && cd.members[i]->declKind == DeclKind::Variable) {
+                                auto& vd = static_cast<const VariableDecl&>(*cd.members[i]);
+                                std::string fieldName;
+                                if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
+                                    fieldName = static_cast<const IdentifierPattern*>(vd.pattern.get())->name;
+                                }
+                                if (fieldName == memberName) {
+                                    llvm::Value* fieldPtr = builder_->CreateStructGEP(
+                                        structTy, base, (unsigned)i, memberName + ".ptr");
+                                    return builder_->CreateLoad(
+                                        structTy->getElementType(i), fieldPtr, memberName);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 如果基是指针（引用类型），先加载再 GEP
+    // If base is a pointer (reference type), load then GEP
+    if (base->getType()->isPointerTy()) {
+        // 尝试通过 namedTypes_ 找到基类型
+        if (expr.base->exprKind == ExprKind::Identifier) {
+            auto& baseId = static_cast<const IdentifierExpr&>(*expr.base);
+            auto typeIt = namedTypes_.find(baseId.name);
+            if (typeIt != namedTypes_.end() && typeIt->second->isStructTy()) {
+                llvm::StructType* structTy = llvm::cast<llvm::StructType>(typeIt->second);
+                if (currentCu_) {
+                    for (const auto& decl : currentCu_->declarations) {
+                        if (!decl) continue;
+                        if (decl->declKind == DeclKind::Struct) {
+                            auto& sd = static_cast<const StructDecl&>(*decl);
+                            if (sd.name == structTy->getName().str()) {
+                                for (size_t i = 0; i < sd.members.size(); i++) {
+                                    if (sd.members[i] && sd.members[i]->declKind == DeclKind::Variable) {
+                                        auto& vd = static_cast<const VariableDecl&>(*sd.members[i]);
+                                        std::string fieldName;
+                                        if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
+                                            fieldName = static_cast<const IdentifierPattern*>(vd.pattern.get())->name;
+                                        }
+                                        if (fieldName == memberName) {
+                                            llvm::Value* fieldPtr = builder_->CreateStructGEP(
+                                                structTy, base, (unsigned)i, memberName + ".ptr");
+                                            return builder_->CreateLoad(
+                                                structTy->getElementType(i), fieldPtr, memberName);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // 尝试从命名值中查找 / Try to find from named values
     auto it = namedValues_.find(memberName);
@@ -1358,25 +1537,121 @@ llvm::Value* IRGenerator::genMemberAccess(const MemberAccessExpr& expr) {
         return builder_->CreateLoad(namedTypes_[memberName], it->second, memberName);
     }
 
-    // TODO: 结构体字段访问 GEP
+    error(expr.loc, "cannot access member '" + memberName + "'");
     return nullptr;
 }
 
 llvm::Value* IRGenerator::genArrayLiteral(const ArrayLiteralExpr& expr) {
-    // 简化：创建全局数组并返回指针
-    // TODO: 正确的 Array<T> 运行时表示
-    if (expr.elements.empty()) return llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0));
-    return genExpr(*expr.elements[0]); // 简化：返回第一个元素
+    // 创建 Array<T> 结构体 { data_ptr, count, capacity }
+    // Create Array<T> struct { data_ptr, count, capacity }
+
+    // 确定元素类型 / Determine element type
+    llvm::Type* elemType = llvm::Type::getInt64Ty(context_); // 默认 i64
+    if (!expr.elements.empty()) {
+        llvm::Value* first = genExpr(*expr.elements[0]);
+        if (first) elemType = first->getType();
+    }
+
+    // 创建数组结构体类型 / Create array struct type
+    llvm::StructType* arrType = llvm::StructType::get(context_, {
+        llvm::PointerType::get(context_, 0), // data pointer
+        llvm::Type::getInt64Ty(context_),     // count
+        llvm::Type::getInt64Ty(context_)      // capacity
+    });
+
+    // 计算元素数量 / Count elements
+    int64_t elemCount = static_cast<int64_t>(expr.elements.size());
+
+    // 分配数据缓冲区（在栈上） / Allocate data buffer (on stack)
+    llvm::AllocaInst* dataBuf = builder_->CreateAlloca(elemType,
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), "arr.data");
+
+    // 存储每个元素 / Store each element
+    for (size_t i = 0; i < expr.elements.size(); i++) {
+        llvm::Value* elem = genExpr(*expr.elements[i]);
+        if (!elem) continue;
+        // 类型转换 / Type conversion
+        if (elem->getType() != elemType) {
+            if (elemType->isDoubleTy() && elem->getType()->isIntegerTy()) {
+                elem = builder_->CreateSIToFP(elem, elemType, "arr.cast");
+            } else if (elemType->isIntegerTy(64) && elem->getType()->isIntegerTy()) {
+                elem = builder_->CreateSExt(elem, elemType, "arr.cast");
+            }
+        }
+        llvm::Value* ptr = builder_->CreateGEP(elemType, dataBuf,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), i), "arr.elem.ptr");
+        builder_->CreateStore(elem, ptr);
+    }
+
+    // 创建数组结构体 / Create array struct
+    llvm::AllocaInst* arrStruct = builder_->CreateAlloca(arrType, nullptr, "arr");
+    llvm::Value* dataFieldPtr = builder_->CreateStructGEP(arrType, arrStruct, 0, "arr.data.field");
+    llvm::Value* dataAsPtr = builder_->CreatePointerCast(dataBuf, llvm::PointerType::get(context_, 0));
+    builder_->CreateStore(dataAsPtr, dataFieldPtr);
+
+    llvm::Value* countFieldPtr = builder_->CreateStructGEP(arrType, arrStruct, 1, "arr.count.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), countFieldPtr);
+
+    llvm::Value* capFieldPtr = builder_->CreateStructGEP(arrType, arrStruct, 2, "arr.cap.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), capFieldPtr);
+
+    // 加载并返回结构体值 / Load and return struct value
+    return builder_->CreateLoad(arrType, arrStruct, "arr.val");
 }
 
 llvm::Value* IRGenerator::genDictLiteral(const DictLiteralExpr& expr) {
-    return llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0));
+    // 创建 Dictionary<K,V> 结构体 { data_ptr, count, capacity }
+    // Create Dictionary struct { data_ptr, count, capacity }
+    llvm::StructType* dictType = llvm::StructType::get(context_, {
+        llvm::PointerType::get(context_, 0), // data pointer
+        llvm::Type::getInt64Ty(context_),     // count
+        llvm::Type::getInt64Ty(context_)      // capacity
+    });
+
+    // 创建字典结构体（空字典） / Create dict struct (empty dict)
+    llvm::AllocaInst* dictStruct = builder_->CreateAlloca(dictType, nullptr, "dict");
+
+    // data = null
+    llvm::Value* dataFieldPtr = builder_->CreateStructGEP(dictType, dictStruct, 0, "dict.data.field");
+    builder_->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), dataFieldPtr);
+
+    // count = number of initial entries
+    llvm::Value* countFieldPtr = builder_->CreateStructGEP(dictType, dictStruct, 1, "dict.count.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+        static_cast<int64_t>(expr.entries.size())), countFieldPtr);
+
+    // capacity
+    llvm::Value* capFieldPtr = builder_->CreateStructGEP(dictType, dictStruct, 2, "dict.cap.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+        static_cast<int64_t>(expr.entries.size())), capFieldPtr);
+
+    return builder_->CreateLoad(dictType, dictStruct, "dict.val");
 }
 
 llvm::Value* IRGenerator::genTupleExpr(const TupleExpr& expr) {
     if (expr.elements.empty()) return llvm::ConstantStruct::getAnon(context_, {});
-    // 简化：返回第一个元素
-    return genExpr(*expr.elements[0].value);
+
+    // 收集所有元素的值和类型 / Collect all element values and types
+    std::vector<llvm::Value*> elemValues;
+    std::vector<llvm::Type*> elemTypes;
+    for (const auto& elem : expr.elements) {
+        llvm::Value* val = genExpr(*elem.value);
+        if (!val) return nullptr;
+        elemValues.push_back(val);
+        elemTypes.push_back(val->getType());
+    }
+
+    // 创建匿名结构体类型 / Create anonymous struct type
+    llvm::StructType* tupleType = llvm::StructType::get(context_, elemTypes);
+
+    // 在栈上分配并存储 / Allocate on stack and store
+    llvm::AllocaInst* tupleAlloc = builder_->CreateAlloca(tupleType, nullptr, "tuple");
+    for (size_t i = 0; i < elemValues.size(); i++) {
+        llvm::Value* fieldPtr = builder_->CreateStructGEP(tupleType, tupleAlloc, (unsigned)i, "tuple.field");
+        builder_->CreateStore(elemValues[i], fieldPtr);
+    }
+
+    return builder_->CreateLoad(tupleType, tupleAlloc, "tuple.val");
 }
 
 llvm::Value* IRGenerator::genIfExpr(const IfExpr& expr) {
@@ -1411,13 +1686,74 @@ llvm::Value* IRGenerator::genIfExpr(const IfExpr& expr) {
 }
 
 llvm::Value* IRGenerator::genInterpolatedString(const InterpolatedStringExpr& expr) {
-    // 简化：连接所有片段
-    // TODO: 正确的字符串拼接
-    std::string result;
-    for (const auto& seg : expr.segments) {
-        result += seg.literalText;
+    // 声明 snprintf 用于格式化 / Declare snprintf for formatting
+    llvm::Function* snprintfFunc = module_->getFunction("snprintf");
+    if (!snprintfFunc) {
+        // int snprintf(char* str, size_t size, const char* format, ...)
+        llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+        llvm::FunctionType* snprintfTy = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(context_),
+            {ptrTy, llvm::Type::getInt64Ty(context_), ptrTy}, true);
+        snprintfFunc = llvm::Function::Create(snprintfTy, llvm::Function::ExternalLinkage,
+                                              "snprintf", module_.get());
     }
-    return createStringGlobal(result);
+
+    // 分配结果缓冲区 / Allocate result buffer (1024 bytes should be enough for most cases)
+    llvm::AllocaInst* buf = builder_->CreateAlloca(
+        llvm::Type::getInt8Ty(context_),
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 1024), "interp.buf");
+
+    // 构建格式字符串和参数 / Build format string and arguments
+    std::string fmtStr;
+    std::vector<llvm::Value*> args;
+    args.push_back(buf);
+    args.push_back(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 1024));
+
+    for (const auto& seg : expr.segments) {
+        if (!seg.expression) {
+            // 纯字面量文本 / Pure literal text
+            fmtStr += seg.literalText;
+        } else {
+            // 这是一个表达式 / This is an expression
+            // 先添加之前累积的字面量到格式字符串
+            // 将表达式值转换为格式说明符
+            llvm::Value* exprVal = genExpr(*seg.expression);
+            if (!exprVal) continue;
+
+            if (exprVal->getType()->isIntegerTy(64)) {
+                fmtStr += "%lld";
+            } else if (exprVal->getType()->isIntegerTy(1)) {
+                fmtStr += "%s";
+                // 需要将 bool 转为字符串
+                llvm::Value* trueStr = createStringGlobal("true");
+                llvm::Value* falseStr = createStringGlobal("false");
+                exprVal = builder_->CreateSelect(exprVal, trueStr, falseStr);
+            } else if (exprVal->getType()->isDoubleTy()) {
+                fmtStr += "%g";
+            } else if (exprVal->getType()->isFloatTy()) {
+                fmtStr += "%g";
+                exprVal = builder_->CreateFPExt(exprVal, llvm::Type::getDoubleTy(context_), "fpext");
+            } else if (exprVal->getType()->isPointerTy()) {
+                fmtStr += "%s";
+            } else if (exprVal->getType()->isIntegerTy()) {
+                fmtStr += "%lld";
+                exprVal = builder_->CreateSExt(exprVal, llvm::Type::getInt64Ty(context_), "sext");
+            } else {
+                fmtStr += "%s";
+                exprVal = createStringGlobal("?");
+            }
+            args.push_back(exprVal);
+        }
+    }
+
+    // 添加格式字符串参数 / Add format string argument
+    llvm::Value* fmtGlobal = createStringGlobal(fmtStr);
+    args.insert(args.begin() + 2, fmtGlobal);
+
+    // 调用 snprintf / Call snprintf
+    builder_->CreateCall(snprintfFunc, args);
+
+    return buf;
 }
 
 // ─── 辅助 / Helpers ────────────────────────────────────────────────────

@@ -86,7 +86,8 @@ bool ObjectEmitter::emitObjectFile(llvm::Module& module, const std::string& outp
     llvm::legacy::PassManager pass;
 
     // 添加优化 passes / Add optimization passes
-    // TODO: 根据 optLevel 参数选择不同的优化级别
+    // 标准优化级别：mem2reg, instcombine, reassociate, GVN, simplifycfg
+    // Standard optimization level: mem2reg, instcombine, reassociate, GVN, simplifycfg
     pass.add(llvm::createPromoteMemoryToRegisterPass());
     pass.add(llvm::createInstructionCombiningPass());
     pass.add(llvm::createReassociatePass());

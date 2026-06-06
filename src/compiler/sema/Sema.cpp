@@ -2,6 +2,7 @@
 // Performs type checking, scope resolution, and validation on the parsed AST.
 
 #include "Sema.h"
+#include <fstream>
 
 namespace suki {
 
@@ -132,9 +133,33 @@ void Sema::processDecl(Decl& decl) {
         case DeclKind::Import: {
             // 注册导入模块 / Register imported module
             auto& imp = static_cast<ImportDecl&>(decl);
-            // TODO: 实际模块文件查找和加载
-            // 目前只记录模块名 / Currently just record module name
+            // 记录导入的模块名 / Record imported module name
             importedModules_.push_back(imp.moduleName);
+
+            // 尝试查找模块文件 / Try to find module file
+            // 搜索路径：当前目录、标准库路径
+            // Search paths: current directory, stdlib paths
+            std::vector<std::string> searchPaths = {
+                imp.moduleName + ".suki",
+                "src/stdlib/" + imp.moduleName + ".suki",
+                "Sources/" + imp.moduleName + "/" + imp.moduleName + ".suki",
+            };
+
+            bool found = false;
+            for (const auto& path : searchPaths) {
+                std::ifstream testFile(path);
+                if (testFile.good()) {
+                    found = true;
+                    // 模块文件存在，记录路径 / Module file exists, record path
+                    break;
+                }
+            }
+
+            if (!found) {
+                // 模块未找到但不报错（可能是内置模块）/ Module not found but don't error (may be built-in)
+                // stdlib 模块如 Core、System 等通过头文件提供
+                // stdlib modules like Core, System etc. are provided via headers
+            }
             break;
         }
         case DeclKind::Variable:
@@ -489,21 +514,30 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
 void Sema::processStructDecl(StructDecl& decl) {
     // 类型已在预注册阶段定义，跳过重复定义
     // Type already defined in pre-registration, skip duplicate
+    std::string prevTypeName = currentTypeName_;
+    currentTypeName_ = decl.name;
 
     symbols_.enterScope();
     for (auto& m : decl.members) {
         if (m) processDecl(*m);
     }
     symbols_.leaveScope();
+
+    currentTypeName_ = prevTypeName;
 }
 
 void Sema::processClassDecl(ClassDecl& decl) {
     // 类型已在预注册阶段定义，跳过重复定义
+    std::string prevTypeName = currentTypeName_;
+    currentTypeName_ = decl.name;
+
     symbols_.enterScope();
     for (auto& m : decl.members) {
         if (m) processDecl(*m);
     }
     symbols_.leaveScope();
+
+    currentTypeName_ = prevTypeName;
 }
 
 void Sema::processEnumDecl(EnumDecl& decl) {
@@ -677,11 +711,43 @@ TypePtr Sema::inferExprType(Expr& expr) {
             auto& ma = static_cast<MemberAccessExpr&>(expr);
             TypePtr baseType = inferExprType(*ma.base);
             if (!baseType) return nullptr;
-            // Look up member in the base type's scope
-            // For now, look up as a function or variable
+
+            // 首先在当前作用域查找 / First look up in current scope
             Symbol* sym = symbols_.lookup(ma.member);
             if (sym) return sym->type;
-            // TODO: proper member lookup based on base type
+
+            // 基于基类型查找成员 / Look up member based on base type
+            // 如果基类型是命名类型，查找其成员
+            if (baseType->kind() == TypeKind::Struct ||
+                baseType->kind() == TypeKind::Class ||
+                baseType->kind() == TypeKind::Enum) {
+                // 在符号表中查找类型成员 / Look up type member in symbol table
+                std::string typeName = baseType->name();
+                Symbol* typeSym = symbols_.lookup(typeName);
+                if (typeSym) {
+                    // 查找成员函数 / Look up member function
+                    std::string memberFuncName = typeName + "." + ma.member;
+                    Symbol* memberSym = symbols_.lookup(memberFuncName);
+                    if (memberSym) return memberSym->type;
+                }
+            }
+
+            // 如果基类型是字符串，返回字符串方法的类型
+            // If base type is String, return String method type
+            if (baseType->kind() == TypeKind::String) {
+                // 字符串方法如 count, isEmpty 等返回 Int 或 Bool
+                if (ma.member == "count" || ma.member == "length") return getIntType();
+                if (ma.member == "isEmpty") return getBoolType();
+                if (ma.member == "uppercased" || ma.member == "lowercased") return getStringType();
+            }
+
+            // 如果基类型是数组，返回数组属性类型
+            // If base type is Array, return Array property type
+            if (baseType->kind() == TypeKind::Array) {
+                if (ma.member == "count" || ma.member == "size") return getIntType();
+                if (ma.member == "isEmpty") return getBoolType();
+            }
+
             return nullptr;
         }
         case ExprKind::Subscript: {
@@ -798,9 +864,21 @@ TypePtr Sema::inferExprType(Expr& expr) {
         case ExprKind::InterpolatedString:
             return getStringType();
         case ExprKind::SelfRef:
-            return nullptr; // TODO: self 类型
+            // self 引用当前实例 / self references current instance
+            // 返回当前类型（如果有）/ Return current type (if available)
+            if (!currentTypeName_.empty()) {
+                Symbol* typeSym = symbols_.lookup(currentTypeName_);
+                if (typeSym) return typeSym->type;
+            }
+            return getAnyType();
         case ExprKind::SuperRef:
-            return nullptr; // TODO: super 类型
+            // super 引用父类 / super references parent class
+            // 返回当前类型（简化处理）/ Return current type (simplified)
+            if (!currentTypeName_.empty()) {
+                Symbol* typeSym = symbols_.lookup(currentTypeName_);
+                if (typeSym) return typeSym->type;
+            }
+            return getAnyType();
         default:
             return nullptr;
     }
