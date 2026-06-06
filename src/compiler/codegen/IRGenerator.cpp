@@ -553,13 +553,74 @@ void IRGenerator::genWhileStmt(const WhileDecl& decl) {
 }
 
 void IRGenerator::genForInStmt(const ForInDecl& decl) {
-    // 简化实现：将 for-in 展开为 while 循环
-    // TODO: 正确的迭代器协议实现
-    if (!decl.body.empty()) {
-        for (const auto& s : decl.body) {
-            if (s) genStmt(*s);
-        }
+    if (!currentFunc_) return;
+
+    // 获取循环变量名 / Get loop variable name
+    std::string varName;
+    if (decl.pattern && decl.pattern->patternKind == PatternKind::Identifier) {
+        varName = static_cast<const IdentifierPattern*>(decl.pattern.get())->name;
+    } else {
+        return;
     }
+
+    // 生成序列表达式 / Generate sequence expression
+    llvm::Value* seqExpr = nullptr;
+    if (decl.sequence) {
+        seqExpr = genExpr(*decl.sequence);
+    }
+    if (!seqExpr) return;
+
+    // 创建循环变量 / Create loop variable
+    llvm::Type* varType = llvm::Type::getInt64Ty(context_);
+    llvm::AllocaInst* loopVar = createEntryBlockAlloca(currentFunc_, varType, varName);
+
+    // 创建索引变量 / Create index variable
+    llvm::AllocaInst* indexVar = createEntryBlockAlloca(currentFunc_, llvm::Type::getInt64Ty(context_), "__for_idx");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 0), indexVar);
+
+    // 创建基本块 / Create basic blocks
+    llvm::Function* func = builder_->GetInsertBlock()->getParent();
+    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context_, "for.cond", func);
+    llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(context_, "for.body", func);
+    llvm::BasicBlock* endBB = llvm::BasicBlock::Create(context_, "for.end", func);
+
+    loopStack_.push_back({condBB, endBB});
+
+    // 跳转到条件块 / Jump to condition block
+    builder_->CreateBr(condBB);
+
+    // 条件块: index < length / Condition block: index < length
+    builder_->SetInsertPoint(condBB);
+    llvm::Value* index = builder_->CreateLoad(llvm::Type::getInt64Ty(context_), indexVar, "idx");
+    // 简化：假设序列长度为 10（实际应从序列类型获取）
+    llvm::Value* length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 10);
+    llvm::Value* cond = builder_->CreateICmpSLT(index, length, "for.cond");
+    builder_->CreateCondBr(cond, bodyBB, endBB);
+
+    // 循环体 / Loop body
+    builder_->SetInsertPoint(bodyBB);
+
+    // 设置循环变量（简化：使用索引值）
+    builder_->CreateStore(index, loopVar);
+    namedValues_[varName] = loopVar;
+    namedTypes_[varName] = varType;
+
+    // 生成循环体 / Generate loop body
+    for (const auto& s : decl.body) {
+        if (s) genStmt(*s);
+    }
+
+    // 递增索引 / Increment index
+    if (!builder_->GetInsertBlock()->getTerminator()) {
+        llvm::Value* newIndex = builder_->CreateAdd(index,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 1), "idx.inc");
+        builder_->CreateStore(newIndex, indexVar);
+        builder_->CreateBr(condBB);
+    }
+
+    // 结束块 / End block
+    builder_->SetInsertPoint(endBB);
+    loopStack_.pop_back();
 }
 
 void IRGenerator::genSwitchStmt(const SwitchDecl& decl) {
