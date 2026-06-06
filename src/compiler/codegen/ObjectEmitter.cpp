@@ -13,6 +13,11 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -79,6 +84,15 @@ bool ObjectEmitter::emitObjectFile(llvm::Module& module, const std::string& outp
 
     // 生成目标文件 / Generate object file
     llvm::legacy::PassManager pass;
+
+    // 添加优化 passes / Add optimization passes
+    // TODO: 根据 optLevel 参数选择不同的优化级别
+    pass.add(llvm::createPromoteMemoryToRegisterPass());
+    pass.add(llvm::createInstructionCombiningPass());
+    pass.add(llvm::createReassociatePass());
+    pass.add(llvm::createGVNPass());
+    pass.add(llvm::createCFGSimplificationPass());
+
     auto fileType = llvm::CodeGenFileType::ObjectFile;
 
     if (targetMachine->addPassesToEmitFile(pass, dest, nullptr, fileType)) {
