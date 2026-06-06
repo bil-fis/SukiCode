@@ -340,10 +340,9 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
     if (initVal) {
         builder_->CreateStore(initVal, allocaInst);
         // ARC: 引用类型赋值时 retain / ARC: retain on reference type assignment
-        // TODO: 启用 ARC 需要链接运行时库
-        // if (isReferenceType(initVal->getType())) {
-        //     insertRetain(initVal);
-        // }
+        if (isReferenceType(initVal->getType())) {
+            insertRetain(initVal);
+        }
     }
 
     // 注册变量
@@ -385,6 +384,15 @@ void IRGenerator::genStmt(const Stmt& stmt) {
 }
 
 void IRGenerator::genReturnStmt(const ReturnStmt& stmt) {
+    // ARC: release all local reference type variables before return
+    for (const auto& [name, allocaInst] : namedValues_) {
+        auto typeIt = namedTypes_.find(name);
+        if (typeIt != namedTypes_.end() && isReferenceType(typeIt->second)) {
+            llvm::Value* val = builder_->CreateLoad(typeIt->second, allocaInst, "arc.load");
+            insertRelease(val);
+        }
+    }
+
     if (stmt.value) {
         llvm::Value* retVal = genExpr(*stmt.value);
         if (retVal) {
