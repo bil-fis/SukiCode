@@ -63,6 +63,7 @@ private:
     std::unordered_set<std::string> actorTypes_; // Actor 类型名称集合
     std::string currentActor_; // 当前 Actor 名称（如果在 Actor 内部）
     std::string currentTypeName_; // 当前处理的类型名称（用于 self/super 引用）
+    std::string currentSuperclassName_; // 当前类的父类名称（用于 super 引用）
 };
 
 } // namespace suki

@@ -255,7 +255,15 @@ DeclPtr Parser::parseDeclaration() {
         decl->isStatic = isStatic;
         decl->isOverride = isOverride;
         decl->isMutating = isMutating;
+        decl->isFinal = isFinal;
         decl->attributes = std::move(attrs);
+
+        // 传播 convenience/required 到 InitDecl
+        if (decl->declKind == DeclKind::Init) {
+            auto& initDecl = static_cast<InitDecl&>(*decl);
+            initDecl.isConvenience = isConvenience;
+            initDecl.isRequired = isRequired;
+        }
     }
     return decl;
 }

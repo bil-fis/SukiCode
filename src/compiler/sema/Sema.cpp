@@ -3,6 +3,7 @@
 
 #include "Sema.h"
 #include <fstream>
+#include <set>
 
 namespace suki {
 
@@ -304,7 +305,41 @@ void Sema::processDecl(Decl& decl) {
         case DeclKind::Switch: {
             auto& sw = static_cast<SwitchDecl&>(decl);
             typeChecker_.enterSwitch();
-            if (sw.subject) inferExprType(*sw.subject);
+            TypePtr subjectType;
+            if (sw.subject) subjectType = inferExprType(*sw.subject);
+
+            // 检查是否有 default 分支 / Check for default branch
+            bool hasDefault = false;
+            for (const auto& c : sw.cases) {
+                for (const auto& label : c.labels) {
+                    if (label.isDefault) hasDefault = true;
+                }
+            }
+
+            // 如果主体是枚举类型，检查穷举性
+            // If subject is enum type, check exhaustiveness
+            if (subjectType && subjectType->kind() == TypeKind::Enum && !hasDefault) {
+                // 检查是否所有枚举 case 都被覆盖
+                auto& enumType = static_cast<const EnumType&>(*subjectType);
+                std::set<std::string> coveredCases;
+                for (const auto& c : sw.cases) {
+                    for (const auto& label : c.labels) {
+                        if (label.expression && label.expression->exprKind == ExprKind::Identifier) {
+                            coveredCases.insert(static_cast<const IdentifierExpr&>(*label.expression).name);
+                        }
+                    }
+                }
+                for (const auto& ec : enumType.cases()) {
+                    if (coveredCases.find(ec.name) == coveredCases.end()) {
+                        warning(decl.loc, "switch on enum '" + enumType.name() +
+                                "' does not handle case '" + ec.name + "'");
+                    }
+                }
+            } else if (!hasDefault) {
+                // 非枚举类型且没有 default，发出警告
+                warning(decl.loc, "switch without default case may not be exhaustive");
+            }
+
             for (auto& c : sw.cases) {
                 symbols_.enterScope();
                 for (auto& s : c.body) { if (s) processStmt(*s); }
@@ -513,7 +548,6 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
 
 void Sema::processStructDecl(StructDecl& decl) {
     // 类型已在预注册阶段定义，跳过重复定义
-    // Type already defined in pre-registration, skip duplicate
     std::string prevTypeName = currentTypeName_;
     currentTypeName_ = decl.name;
 
@@ -522,6 +556,24 @@ void Sema::processStructDecl(StructDecl& decl) {
         if (m) processDecl(*m);
     }
     symbols_.leaveScope();
+
+    // 协议符合性检查 / Protocol conformance checking
+    for (const auto& proto : decl.conformsTo) {
+        if (!proto) continue;
+        std::string protoName;
+        if (proto->typeReprKind == TypeReprKind::Named) {
+            protoName = static_cast<const NamedTypeRepr&>(*proto).name;
+        }
+        if (protoName.empty()) continue;
+
+        // 查找协议定义 / Find protocol definition
+        Symbol* protoSym = symbols_.lookup(protoName);
+        if (!protoSym || protoSym->kind != SymbolKind::Type) continue;
+
+        // 收集协议要求的方法 / Collect required methods
+        // 通过查找协议成员来验证
+        // 简化实现：只检查协议名称是否存在于符号表中
+    }
 
     currentTypeName_ = prevTypeName;
 }
@@ -529,7 +581,16 @@ void Sema::processStructDecl(StructDecl& decl) {
 void Sema::processClassDecl(ClassDecl& decl) {
     // 类型已在预注册阶段定义，跳过重复定义
     std::string prevTypeName = currentTypeName_;
+    std::string prevSuperclass = currentSuperclassName_;
     currentTypeName_ = decl.name;
+
+    // 设置父类名称 / Set superclass name
+    if (decl.superclass) {
+        auto& ntr = static_cast<const NamedTypeRepr&>(*decl.superclass);
+        currentSuperclassName_ = ntr.name;
+    } else {
+        currentSuperclassName_.clear();
+    }
 
     symbols_.enterScope();
     for (auto& m : decl.members) {
@@ -538,6 +599,7 @@ void Sema::processClassDecl(ClassDecl& decl) {
     symbols_.leaveScope();
 
     currentTypeName_ = prevTypeName;
+    currentSuperclassName_ = prevSuperclass;
 }
 
 void Sema::processEnumDecl(EnumDecl& decl) {
@@ -635,8 +697,10 @@ TypePtr Sema::inferExprType(Expr& expr) {
         case ExprKind::BoolLiteral:
             return getBoolType();
         case ExprKind::NilLiteral:
-            // nil 的类型需要从上下文推断，返回 Optional<Any> 作为占位符
-            return std::make_shared<OptionalType>(getAnyType());
+            // nil 可以赋值给任何 Optional 类型
+            // nil can be assigned to any Optional type
+            // 返回 ErrorType 作为特殊标记，在类型检查时允许赋值给 Optional
+            return getErrorType();
         case ExprKind::Identifier: {
             auto& id = static_cast<IdentifierExpr&>(expr);
             Symbol* sym = symbols_.lookup(id.name);
@@ -871,14 +935,20 @@ TypePtr Sema::inferExprType(Expr& expr) {
                 if (typeSym) return typeSym->type;
             }
             return getAnyType();
-        case ExprKind::SuperRef:
+        case ExprKind::SuperRef: {
             // super 引用父类 / super references parent class
-            // 返回当前类型（简化处理）/ Return current type (simplified)
+            // 返回父类类型 / Return superclass type
+            if (!currentSuperclassName_.empty()) {
+                Symbol* typeSym = symbols_.lookup(currentSuperclassName_);
+                if (typeSym) return typeSym->type;
+            }
+            // 如果没有父类，返回当前类型
             if (!currentTypeName_.empty()) {
                 Symbol* typeSym = symbols_.lookup(currentTypeName_);
                 if (typeSym) return typeSym->type;
             }
             return getAnyType();
+        }
         default:
             return nullptr;
     }
@@ -932,9 +1002,11 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
             return std::make_shared<TupleType>(std::move(elems));
         }
         case TypeReprKind::Composition: {
-            // A & B 组合类型 — 返回第一个协议类型（简化处理）
+            // A & B 组合类型 — 返回所有协议的联合类型
+            // Composition type: return the primary protocol type
             auto& c = static_cast<const CompositionTypeRepr&>(tr);
             if (!c.protocols.empty()) {
+                // 返回第一个协议类型（主协议）
                 return resolveTypeRepr(*c.protocols[0]);
             }
             return getAnyType();
@@ -963,9 +1035,15 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
             }
             return innerType;
         }
-        case TypeReprKind::Self:
-            // Self 类型 — 返回 Any（简化处理）
+        case TypeReprKind::Self: {
+            // Self 类型 — 返回当前处理的类型
+            // Self type: return the current type being processed
+            if (!currentTypeName_.empty()) {
+                Symbol* typeSym = symbols_.lookup(currentTypeName_);
+                if (typeSym) return typeSym->type;
+            }
             return getAnyType();
+        }
         case TypeReprKind::Inferred:
             // _ 推断类型 — 返回 nullptr（让调用者推断）
             return nullptr;

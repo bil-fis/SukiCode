@@ -172,7 +172,16 @@ llvm::Type* IRGenerator::resolveType(const TypeRepr* tr) {
     }
     if (tr->typeReprKind == TypeReprKind::Optional) {
         auto& o = static_cast<const OptionalTypeRepr&>(*tr);
-        return resolveType(o.base.get()); // 简化：Optional 和 base 类型相同
+        llvm::Type* baseType = resolveType(o.base.get());
+        // Optional 使用 {value, hasValue} 标记结构体
+        // Optional uses {value, hasValue} tagged struct
+        std::string typeName = "Optional." + std::to_string(reinterpret_cast<uintptr_t>(o.base.get()));
+        llvm::StructType* optType = llvm::StructType::getTypeByName(context_, typeName);
+        if (!optType) {
+            optType = llvm::StructType::create(context_, typeName);
+            optType->setBody({baseType, llvm::Type::getInt1Ty(context_)});
+        }
+        return optType;
     }
     if (tr->typeReprKind == TypeReprKind::Tuple) {
         auto& t = static_cast<const TupleTypeRepr&>(*tr);
@@ -254,9 +263,19 @@ void IRGenerator::genDecl(const Decl& decl) {
         case DeclKind::Enum: {
             auto& ed = static_cast<const EnumDecl&>(decl);
             // Enum 生成 tagged union 类型
+            // 根据 associated values 计算最大 payload 大小
+            llvm::Type* payloadType = llvm::Type::getInt64Ty(context_); // 默认 i64
+            for (const auto& enumCase : ed.cases) {
+                if (enumCase && !enumCase->associatedValues.empty()) {
+                    // 使用第一个 associated value 的类型
+                    llvm::Type* assocType = resolveType(enumCase->associatedValues[0].type.get());
+                    if (assocType && assocType->getPrimitiveSizeInBits() > payloadType->getPrimitiveSizeInBits()) {
+                        payloadType = assocType;
+                    }
+                }
+            }
             llvm::StructType* enumType = llvm::StructType::create(context_, ed.name);
-            // 简化：tag (i32) + payload (i64)
-            enumType->setBody({llvm::Type::getInt32Ty(context_), llvm::Type::getInt64Ty(context_)});
+            enumType->setBody({llvm::Type::getInt32Ty(context_), payloadType});
             structTypes_[ed.name] = enumType;
             break;
         }
@@ -387,14 +406,64 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
     if (!decl.pattern || decl.pattern->patternKind != PatternKind::Identifier) return;
     std::string varName = static_cast<const IdentifierPattern*>(decl.pattern.get())->name;
 
-    // 获取类型
+    // 获取声明类型
     llvm::Type* varType = resolveType(decl.typeAnnotation.get());
 
     // 生成初始化值
     llvm::Value* initVal = nullptr;
     if (decl.initializer) {
         initVal = genExpr(*decl.initializer);
-        if (initVal) varType = initVal->getType();
+    }
+
+    // Optional 类型包装：如果声明类型是 Optional 结构体，需要正确包装值
+    if (varType->isStructTy() && decl.typeAnnotation &&
+        decl.typeAnnotation->typeReprKind == TypeReprKind::Optional) {
+        llvm::StructType* optType = llvm::cast<llvm::StructType>(varType);
+        if (initVal) {
+            // 检查是否是 nil（null 指针）
+            bool isNil = initVal->getType()->isPointerTy() &&
+                llvm::isa<llvm::ConstantPointerNull>(initVal);
+            if (isNil) {
+                // nil: 创建 {default, false}
+                llvm::Value* undef = llvm::UndefValue::get(optType->getElementType(0));
+                std::vector<llvm::Constant*> elems = {
+                    llvm::cast<llvm::Constant>(undef),
+                    llvm::ConstantInt::getFalse(context_)
+                };
+                initVal = llvm::ConstantStruct::get(optType, elems);
+            } else {
+                // 非 nil: 包装为 {value, true}
+                llvm::Value* val = initVal;
+                if (val->getType() != optType->getElementType(0)) {
+                    if (optType->getElementType(0)->isDoubleTy() && val->getType()->isIntegerTy()) {
+                        val = builder_->CreateSIToFP(val, optType->getElementType(0), "opt.cast");
+                    } else if (optType->getElementType(0)->isIntegerTy(64) && val->getType()->isIntegerTy()) {
+                        val = builder_->CreateSExt(val, optType->getElementType(0), "opt.cast");
+                    }
+                }
+                std::vector<llvm::Constant*> elems = {
+                    llvm::UndefValue::get(optType->getElementType(0)),
+                    llvm::ConstantInt::getTrue(context_)
+                };
+                initVal = llvm::ConstantStruct::get(optType, elems);
+                initVal = builder_->CreateInsertValue(initVal, val, 0, "opt.wrap");
+            }
+        } else {
+            // 无初始化值: 创建 {default, false}
+            llvm::Value* undef = llvm::UndefValue::get(optType->getElementType(0));
+            std::vector<llvm::Constant*> elems = {
+                llvm::cast<llvm::Constant>(undef),
+                llvm::ConstantInt::getFalse(context_)
+            };
+            initVal = llvm::ConstantStruct::get(optType, elems);
+        }
+    } else if (initVal && initVal->getType() != varType) {
+        // 非 Optional 类型的类型转换
+        if (varType->isDoubleTy() && initVal->getType()->isIntegerTy()) {
+            initVal = builder_->CreateSIToFP(initVal, varType, "cast");
+        } else if (varType->isIntegerTy(64) && initVal->getType()->isIntegerTy()) {
+            initVal = builder_->CreateSExt(initVal, varType, "cast");
+        }
     }
 
     // 创建 alloca

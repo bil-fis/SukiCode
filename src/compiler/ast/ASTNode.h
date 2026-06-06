@@ -550,6 +550,7 @@ struct Decl : ASTNode {
     bool isStatic = false;
     bool isOverride = false;
     bool isMutating = false;
+    bool isFinal = false;
     bool isAsync = false;
     bool isThrows = false;
     std::vector<Attribute> attributes;
