@@ -184,6 +184,10 @@ endif()
 # ─── Subdirectories ───────────────────────────────────────────────────────
 add_subdirectory(src)
 
+if(SUKICODE_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
+
 if(SUKICODE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
