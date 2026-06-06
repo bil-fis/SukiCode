@@ -17,6 +17,9 @@ public:
     Lexer(std::string_view source, std::string_view filename, DiagnosticEngine& diag);
     ~Lexer();
 
+    // 设置编译定义标志 / Set compilation defines (-D flags)
+    void setDefines(const std::vector<std::string>& defines) { defines_ = defines; }
+
     // Lex the entire source into a token vector (includes Eof)
     std::vector<Token> lexAll();
 
@@ -45,7 +48,6 @@ private:
     Token scanAttribute();     // @identifier
     Token scanLineComment();   // //...
     Token scanBlockComment();  // /* ... */
-    Token scanOperator();      // multi-char operators
 
     // ─── String interpolation ─────────────────────────────────────────────
     // \(expr) inside string literals requires nested parsing.

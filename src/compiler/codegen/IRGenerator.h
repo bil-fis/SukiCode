@@ -15,7 +15,6 @@
 
 #include "compiler/ast/ASTNode.h"
 #include "compiler/diag/Diagnostic.h"
-#include "TypeConverter.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -92,7 +91,6 @@ private:
     llvm::LLVMContext context_;
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> builder_;
-    TypeConverter typeConverter_;
 
     // 调试信息 / Debug info
     std::unique_ptr<llvm::DIBuilder> diBuilder_;

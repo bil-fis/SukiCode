@@ -8,6 +8,7 @@
 #include <sstream>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 
 namespace fs = std::filesystem;
 
@@ -30,9 +31,18 @@ public:
     FileHandle& operator=(const FileHandle&) = delete;
 
     // 允许移动 / Allow move
-    FileHandle(FileHandle&& other) noexcept : stream_(other.stream_), isOpen_(other.isOpen_) {
-        other.stream_ = nullptr;
+    FileHandle(FileHandle&& other) noexcept : stream_(std::move(other.stream_)), isOpen_(other.isOpen_) {
         other.isOpen_ = false;
+    }
+
+    FileHandle& operator=(FileHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+            stream_ = std::move(other.stream_);
+            isOpen_ = other.isOpen_;
+            other.isOpen_ = false;
+        }
+        return *this;
     }
 
     // 打开文件 / Open file
@@ -45,7 +55,7 @@ public:
             case FileMode::Append: flags |= std::ios::out | std::ios::app; break;
             case FileMode::ReadWrite: flags |= std::ios::in | std::ios::out; break;
         }
-        fh.stream_ = new std::fstream(path, flags);
+        fh.stream_ = std::make_unique<std::fstream>(path, flags);
         fh.isOpen_ = fh.stream_->is_open();
         return fh;
     }
@@ -92,8 +102,7 @@ public:
     void close() {
         if (stream_) {
             stream_->close();
-            delete stream_;
-            stream_ = nullptr;
+            stream_.reset();
         }
         isOpen_ = false;
     }
@@ -101,7 +110,7 @@ public:
     bool isOpen() const { return isOpen_; }
 
 private:
-    std::fstream* stream_ = nullptr;
+    std::unique_ptr<std::fstream> stream_;
     bool isOpen_ = false;
 };
 
@@ -128,8 +137,7 @@ public:
 
     // 文件是否存在 / Check if file exists
     static bool exists(const std::string& path) {
-        std::ifstream f(path);
-        return f.good();
+        return fs::exists(path);
     }
 
     // 删除文件 / Delete file

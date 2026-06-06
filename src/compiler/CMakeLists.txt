@@ -14,12 +14,10 @@ add_library(sukicompiler STATIC
     # Semantic Analysis
     sema/Sema.cpp
     sema/TypeChecker.cpp
-    sema/Scope.cpp
     sema/Type.cpp
     sema/SymbolTable.cpp
     # IR Generation
     codegen/IRGenerator.cpp
-    codegen/TypeConverter.cpp
     codegen/ObjectEmitter.cpp
     # Diagnostics
     diag/Diagnostic.cpp

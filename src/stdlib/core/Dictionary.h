@@ -35,7 +35,7 @@ public:
     // 查找 / Search
     bool contains(const K& key) const { return data_->count(key) > 0; }
 
-    V value(forKey: const K& key, orDefault: const V& defaultValue = V()) const {
+    V value(const K& key, const V& defaultValue = V()) const {
         auto it = data_->find(key);
         return it != data_->end() ? it->second : defaultValue;
     }

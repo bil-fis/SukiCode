@@ -225,6 +225,7 @@ int main(int argc, char* argv[]) {
     if (opts.verbose) std::cerr << "sukic: lexing...\n";
 
     suki::Lexer lexer(source, opts.inputFile, diag);
+    lexer.setDefines(opts.defines); // 传递 -D 定义到词法分析器
     auto tokens = lexer.lexAll();
 
     if (diag.hadErrors()) {

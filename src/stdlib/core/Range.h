@@ -78,7 +78,7 @@ ClosedRange<T> closedRange(T start, T end) { return ClosedRange<T>(start, end); 
 
 // stride 函数 / stride function
 template<typename T>
-void stride(from: T, to: T, by: T, std::function<void(T)> body) {
+void stride(T from, T to, T by, std::function<void(T)> body) {
     if (by > 0) {
         for (T i = from; i < to; i += by) body(i);
     } else if (by < 0) {

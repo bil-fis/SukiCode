@@ -34,6 +34,19 @@ public:
         other.size_ = 0;
     }
 
+    LinkedList& operator=(LinkedList&& other) noexcept {
+        if (this != &other) {
+            clear();
+            head_ = other.head_;
+            tail_ = other.tail_;
+            size_ = other.size_;
+            other.head_ = nullptr;
+            other.tail_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
+    }
+
     // 头部插入 / Insert at front
     void insertFront(const T& value) {
         Node* node = new Node(value);
@@ -106,6 +119,24 @@ public:
         tail_ = nullptr;
         size_ = 0;
     }
+
+    // 迭代器 / Iterator
+    class Iterator {
+    public:
+        Iterator(Node* node) : node_(node) {}
+        T& operator*() { return node_->value; }
+        const T& operator*() const { return node_->value; }
+        Iterator& operator++() { node_ = node_->next; return *this; }
+        bool operator!=(const Iterator& other) const { return node_ != other.node_; }
+        bool operator==(const Iterator& other) const { return node_ == other.node_; }
+    private:
+        Node* node_;
+    };
+
+    Iterator begin() { return Iterator(head_); }
+    Iterator end() { return Iterator(nullptr); }
+    Iterator begin() const { return Iterator(head_); }
+    Iterator end() const { return Iterator(nullptr); }
 
 private:
     Node* head_ = nullptr;

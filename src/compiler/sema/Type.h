@@ -71,7 +71,7 @@ private:
 
 class FloatType : public Type {
 public:
-    explicit FloatType(int bits = 32) : Type(TypeKind::Float), bits_(bits) {}
+    explicit FloatType(int bits = 32) : Type(bits == 64 ? TypeKind::Double : TypeKind::Float), bits_(bits) {}
     std::string name() const override { return bits_ == 32 ? "Float" : "Double"; }
     int bitWidth() const { return bits_; }
     size_t sizeInBytes() const override { return static_cast<size_t>(bits_ / 8); }

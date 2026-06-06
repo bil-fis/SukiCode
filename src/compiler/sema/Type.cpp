@@ -76,9 +76,12 @@ std::string FunctionType::name() const {
 
 // StructType
 size_t StructType::sizeInBytes() const {
-    size_t total = 0;
-    for (const auto& f : fields_) total += f.type->sizeInBytes();
-    return total;
+    if (fields_.empty()) return 0;
+    // 最后一个字段的偏移 + 大小，然后对齐到结构体对齐
+    const auto& last = fields_.back();
+    size_t total = last.offset + last.type->sizeInBytes();
+    size_t align = alignment();
+    return (total + align - 1) & ~(align - 1); // 向上对齐
 }
 
 size_t StructType::alignment() const {
@@ -91,22 +94,44 @@ void StructType::addField(const std::string& n, TypePtr t) {
     Field f;
     f.name = n;
     f.type = std::move(t);
-    f.offset = sizeInBytes();
+    // 计算偏移，考虑对齐填充
+    size_t currentSize = fields_.empty() ? 0 : (fields_.back().offset + fields_.back().type->sizeInBytes());
+    size_t fieldAlign = f.type->alignment();
+    f.offset = (currentSize + fieldAlign - 1) & ~(fieldAlign - 1); // 向上对齐
     fields_.push_back(std::move(f));
 }
 
 // EnumType
 size_t EnumType::sizeInBytes() const {
-    size_t maxSize = 4;
+    size_t maxPayloadSize = 0;
+    size_t maxPayloadAlign = 1;
     for (const auto& c : cases_) {
         size_t cs = 0;
-        for (const auto& t : c.associatedTypes) cs += t->sizeInBytes();
-        maxSize = std::max(maxSize, cs);
+        size_t ca = 1;
+        for (const auto& t : c.associatedTypes) {
+            cs += t->sizeInBytes();
+            ca = std::max(ca, t->alignment());
+        }
+        maxPayloadSize = std::max(maxPayloadSize, cs);
+        maxPayloadAlign = std::max(maxPayloadAlign, ca);
     }
-    return maxSize + 4;
+    // tag (4 bytes) + padding + payload，对齐到 maxPayloadAlign
+    size_t tagSize = 4;
+    size_t payloadOffset = (tagSize + maxPayloadAlign - 1) & ~(maxPayloadAlign - 1);
+    size_t total = payloadOffset + maxPayloadSize;
+    size_t align = std::max<size_t>(4, maxPayloadAlign);
+    return (total + align - 1) & ~(align - 1);
 }
 
-size_t EnumType::alignment() const { return 4; }
+size_t EnumType::alignment() const {
+    size_t maxAlign = 4; // tag 至少 4 字节对齐
+    for (const auto& c : cases_) {
+        for (const auto& t : c.associatedTypes) {
+            maxAlign = std::max(maxAlign, t->alignment());
+        }
+    }
+    return maxAlign;
+}
 
 void EnumType::addCase(const std::string& n, std::vector<TypePtr> assoc) {
     Case c;

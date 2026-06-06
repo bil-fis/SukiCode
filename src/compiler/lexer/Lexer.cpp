@@ -152,16 +152,16 @@ Token Lexer::scanToken() {
                 }
                 return next();
             }
-            if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
-                // #else — 在 #if 块内，跳过到 #endif
-                advance(); advance(); advance(); advance(); // skip 'else'
-                skipUntilHashEnd();
-                return next();
-            }
             if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e' &&
                 peekAt(4) == 'i' && peekAt(5) == 'f') {
                 // #elseif — 在 #if 块内，跳过到 #endif
                 advance(); advance(); advance(); advance(); advance(); advance(); // skip 'elseif'
+                skipUntilHashEnd();
+                return next();
+            }
+            if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
+                // #else — 在 #if 块内，跳过到 #endif
+                advance(); advance(); advance(); advance(); // skip 'else'
                 skipUntilHashEnd();
                 return next();
             }

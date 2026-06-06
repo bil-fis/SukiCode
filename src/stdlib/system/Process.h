@@ -10,8 +10,8 @@ namespace suki::stdlib {
 
 struct ProcessResult {
     int exitCode;
-    std::string stdout;
-    std::string stderr;
+    std::string output;   // stdout output
+    std::string errorOutput; // stderr output
     bool success() const { return exitCode == 0; }
 };
 
@@ -27,7 +27,7 @@ public:
         }
         char buffer[256];
         while (fgets(buffer, sizeof(buffer), pipe)) {
-            result.stdout += buffer;
+            result.output += buffer;
         }
         result.exitCode = pclose(pipe);
         return result;

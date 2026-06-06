@@ -234,6 +234,7 @@ const char* Token::kindName(TokenKind kind) {
         case TokenKind::KwOpen:      return "'open'";
         case TokenKind::KwStatic:    return "'static'";
         case TokenKind::KwMutating:  return "'mutating'";
+        case TokenKind::KwInOut:     return "'inout'";
         case TokenKind::KwGet:       return "'get'";
         case TokenKind::KwSet:       return "'set'";
         case TokenKind::KwWillSet:   return "'willSet'";

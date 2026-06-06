@@ -18,7 +18,7 @@ namespace suki {
 IRGenerator::IRGenerator(DiagnosticEngine& diag, const std::string& moduleName)
     : diag_(diag), moduleName_(moduleName)
 #ifdef SUKI_HAS_LLVM
-      , context_(), typeConverter_(context_)
+      , context_()
 #endif
 {
 #ifdef SUKI_HAS_LLVM
@@ -917,8 +917,19 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             }
             return val;
         }
-        case ExprKind::TypeCheck:
-            return llvm::ConstantInt::getTrue(context_); // 简化：总是返回 true
+        case ExprKind::TypeCheck: {
+            // is 类型检查：简化实现 - 对于引用类型检查非 null，对于值类型始终返回 true
+            auto& tc = static_cast<const TypeCheckExpr&>(expr);
+            llvm::Value* val = genExpr(*tc.subExpr);
+            if (!val) return nullptr;
+            // 对于指针类型，检查是否非 null
+            if (val->getType()->isPointerTy()) {
+                return builder_->CreateICmpNE(val,
+                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.check");
+            }
+            // 对于值类型，始终返回 true（完整实现需要 RTTI）
+            return llvm::ConstantInt::getTrue(context_);
+        }
         case ExprKind::Await:
         case ExprKind::Try: {
             auto* sub = (expr.exprKind == ExprKind::Await) ?
@@ -958,12 +969,66 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             return nullptr;
         }
         case ExprKind::ForceUnwrap: {
+            // 强制解包：如果值为 null 则调用 abort
             auto& fu = static_cast<const ForceUnwrapExpr&>(expr);
-            return genExpr(*fu.subExpr); // 简化
+            llvm::Value* val = genExpr(*fu.subExpr);
+            if (!val) return nullptr;
+            // 对于指针类型，检查是否为 null
+            if (val->getType()->isPointerTy()) {
+                llvm::Function* func = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* checkBB = llvm::BasicBlock::Create(context_, "unwrap.check", func);
+                llvm::BasicBlock* contBB = llvm::BasicBlock::Create(context_, "unwrap.ok", func);
+
+                llvm::Value* isNull = builder_->CreateICmpEQ(val,
+                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.null");
+                builder_->CreateCondBr(isNull, checkBB, contBB);
+
+                // null 分支：调用 abort
+                builder_->SetInsertPoint(checkBB);
+                llvm::Function* abortFunc = module_->getFunction("abort");
+                if (!abortFunc) {
+                    llvm::FunctionType* abortTy = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(context_), false);
+                    abortFunc = llvm::Function::Create(abortTy, llvm::Function::ExternalLinkage,
+                                                       "abort", module_.get());
+                }
+                builder_->CreateCall(abortFunc);
+                builder_->CreateUnreachable();
+
+                // 非 null 分支
+                builder_->SetInsertPoint(contBB);
+            }
+            return val;
         }
         case ExprKind::OptionalChain: {
+            // 可选链：如果值为 null，整个表达式返回 null
             auto& oc = static_cast<const OptionalChainExpr&>(expr);
-            return genExpr(*oc.subExpr); // 简化
+            llvm::Value* val = genExpr(*oc.subExpr);
+            if (!val) return nullptr;
+            // 对于指针类型，如果为 null 则短路返回 null
+            if (val->getType()->isPointerTy()) {
+                llvm::Function* func = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* nonNullBB = llvm::BasicBlock::Create(context_, "chain.nonnull", func);
+                llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "chain.merge", func);
+
+                llvm::Value* isNull = builder_->CreateICmpEQ(val,
+                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.null");
+                builder_->CreateCondBr(isNull, mergeBB, nonNullBB);
+
+                // 非 null 分支：继续执行
+                builder_->SetInsertPoint(nonNullBB);
+                builder_->CreateBr(mergeBB);
+                nonNullBB = builder_->GetInsertBlock();
+
+                // merge 分支：PHI 选择结果
+                builder_->SetInsertPoint(mergeBB);
+                llvm::PHINode* phi = builder_->CreatePHI(val->getType(), 2, "chain.result");
+                phi->addIncoming(val, nonNullBB);
+                phi->addIncoming(llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
+                    &func->getEntryBlock());
+                return phi;
+            }
+            return val;
         }
         case ExprKind::Subscript: {
             auto& sub = static_cast<const SubscriptExpr&>(expr);
@@ -971,19 +1036,53 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             if (!base || sub.indices.empty()) return nullptr;
             llvm::Value* index = genExpr(*sub.indices[0]);
             if (!index) return nullptr;
-            // 简化：计算指针偏移 / Simplified: compute pointer offset
-            return builder_->CreateGEP(llvm::Type::getInt8Ty(context_), base, index, "idx");
+
+            // 确定元素类型 / Determine element type
+            llvm::Type* elemType = llvm::Type::getInt64Ty(context_); // 默认 i64
+            if (base->getType()->isStructTy()) {
+                // Array 类型 {data_ptr, count, capacity}，数据指针在索引 0
+                llvm::Value* dataPtr = builder_->CreateStructGEP(
+                    base->getType(), base, 0, "arr.data.ptr");
+                llvm::Value* data = builder_->CreateLoad(
+                    llvm::PointerType::get(context_, 0), dataPtr, "arr.data");
+                return builder_->CreateGEP(elemType, data, index, "idx");
+            } else if (base->getType()->isPointerTy()) {
+                // 指针类型，按元素类型 GEP
+                return builder_->CreateGEP(elemType, base, index, "idx");
+            }
+            return builder_->CreateGEP(elemType, base, index, "idx");
         }
         case ExprKind::Closure: {
-            // 闭包简化实现：生成匿名函数
-            // Simplified closure: generate anonymous function
+            // 闭包实现：捕获外部变量作为额外参数
+            // Closure: capture outer variables as additional parameters
             auto& closure = static_cast<const ClosureExpr&>(expr);
             std::string funcName = "__closure_" + std::to_string(nextClosureId_++);
 
-            // 创建函数类型
+            // 收集需要捕获的变量（当前作用域中的所有变量）
+            // Collect variables to capture (all variables in current scope)
+            std::vector<std::string> capturedNames;
+            std::vector<llvm::Type*> capturedTypes;
+            std::vector<llvm::Value*> capturedValues;
+            for (const auto& [name, allocaInst] : namedValues_) {
+                // 跳过参数（它们会在闭包参数中）
+                bool isParam = false;
+                for (const auto& p : closure.params) {
+                    if (p.name == name) { isParam = true; break; }
+                }
+                if (isParam) continue;
+                capturedNames.push_back(name);
+                capturedTypes.push_back(namedTypes_[name]);
+                capturedValues.push_back(allocaInst);
+            }
+
+            // 创建函数类型：显式参数 + 捕获变量参数
             std::vector<llvm::Type*> paramTypes;
             for (const auto& p : closure.params) {
-                paramTypes.push_back(llvm::Type::getInt64Ty(context_)); // 简化
+                paramTypes.push_back(llvm::Type::getInt64Ty(context_));
+            }
+            // 添加捕获变量的指针参数
+            for (auto* ty : capturedTypes) {
+                paramTypes.push_back(llvm::PointerType::get(context_, 0));
             }
             llvm::Type* retType = llvm::Type::getVoidTy(context_);
             llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
@@ -1006,11 +1105,26 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             size_t idx = 0;
             for (auto& arg : func->args()) {
                 if (idx < closure.params.size()) {
+                    // 显式参数
                     arg.setName(closure.params[idx].name);
-                    llvm::AllocaInst* alloca = createEntryBlockAlloca(func, arg.getType(), closure.params[idx].name);
-                    builder_->CreateStore(&arg, alloca);
-                    namedValues_[closure.params[idx].name] = alloca;
+                    llvm::AllocaInst* allocaInst = createEntryBlockAlloca(func, arg.getType(), closure.params[idx].name);
+                    builder_->CreateStore(&arg, allocaInst);
+                    namedValues_[closure.params[idx].name] = allocaInst;
                     namedTypes_[closure.params[idx].name] = arg.getType();
+                } else {
+                    // 捕获的变量：从指针加载
+                    size_t capIdx = idx - closure.params.size();
+                    if (capIdx < capturedNames.size()) {
+                        std::string capName = capturedNames[capIdx];
+                        llvm::Type* capType = capturedTypes[capIdx];
+                        arg.setName(capName + ".cap");
+                        // 创建本地 alloca 并从捕获指针加载值
+                        llvm::AllocaInst* allocaInst = createEntryBlockAlloca(func, capType, capName);
+                        llvm::Value* loaded = builder_->CreateLoad(capType, &arg, capName + ".loaded");
+                        builder_->CreateStore(loaded, allocaInst);
+                        namedValues_[capName] = allocaInst;
+                        namedTypes_[capName] = capType;
+                    }
                 }
                 idx++;
             }
@@ -1031,6 +1145,7 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             namedTypes_ = savedTypes;
             builder_->SetInsertPoint(&currentFunc_->back());
 
+            // 返回闭包函数指针
             return func;
         }
         case ExprKind::CharLiteral: {
@@ -1325,9 +1440,9 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
                     paramTypes.push_back(resolveType(genericAst->params[i].type.get()));
                 }
             }
-            llvm::Type* retType = !argTypes.empty() ? argTypes[0] :
-                (genericAst->returnType ? resolveType(genericAst->returnType.get()) :
-                 llvm::Type::getVoidTy(context_));
+            llvm::Type* retType = genericAst->returnType ?
+                resolveType(genericAst->returnType.get()) :
+                llvm::Type::getVoidTy(context_);
 
             llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
             specFunc = llvm::Function::Create(
