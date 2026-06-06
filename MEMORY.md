@@ -17,8 +17,10 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 - **@main 属性**: 自动重命名为入口函数
 - **条件编译**: #if os(Windows) 正确工作
 - **前向引用**: 函数可以在定义前调用
-- **泛型函数**: `identity<T>(value: T) -> T` 正确工作
-- **30 次提交**, 所有测试通过
+- **泛型函数**: `identity<T>(value: T) -> T` 正确工作（单态化）
+- **复合赋值运算符**: `+=`, `-=` 等正确生成 IR
+- **集成测试**: hello_world, fibonacci, generic, control_flow 全部通过
+- **35 次提交**, 所有测试通过
 
 ## 已完成的核心管道
 ```
@@ -54,6 +56,8 @@ Lexer → Parser → AST → Sema → LLVM IR → Object File → Executable
 - 前向引用通过预注册所有函数声明解决
 - 泛型参数在预注册和函数体处理时都需要注册到符号表
 - 泛型返回类型跳过类型兼容性检查（Any 类型）
+- 泛型单态化：当泛型函数被调用时，根据参数类型生成特化版本
+- 复合赋值运算符需要在 AST 中存储运算符种类
 
 ## 文件结构
 ```
