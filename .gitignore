@@ -4,6 +4,9 @@ out/
 cmake-build-*/
 .cache/
 
+# Test build artifacts
+moduleTest/build/
+
 # Claude session memory (not for version control)
 MEMORY.md
 

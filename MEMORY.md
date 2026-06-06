@@ -20,8 +20,10 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 - **泛型函数**: `identity<T>(value: T) -> T` 正确工作（单态化）
 - **复合赋值运算符**: `+=`, `-=` 等正确生成 IR
 - **集成测试**: hello_world, fibonacci, generic, control_flow 全部通过
-- **工具链**: sukic, sukipm, suki-fmt, suki-doc 全部构建成功
-- **42 次提交**, 所有测试通过
+- **工具链**: sukic, sukipm, suki-fmt, suki-lsp, suki-doc 全部构建成功
+- **ARC 插入**: 变量赋值 retain + 返回时 release
+- **协程框架**: async 函数状态追踪
+- **50 次提交**, 14/14 测试通过
 
 ## 已完成的核心管道
 ```
@@ -36,12 +38,18 @@ Lexer → Parser → AST → Sema → LLVM IR → Object File → Executable
 | 语法分析器 | **92%** | 所有声明/语句/表达式类型均有 AST 定义 |
 | 类型系统 | **65%** | 基本类型和复合类型，泛型单态化 |
 | 语义分析 | **50%** | 类型推断、类型检查、作用域 |
-| LLVM IR 代码生成 | **55%** | 函数/变量/控制流/表达式/泛型单态化 |
+| LLVM IR 代码生成 | **55%** | 函数/变量/控制流/表达式/泛型单态化/ARC 插入 |
 | 编译器驱动 | **50%** | 可产出可执行文件，交叉编译，调试信息 |
 | 运行时库 | **45%** | ARC、Pool、Collection、Channel、Atomic、Mutex、Coroutine |
-| 标准库 | **30%** | Core + System + Test + Network 基础 |
-| 工具链 | **50%** | sukipm + suki-fmt + suki-doc |
-| **整体** | **~50%** | |
+| 标准库 | **30%** | Core + System + Test + Network + Crypto + Data + CLI |
+| 工具链 | **60%** | sukipm + suki-fmt + suki-lsp + suki-doc |
+| **整体** | **~55%** | |
+
+## 测试文件约定
+- 所有测试文件（test_*.suki）放到 `moduleTest/` 目录
+- 测试分类：`moduleTest/lexer/`、`moduleTest/parser/`、`moduleTest/sema/`、`moduleTest/codegen/`、`moduleTest/runtime/`、`moduleTest/integration/`
+- 测试构建产物放到 `moduleTest/build/`（已 git 排除）
+- 不要在 `/tmp` 或项目根目录放测试文件
 
 ## 关键技术决策
 - 使用手写递归下降解析器（非 ANTLR/TableGen），更好控制错误信息
