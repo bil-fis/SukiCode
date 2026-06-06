@@ -294,8 +294,11 @@ DeclPtr Parser::parseVariableDecl() {
     advance(); // consume let/var
 
     // Parse first variable name
+    // Allow keywords like 'set', 'get' as variable names (context-sensitive)
     std::vector<std::string> names;
     if (check(TokenKind::Identifier)) {
+        names.push_back(std::string(advance().stringValue));
+    } else if (check(TokenKind::KwSet) || check(TokenKind::KwGet)) {
         names.push_back(std::string(advance().stringValue));
     } else if (match(TokenKind::Underscore)) {
         names.push_back("_");
@@ -1692,17 +1695,33 @@ ExprPtr Parser::parsePrimaryExpr() {
         // Closure or set literal: {1, 2, 3} vs { body }
         case TokenKind::LBrace: {
             // Heuristic: if { is followed by a literal, it's a set literal
-            if (peekAt(1).isOneOf({
-                TokenKind::IntegerLiteral, TokenKind::FloatLiteral,
-                TokenKind::StringLiteral, TokenKind::CharLiteral,
-                TokenKind::True, TokenKind::False, TokenKind::Nil})) {
+            // Use tokens_ array directly for lookahead to avoid issues
+            bool isSetLiteral = false;
+            if (pos_ + 1 < tokens_.size()) {
+                TokenKind nextKind = tokens_[pos_ + 1].kind;
+                isSetLiteral = (nextKind == TokenKind::IntegerLiteral ||
+                               nextKind == TokenKind::FloatLiteral ||
+                               nextKind == TokenKind::StringLiteral ||
+                               nextKind == TokenKind::CharLiteral ||
+                               nextKind == TokenKind::True ||
+                               nextKind == TokenKind::False ||
+                               nextKind == TokenKind::Nil);
+            }
+            if (isSetLiteral) {
                 // Parse as set literal: {1, 2, 3}
                 advance(); // {
                 auto setLit = makeNode<SetLiteralExpr>();
-                do {
-                    setLit->elements.push_back(parseExpression());
-                } while (match(TokenKind::Comma));
-                expect(TokenKind::RBrace);
+                while (!check(TokenKind::RBrace) && !isAtEnd()) {
+                    ExprPtr elem = parseExpression();
+                    if (elem) {
+                        setLit->elements.push_back(std::move(elem));
+                    } else {
+                        break;
+                    }
+                    if (!check(TokenKind::Comma)) break;
+                    advance(); // ,
+                }
+                if (check(TokenKind::RBrace)) advance(); // }
                 return setLit;
             }
 
