@@ -20,7 +20,8 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 - **泛型函数**: `identity<T>(value: T) -> T` 正确工作（单态化）
 - **复合赋值运算符**: `+=`, `-=` 等正确生成 IR
 - **集成测试**: hello_world, fibonacci, generic, control_flow 全部通过
-- **35 次提交**, 所有测试通过
+- **工具链**: sukic, sukipm, suki-fmt, suki-doc 全部构建成功
+- **42 次提交**, 所有测试通过
 
 ## 已完成的核心管道
 ```
@@ -31,15 +32,16 @@ Lexer → Parser → AST → Sema → LLVM IR → Object File → Executable
 
 | 维度 | 完成度 | 说明 |
 |------|--------|------|
-| 词法分析器 | **95%** | 核心功能完成，字符串插值标记化待完善 |
-| 语法分析器 | **90%** | 所有声明/语句/表达式类型均有 AST 定义和解析逻辑 |
-| 类型系统 | **65%** | 基本类型和复合类型框架存在，泛型基础已实现 |
-| 语义分析 | **50%** | 类型推断、类型检查、作用域、控制流检查 |
-| LLVM IR 代码生成 | **50%** | 函数/变量/控制流/表达式 IR 生成，ARC 框架 |
-| 编译器驱动 | **40%** | 可产出可执行文件，目标代码和链接 |
-| 运行时库 | **45%** | ARC、Pool、Collection、Channel、Atomic、Mutex |
-| 标准库 | **15%** | Error/Result/Equatable/Hashable/String/Array/Dict/Optional/Range |
-| **整体** | **~40%** | |
+| 词法分析器 | **95%** | 核心功能完成 |
+| 语法分析器 | **92%** | 所有声明/语句/表达式类型均有 AST 定义 |
+| 类型系统 | **65%** | 基本类型和复合类型，泛型单态化 |
+| 语义分析 | **50%** | 类型推断、类型检查、作用域 |
+| LLVM IR 代码生成 | **55%** | 函数/变量/控制流/表达式/泛型单态化 |
+| 编译器驱动 | **50%** | 可产出可执行文件，交叉编译，调试信息 |
+| 运行时库 | **45%** | ARC、Pool、Collection、Channel、Atomic、Mutex、Coroutine |
+| 标准库 | **30%** | Core + System + Test + Network 基础 |
+| 工具链 | **50%** | sukipm + suki-fmt + suki-doc |
+| **整体** | **~50%** | |
 
 ## 关键技术决策
 - 使用手写递归下降解析器（非 ANTLR/TableGen），更好控制错误信息
@@ -83,14 +85,19 @@ src/stdlib/core/
 ## 未完成任务清单
 
 ### P3: 工具链/生态
-- [ ] P3-1: SukiPM 包管理器
+- [x] P3-1: SukiPM 包管理器基础
 - [ ] P3-2: suki-lsp 语言服务器
-- [ ] P3-3: suki-fmt 格式化器
-- [ ] P3-4: 调试信息 DWARF
-- [ ] P3-5: 增量编译
-- [ ] P3-6: 跨平台编译目标三元组
-- [ ] P3-7: 文档生成
-- [ ] P3-8: 标准库模块 (System/Network/Crypto/Data/I18n/Test/CLI)
+- [x] P3-3: suki-fmt 格式化器
+- [x] P3-4: 调试信息 DWARF
+- [x] P3-5: 增量编译缓存
+- [x] P3-6: 跨平台编译目标三元组
+- [x] P3-7: 文档生成器 suki-doc
+- [x] P3-8a: 标准库 System 模块 (Path, Process, File, Date)
+- [x] P3-8b: 标准库 Test 模块
+- [x] P3-8c: 标准库 Network 模块基础 (URL, JSON)
+- [ ] P3-8d: 标准库 Crypto 模块
+- [ ] P3-8e: 标准库 Data 模块
+- [ ] P3-8f: 标准库 CLI 模块
 
 ### 完善项
 - [ ] 泛型实例化（单态化）、关联类型
