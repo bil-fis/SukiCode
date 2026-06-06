@@ -15,16 +15,8 @@ class Animal {
     }
 }
 
-class Dog: Animal {
-    override func speak() -> String {
-        return "Woof!"
-    }
-}
-
 @main
 func main() -> Int {
-    let p = Point(x: 1.0, y: 2.0)
-    let dog = Dog(name: "Buddy")
     print(42)
     return 0
 }

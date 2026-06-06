@@ -34,9 +34,10 @@ set_tests_properties(CompileBasics PROPERTIES TIMEOUT 10)
 # Compile and verify moduleTest files
 file(GLOB MODULETEST_LEXER ${CMAKE_SOURCE_DIR}/moduleTest/lexer/*.suki)
 file(GLOB MODULETEST_PARSER ${CMAKE_SOURCE_DIR}/moduleTest/parser/*.suki)
+file(GLOB MODULETEST_CODEGEN ${CMAKE_SOURCE_DIR}/moduleTest/codegen/*.suki)
 file(GLOB MODULETEST_INTEGRATION ${CMAKE_SOURCE_DIR}/moduleTest/integration/*.suki)
 
-foreach(test_file ${MODULETEST_LEXER} ${MODULETEST_PARSER})
+foreach(test_file ${MODULETEST_LEXER} ${MODULETEST_PARSER} ${MODULETEST_CODEGEN})
     get_filename_component(test_name ${test_file} NAME_WE)
     add_test(NAME "ModuleTest_${test_name}"
         COMMAND sukic --emit-ast ${test_file}

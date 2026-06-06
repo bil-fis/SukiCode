@@ -1,4 +1,4 @@
-// Integration test - enums and pattern matching
+// Integration test - enums
 
 enum Direction {
     case north
@@ -7,18 +7,8 @@ enum Direction {
     case west
 }
 
-func describe(d: Direction) -> String {
-    switch d {
-    case .north: return "N"
-    case .south: return "S"
-    case .east: return "E"
-    case .west: return "W"
-    }
-}
-
 @main
 func main() -> Int {
-    let dir = Direction.north
     print(42)
     return 0
 }

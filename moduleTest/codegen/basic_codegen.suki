@@ -1,0 +1,67 @@
+// Codegen test - basic code generation
+
+// 各种字面量
+let intVal = 42
+let floatVal = 3.14
+let boolVal = true
+let strVal = "hello"
+let nilVal: String? = nil
+
+// 算术运算
+func add(a: Int, b: Int) -> Int { return a + b }
+func sub(a: Int, b: Int) -> Int { return a - b }
+func mul(a: Int, b: Int) -> Int { return a * b }
+
+// 控制流
+func abs(n: Int) -> Int {
+    if n < 0 { return 0 - n }
+    return n
+}
+
+func max(a: Int, b: Int) -> Int {
+    if a > b { return a }
+    return b
+}
+
+// 循环
+func sum(n: Int) -> Int {
+    var total = 0
+    var i = 0
+    while i <= n {
+        total += i
+        i += 1
+    }
+    return total
+}
+
+// 泛型
+func identity<T>(value: T) -> T {
+    return value
+}
+
+// 结构体
+struct Point {
+    var x: Double
+    var y: Double
+}
+
+// 枚举
+enum Direction {
+    case north
+    case south
+    case east
+    case west
+}
+
+@main
+func main() -> Int {
+    let a = add(a: 1, b: 2)
+    let b = abs(n: -42)
+    let c = sum(n: 10)
+    let d = identity(value: 100)
+    print(a)
+    print(b)
+    print(c)
+    print(d)
+    return 0
+}
