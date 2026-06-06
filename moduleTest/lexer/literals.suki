@@ -1,0 +1,15 @@
+// 词法分析器测试 - 字面量
+// Lexer test - literals
+
+let intLit = 42
+let hexLit = 0xFF
+let binLit = 0b1010
+let octLit = 0o77
+let floatLit = 3.14
+let expLit = 1.0e10
+let strLit = "hello world"
+let charLit = 'A'
+let trueLit = true
+let falseLit = false
+let nilLit = nil
+let interpolated = "value is \(intLit)"

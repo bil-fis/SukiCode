@@ -1,0 +1,13 @@
+// 解析器测试 - 函数声明
+// Parser test - function declarations
+
+func noArgs() -> Int { return 0 }
+func withArgs(a: Int, b: String) -> Bool { return true }
+func labeled(external internal: Int) -> Int { return internal }
+func defaulted(x: Int = 10) -> Int { return x }
+func variadic(args: Int...) -> Int { return 0 }
+async func asyncFunc() -> Int { return 0 }
+func throwsFunc() throws -> Int { return 0 }
+func inoutFunc(x: inout Int) { x += 1 }
+func generic<T>(value: T) -> T { return value }
+func genericConstrained<T: Hashable>(value: T) -> T { return value }

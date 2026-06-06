@@ -1,0 +1,74 @@
+// 解析器测试 - 表达式
+// Parser test - expressions
+
+func expressions() {
+    // 算术
+    let a = 1 + 2 * 3 - 4 / 2
+
+    // 比较
+    let b = a > 10 && a < 100
+
+    // 位运算
+    let c = 0xFF & 0x0F | 0xF0
+
+    // 范围
+    let r1 = 0..<10
+    let r2 = 1...5
+
+    // 数组
+    let arr = [1, 2, 3, 4, 5]
+
+    // 字典
+    let dict = ["key": "value", "name": "test"]
+
+    // 集合
+    let set = {1, 2, 3}
+
+    // 元组
+    let tuple = (1, "hello", true)
+
+    // 闭包
+    let closure = { (x: Int) -> Int in return x * 2 }
+    let arrow = (x: Int) => x * 2
+
+    // 函数调用
+    let result = add(a: 1, b: 2)
+    let trailing = [1, 2, 3].map { $0 * 2 }
+
+    // 成员访问
+    let len = "hello".count
+
+    // 下标
+    let first = arr[0]
+
+    // 可选链
+    var opt: String? = "hello"
+    let upper = opt?.uppercased()
+
+    // 强制解包
+    let unwrapped = opt!
+
+    // 空合并
+    let fallback = opt ?? "default"
+
+    // as/is
+    let casted = 42 as Double
+    let checked = 42 is Int
+
+    // try/await
+    let data = try risky()
+    let async = await fetch()
+
+    // move
+    let owned = move data
+
+    // if 表达式
+    let val = if x > 0 { 1 } else { 0 }
+
+    // 字符串插值
+    let msg = "value: \(a), result: \(result)"
+
+    // self/super
+    let s = self.name
+    super.init()
+}

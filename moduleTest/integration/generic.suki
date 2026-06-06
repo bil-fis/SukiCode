@@ -1,0 +1,19 @@
+// 集成测试 - 泛型函数
+// Integration test - Generic functions
+
+func identity<T>(value: T) -> T {
+    return value
+}
+
+func max<T: Comparable>(a: T, b: T) -> T {
+    if a > b { return a }
+    return b
+}
+
+@main
+func main() -> Int {
+    let x = identity(value: 42)
+    let y = identity(value: "hello")
+    print(x)
+    return 0
+}

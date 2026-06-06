@@ -372,6 +372,7 @@ struct ForceUnwrapExpr : Expr {
 struct AssignmentExpr : Expr {
     ExprPtr target;
     ExprPtr value;
+    TokenKind op = TokenKind::Assign; // =, +=, -=, *=, /=, etc.
     AssignmentExpr() : Expr(ExprKind::Assignment) {}
 };
 

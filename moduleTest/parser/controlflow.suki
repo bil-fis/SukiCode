@@ -1,0 +1,56 @@
+// 解析器测试 - 控制流
+// Parser test - control flow
+
+func controlFlow() {
+    // if-else
+    let x = 10
+    if x > 0 {
+        print("positive")
+    } else if x < 0 {
+        print("negative")
+    } else {
+        print("zero")
+    }
+
+    // guard
+    guard x >= 0 else { return }
+
+    // for-in
+    for i in 0..<10 {
+        print(i)
+    }
+    for (k, v) in dict { print(k) }
+
+    // while
+    var count = 0
+    while count < 5 { count += 1 }
+
+    // repeat-while
+    repeat { count -= 1 } while count > 0
+
+    // switch
+    switch x {
+    case 0: print("zero")
+    case 1..<10: print("small")
+    case let v where v > 100: print("big \(v)")
+    default: print("other")
+    }
+
+    // do-catch
+    do {
+        let _ = try risky()
+    } catch let e as MyError {
+        print(e)
+    } catch {
+        print("unknown")
+    }
+
+    // defer
+    defer { print("cleanup") }
+
+    // break/continue
+    for i in 0..<10 {
+        if i == 3 { continue }
+        if i == 7 { break }
+    }
+}

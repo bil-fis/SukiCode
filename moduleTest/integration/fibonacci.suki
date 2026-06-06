@@ -1,0 +1,16 @@
+// 集成测试 - Fibonacci
+// Integration test - Fibonacci recursive
+
+func fibonacci(n: Int) -> Int {
+    if n <= 1 {
+        return n
+    }
+    return fibonacci(n: n - 1) + fibonacci(n: n - 2)
+}
+
+@main
+func main() -> Int {
+    let result = fibonacci(n: 10)
+    print(result)
+    return 0
+}

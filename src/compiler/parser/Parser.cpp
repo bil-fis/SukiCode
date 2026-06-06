@@ -1109,11 +1109,10 @@ ExprPtr Parser::parseAssignmentExpr() {
 
     // Assignment operators
     if (peek().isAssignmentOperator()) {
-        TokenKind op = advance().kind;
-        ExprPtr right = parseAssignmentExpr();
         auto expr = makeNode<AssignmentExpr>();
+        expr->op = advance().kind;
         expr->target = std::move(left);
-        expr->value = std::move(right);
+        expr->value = parseAssignmentExpr();
         return expr;
     }
 

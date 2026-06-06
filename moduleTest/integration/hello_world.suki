@@ -1,0 +1,8 @@
+// 集成测试 - Hello World
+// Integration test - Hello World
+
+@main
+func main() -> Int {
+    print("Hello, SukiCode!")
+    return 0
+}

@@ -111,6 +111,10 @@ private:
     // 函数注册 / Function registry
     std::unordered_map<std::string, llvm::Function*> functions_;
 
+    // 泛型函数实例化 / Generic function instantiation
+    std::unordered_map<std::string, const FunctionDecl*> genericFuncAsts_;
+    const CompilationUnit* currentCu_ = nullptr;
+
     // 控制流块 / Control flow blocks (for break/continue)
     struct LoopInfo {
         llvm::BasicBlock* condBlock;

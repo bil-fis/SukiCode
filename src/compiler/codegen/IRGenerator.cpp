@@ -63,10 +63,21 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
     // 初始化调试信息 / Initialize debug info
     initDebugInfo(cu.filename);
 
+    // 保存 CU 指针 / Save CU pointer
+    currentCu_ = &cu;
+
     // 预注册所有函数声明 / Pre-register all function declarations
     for (const auto& decl : cu.declarations) {
         if (decl && decl->declKind == DeclKind::Function) {
             auto& fd = static_cast<const FunctionDecl&>(*decl);
+
+            // 存储泛型函数 AST / Store generic function AST
+            if (!fd.genericParams.empty()) {
+                genericFuncAsts_[fd.name] = &fd;
+                // 泛型函数在预注册时使用 i64 作为占位符
+                // Generic functions use i64 as placeholder during pre-registration
+            }
+
             std::vector<llvm::Type*> paramTypes;
             for (const auto& param : fd.params) {
                 paramTypes.push_back(resolveType(param.type.get()));
@@ -329,9 +340,10 @@ void IRGenerator::genVariableDecl(const VariableDecl& decl) {
     if (initVal) {
         builder_->CreateStore(initVal, allocaInst);
         // ARC: 引用类型赋值时 retain / ARC: retain on reference type assignment
-        if (isReferenceType(initVal->getType())) {
-            insertRetain(initVal);
-        }
+        // TODO: 启用 ARC 需要链接运行时库
+        // if (isReferenceType(initVal->getType())) {
+        //     insertRetain(initVal);
+        // }
     }
 
     // 注册变量
@@ -376,13 +388,17 @@ void IRGenerator::genReturnStmt(const ReturnStmt& stmt) {
     if (stmt.value) {
         llvm::Value* retVal = genExpr(*stmt.value);
         if (retVal) {
-            // 类型转换
+            // 类型转换 / Type conversion
             llvm::Type* expectedType = currentFunc_->getReturnType();
             if (retVal->getType() != expectedType) {
                 if (expectedType->isDoubleTy() && retVal->getType()->isIntegerTy()) {
                     retVal = builder_->CreateSIToFP(retVal, expectedType, "retcast");
                 } else if (expectedType->isIntegerTy(64) && retVal->getType()->isIntegerTy()) {
                     retVal = builder_->CreateSExt(retVal, expectedType, "retcast");
+                } else if (expectedType->isPointerTy() && retVal->getType()->isIntegerTy()) {
+                    retVal = builder_->CreateIntToPtr(retVal, expectedType, "retcast");
+                } else if (expectedType->isIntegerTy() && retVal->getType()->isPointerTy()) {
+                    retVal = builder_->CreatePtrToInt(retVal, expectedType, "retcast");
                 }
             }
             builder_->CreateRet(retVal);
@@ -681,7 +697,39 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                 auto it = namedValues_.find(id.name);
                 if (it != namedValues_.end()) {
                     llvm::Type* varType = namedTypes_[id.name];
-                    // 类型转换
+
+                    // 复合赋值运算符 / Compound assignment operators
+                    if (ae.op != TokenKind::Assign) {
+                        llvm::Value* current = builder_->CreateLoad(varType, it->second, "load");
+                        llvm::Value* result = nullptr;
+                        if (ae.op == TokenKind::PlusAssign) {
+                            result = builder_->CreateAdd(current, val, "add");
+                        } else if (ae.op == TokenKind::MinusAssign) {
+                            result = builder_->CreateSub(current, val, "sub");
+                        } else if (ae.op == TokenKind::StarAssign) {
+                            result = builder_->CreateMul(current, val, "mul");
+                        } else if (ae.op == TokenKind::SlashAssign) {
+                            result = builder_->CreateSDiv(current, val, "div");
+                        } else if (ae.op == TokenKind::PercentAssign) {
+                            result = builder_->CreateSRem(current, val, "mod");
+                        } else if (ae.op == TokenKind::AmpAssign) {
+                            result = builder_->CreateAnd(current, val, "and");
+                        } else if (ae.op == TokenKind::PipeAssign) {
+                            result = builder_->CreateOr(current, val, "or");
+                        } else if (ae.op == TokenKind::CaretAssign) {
+                            result = builder_->CreateXor(current, val, "xor");
+                        } else if (ae.op == TokenKind::LShiftAssign) {
+                            result = builder_->CreateShl(current, val, "shl");
+                        } else if (ae.op == TokenKind::RShiftAssign) {
+                            result = builder_->CreateAShr(current, val, "shr");
+                        }
+                        if (result) {
+                            builder_->CreateStore(result, it->second);
+                            return result;
+                        }
+                    }
+
+                    // 简单赋值 / Simple assignment
                     if (val->getType() != varType) {
                         if (varType->isDoubleTy() && val->getType()->isIntegerTy()) {
                             val = builder_->CreateSIToFP(val, varType, "cast");
@@ -893,6 +941,110 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
     }
 
     llvm::Function* func = module_->getFunction(funcName);
+
+    // 泛型函数单态化 / Generic function monomorphization
+    if (!func || genericFuncAsts_.count(funcName) > 0) {
+        // 生成参数类型列表以创建特化函数名
+        std::vector<llvm::Type*> argTypes;
+        for (const auto& arg : expr.args) {
+            llvm::Value* argVal = genExpr(*arg.value);
+            if (argVal) argTypes.push_back(argVal->getType());
+        }
+
+        // 创建特化函数名: funcName<Type1,Type2,...>
+        std::string specName = funcName;
+        for (auto* ty : argTypes) {
+            specName += "_";
+            if (ty->isIntegerTy(64)) specName += "i64";
+            else if (ty->isIntegerTy(32)) specName += "i32";
+            else if (ty->isDoubleTy()) specName += "f64";
+            else if (ty->isFloatTy()) specName += "f32";
+            else if (ty->isPointerTy()) specName += "ptr";
+            else specName += "any";
+        }
+
+        // 检查特化函数是否已存在
+        llvm::Function* specFunc = module_->getFunction(specName);
+        if (!specFunc && genericFuncAsts_.count(funcName) > 0) {
+            // 生成特化函数 / Generate specialized function
+            const FunctionDecl* genericAst = genericFuncAsts_[funcName];
+            std::vector<llvm::Type*> paramTypes;
+            for (size_t i = 0; i < genericAst->params.size(); i++) {
+                if (i < argTypes.size()) {
+                    paramTypes.push_back(argTypes[i]);
+                } else {
+                    paramTypes.push_back(resolveType(genericAst->params[i].type.get()));
+                }
+            }
+            llvm::Type* retType = !argTypes.empty() ? argTypes[0] :
+                (genericAst->returnType ? resolveType(genericAst->returnType.get()) :
+                 llvm::Type::getVoidTy(context_));
+
+            llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
+            specFunc = llvm::Function::Create(
+                funcType, llvm::Function::ExternalLinkage, specName, module_.get());
+
+            // 设置参数名称
+            size_t aIdx = 0;
+            for (auto& a : specFunc->args()) {
+                if (aIdx < genericAst->params.size()) {
+                    a.setName(genericAst->params[aIdx].internalName);
+                }
+                aIdx++;
+            }
+
+            // 生成函数体 / Generate function body
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", specFunc);
+            builder_->SetInsertPoint(entry);
+
+            llvm::Function* prevFunc = currentFunc_;
+            currentFunc_ = specFunc;
+
+            // 保存和恢复命名值 / Save and restore named values
+            auto savedValues = namedValues_;
+            auto savedTypes = namedTypes_;
+            namedValues_.clear();
+            namedTypes_.clear();
+
+            // 为参数创建 alloca
+            size_t idx = 0;
+            for (auto& arg : specFunc->args()) {
+                llvm::Type* pType = arg.getType();
+                llvm::AllocaInst* allocaInst = createEntryBlockAlloca(specFunc, pType, std::string(arg.getName()));
+                builder_->CreateStore(&arg, allocaInst);
+                namedValues_[std::string(arg.getName())] = allocaInst;
+                namedTypes_[std::string(arg.getName())] = pType;
+                idx++;
+            }
+
+            // 生成函数体
+            for (const auto& stmt : genericAst->body) {
+                if (stmt) genStmt(*stmt);
+            }
+
+            // 添加 return
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                if (retType->isVoidTy()) {
+                    builder_->CreateRetVoid();
+                } else {
+                    builder_->CreateRet(llvm::Constant::getNullValue(retType));
+                }
+            }
+
+            llvm::verifyFunction(*specFunc);
+            currentFunc_ = prevFunc;
+            namedValues_ = savedValues;
+            namedTypes_ = savedTypes;
+
+            // 恢复插入点 / Restore insert point
+            if (currentFunc_ && !currentFunc_->empty()) {
+                builder_->SetInsertPoint(&currentFunc_->back());
+            }
+        }
+
+        if (specFunc) func = specFunc;
+    }
+
     if (!func) {
         error({}, "unknown function: " + funcName);
         return nullptr;
@@ -903,7 +1055,7 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
         llvm::Value* argVal = genExpr(*arg.value);
         if (!argVal) return nullptr;
 
-        // 参数类型转换
+        // 参数类型转换 / Argument type conversion
         size_t argIdx = args.size();
         if (argIdx < func->arg_size()) {
             llvm::Type* expectedType = func->getArg(argIdx)->getType();
@@ -912,6 +1064,10 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
                     argVal = builder_->CreateSIToFP(argVal, expectedType, "argcast");
                 } else if (expectedType->isIntegerTy(64) && argVal->getType()->isIntegerTy()) {
                     argVal = builder_->CreateSExt(argVal, expectedType, "argcast");
+                } else if (expectedType->isPointerTy() && argVal->getType()->isIntegerTy()) {
+                    argVal = builder_->CreateIntToPtr(argVal, expectedType, "argcast");
+                } else if (expectedType->isIntegerTy() && argVal->getType()->isPointerTy()) {
+                    argVal = builder_->CreatePtrToInt(argVal, expectedType, "argcast");
                 }
             }
         }
