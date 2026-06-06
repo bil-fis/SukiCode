@@ -62,6 +62,8 @@ private:
     DeclPtr parseAsmDecl();
     DeclPtr parseMacroDecl(MacroKind kind);
     DeclPtr parseExternDecl();
+    DeclPtr parseExternFuncDecl(const std::string& callingConv);
+    FunctionParam parseExternParam();
 
     // ─── Statements ───────────────────────────────────────────────────────
     StmtPtr parseStatement();

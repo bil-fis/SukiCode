@@ -1067,66 +1067,113 @@ DeclPtr Parser::parseMacroDecl(MacroKind kind) {
 
 DeclPtr Parser::parseExternDecl() {
     expect(TokenKind::KwExtern);
-    auto decl = makeNode<FunctionDecl>();
 
-    // extern "C" { ... } 或 extern "C" func ...
+    // 解析调用约定 / Parse calling convention
+    std::string callingConv = "C"; // 默认 C 调用约定
     if (check(TokenKind::StringLiteral)) {
-        // 跳过调用约定字符串 / Skip calling convention string (e.g., "C")
-        advance();
+        callingConv = std::string(advance().stringValue);
     }
 
-    // extern func printf(fmt: *const u8, ...) -> i32
-    if (check(TokenKind::KwFunc)) {
-        advance(); // skip 'func'
-        if (check(TokenKind::Identifier)) {
-            decl->name = std::string(advance().stringValue);
-        } else {
-            error("expected function name");
-        }
-
-        // 参数列表
-        if (expect(TokenKind::LParen)) {
-            decl->params = parseParamList();
-            expect(TokenKind::RParen);
-        }
-
-        // 返回类型
-        if (match(TokenKind::Arrow)) {
-            decl->returnType = parseType();
-        }
-
-        // 标记为 extern / Mark as extern
-        Attribute attr;
-        attr.name = "_cdecl";
-        decl->attributes.push_back(attr);
-    }
-    // extern { func ...; func ...; }
-    else if (check(TokenKind::LBrace)) {
+    // extern "C" { func ...; func ...; } - extern 块
+    if (check(TokenKind::LBrace)) {
+        auto block = makeNode<ExternBlockDecl>();
+        block->callingConvention = callingConv;
         advance(); // skip '{'
+
         while (!check(TokenKind::RBrace) && !isAtEnd()) {
             if (check(TokenKind::KwFunc)) {
                 advance(); // skip 'func'
-                auto funcDecl = makeNode<FunctionDecl>();
-                if (check(TokenKind::Identifier)) {
-                    funcDecl->name = std::string(advance().stringValue);
+                auto funcDecl = parseExternFuncDecl(callingConv);
+                if (funcDecl) {
+                    block->declarations.push_back(std::move(funcDecl));
                 }
-                if (expect(TokenKind::LParen)) {
-                    funcDecl->params = parseParamList();
-                    expect(TokenKind::RParen);
-                }
-                if (match(TokenKind::Arrow)) {
-                    funcDecl->returnType = parseType();
-                }
-                Attribute attr;
-                attr.name = "_cdecl";
-                funcDecl->attributes.push_back(attr);
-                // 直接返回第一个函数（简化处理）
-                decl = std::move(funcDecl);
             }
             match(TokenKind::Semicolon);
         }
         expect(TokenKind::RBrace);
+        return block;
     }
+
+    // extern "C" func printf(...) -> i32 - 单个 extern 函数
+    if (check(TokenKind::KwFunc)) {
+        advance(); // skip 'func'
+        return parseExternFuncDecl(callingConv);
+    }
+
+    error("expected 'func' or '{' after extern");
+    return makeNode<FunctionDecl>();
+}
+
+FunctionParam Parser::parseExternParam() {
+    FunctionParam param;
+
+    // 参数名 / Parameter name
+    if (check(TokenKind::Identifier)) {
+        param.internalName = std::string(advance().stringValue);
+    } else if (check(TokenKind::KwInOut)) {
+        advance(); // skip 'inout'
+        param.isInOut = true;
+        if (check(TokenKind::Identifier)) {
+            param.internalName = std::string(advance().stringValue);
+        }
+    }
+
+    // 类型注解 / Type annotation
+    if (match(TokenKind::Colon)) {
+        param.type = parseType();
+    }
+
+    // 可变参数 / Variadic
+    if (match(TokenKind::Ellipsis)) {
+        param.isVariadic = true;
+    }
+
+    return param;
+}
+
+DeclPtr Parser::parseExternFuncDecl(const std::string& callingConv) {
+    auto decl = makeNode<FunctionDecl>();
+
+    // 函数名 / Function name
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected function name");
+        return decl;
+    }
+
+    // 参数列表 / Parameter list
+    if (expect(TokenKind::LParen)) {
+        while (!check(TokenKind::RParen) && !isAtEnd()) {
+            // 检查可变参数 ... / Check variadic ...
+            if (check(TokenKind::Ellipsis)) {
+                decl->isVariadic = true;
+                advance();
+                break;
+            }
+
+            auto param = parseExternParam();
+            decl->params.push_back(std::move(param));
+
+            if (!match(TokenKind::Comma)) break;
+        }
+        expect(TokenKind::RParen);
+    }
+
+    // 返回类型 / Return type
+    if (match(TokenKind::Arrow)) {
+        decl->returnType = parseType();
+    }
+
+    // 标记为 extern / Mark as extern
+    decl->isExtern = true;
+    decl->callingConvention = callingConv;
+    decl->externSymbolName = decl->name; // 默认符号名等于函数名
+
+    // 添加 @_cdecl 属性 / Add @_cdecl attribute
+    Attribute attr;
+    attr.name = "_cdecl";
+    decl->attributes.push_back(attr);
 
     return decl;
 }

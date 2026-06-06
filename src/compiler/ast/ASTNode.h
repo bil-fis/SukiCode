@@ -529,6 +529,7 @@ enum class DeclKind : uint8_t {
     Asm,            // asm("..." : outputs : inputs : clobbers)
     Attribute,
     Macro,          // @macro declaration
+    ExternBlock,    // extern "C" { ... }
     MacroExpansion, // #macroName(args) expansion
 };
 
@@ -618,8 +619,19 @@ struct FunctionDecl : Decl {
     bool isMutating = false;
     bool isOverride = false;
     bool isRequired = false;
+    bool isExtern = false;          // extern 声明（无函数体）
+    bool isVariadic = false;        // 可变参数 (...)
+    std::string callingConvention;  // 调用约定 ("C", "stdcall" 等)
+    std::string externSymbolName;   // 外部符号名（默认等于函数名）
     std::vector<StmtPtr> body;
     FunctionDecl() : Decl(DeclKind::Function) {}
+};
+
+// extern 块声明 / extern block declaration
+struct ExternBlockDecl : Decl {
+    std::string callingConvention; // "C", "ObjC", "stdcall" 等
+    std::vector<DeclPtr> declarations;
+    ExternBlockDecl() : Decl(DeclKind::ExternBlock) {}
 };
 
 // Struct/Class/Enum/Protocol/Actor common fields

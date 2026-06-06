@@ -68,8 +68,25 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
 
     // 预注册所有函数声明 / Pre-register all function declarations
     for (const auto& decl : cu.declarations) {
-        if (decl && decl->declKind == DeclKind::Function) {
-            auto& fd = static_cast<const FunctionDecl&>(*decl);
+        if (!decl) continue;
+
+        // 收集需要预注册的函数 / Collect functions to pre-register
+        std::vector<const FunctionDecl*> funcsToRegister;
+
+        if (decl->declKind == DeclKind::Function) {
+            funcsToRegister.push_back(static_cast<const FunctionDecl*>(decl.get()));
+        } else if (decl->declKind == DeclKind::ExternBlock) {
+            // extern 块中的函数也需要预注册
+            auto& eb = static_cast<const ExternBlockDecl&>(*decl);
+            for (const auto& d : eb.declarations) {
+                if (d && d->declKind == DeclKind::Function) {
+                    funcsToRegister.push_back(static_cast<const FunctionDecl*>(d.get()));
+                }
+            }
+        }
+
+        for (const auto& fdPtr : funcsToRegister) {
+            const auto& fd = *fdPtr;
 
             // 存储泛型函数 AST / Store generic function AST
             if (!fd.genericParams.empty()) {
@@ -108,6 +125,91 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
             }
             functions_[fd.name] = func;
         }
+    }
+
+    // 预声明 ObjC 运行时函数 / Pre-declare ObjC runtime functions
+    // 这些函数在链接时由 libobjc 提供
+    {
+        llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(context_);
+        llvm::Type* i32Ty = llvm::Type::getInt32Ty(context_);
+
+        // id objc_msgSend(id self, SEL _cmd, ...)
+        auto* objcMsgSendTy = llvm::FunctionType::get(ptrTy, {ptrTy, ptrTy}, true);
+        llvm::Function::Create(objcMsgSendTy, llvm::Function::ExternalLinkage,
+                               "objc_msgSend", module_.get());
+
+        // id objc_msgSend_stret(id self, SEL _cmd, ...)
+        auto* objcMsgSendStretTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, true);
+        llvm::Function::Create(objcMsgSendStretTy, llvm::Function::ExternalLinkage,
+                               "objc_msgSend_stret", module_.get());
+
+        // SEL sel_registerName(const char *str)
+        auto* selRegisterNameTy = llvm::FunctionType::get(ptrTy, {ptrTy}, false);
+        llvm::Function::Create(selRegisterNameTy, llvm::Function::ExternalLinkage,
+                               "sel_registerName", module_.get());
+
+        // Class objc_getClass(const char *name)
+        auto* objcGetClassTy = llvm::FunctionType::get(ptrTy, {ptrTy}, false);
+        llvm::Function::Create(objcGetClassTy, llvm::Function::ExternalLinkage,
+                               "objc_getClass", module_.get());
+
+        // Protocol *objc_getProtocol(const char *name)
+        auto* objcGetProtocolTy = llvm::FunctionType::get(ptrTy, {ptrTy}, false);
+        llvm::Function::Create(objcGetProtocolTy, llvm::Function::ExternalLinkage,
+                               "objc_getProtocol", module_.get());
+
+        // void objc_release(id obj)
+        auto* objcReleaseTy = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+        llvm::Function::Create(objcReleaseTy, llvm::Function::ExternalLinkage,
+                               "objc_release", module_.get());
+
+        // id objc_retain(id obj)
+        auto* objcRetainTy = llvm::FunctionType::get(ptrTy, {ptrTy}, false);
+        llvm::Function::Create(objcRetainTy, llvm::Function::ExternalLinkage,
+                               "objc_retain", module_.get());
+
+        // void objc_storeStrong(id *location, id obj)
+        auto* objcStoreStrongTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
+        llvm::Function::Create(objcStoreStrongTy, llvm::Function::ExternalLinkage,
+                               "objc_storeStrong", module_.get());
+
+        // id objc_loadWeakRetained(id *location)
+        auto* objcLoadWeakTy = llvm::FunctionType::get(ptrTy, {ptrTy}, false);
+        llvm::Function::Create(objcLoadWeakTy, llvm::Function::ExternalLinkage,
+                               "objc_loadWeakRetained", module_.get());
+
+        // void objc_initWeak(id *location, id obj)
+        auto* objcInitWeakTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
+        llvm::Function::Create(objcInitWeakTy, llvm::Function::ExternalLinkage,
+                               "objc_initWeak", module_.get());
+
+        // void objc_destroyWeak(id *location)
+        auto* objcDestroyWeakTy = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+        llvm::Function::Create(objcDestroyWeakTy, llvm::Function::ExternalLinkage,
+                               "objc_destroyWeak", module_.get());
+
+        // IMP class_getMethodImplementation(Class cls, SEL name)
+        auto* classGetMethodTy = llvm::FunctionType::get(ptrTy, {ptrTy, ptrTy}, false);
+        llvm::Function::Create(classGetMethodTy, llvm::Function::ExternalLinkage,
+                               "class_getMethodImplementation", module_.get());
+
+        // BOOL class_addMethod(Class cls, SEL name, IMP imp, const char *types)
+        auto* classAddMethodTy = llvm::FunctionType::get(
+            llvm::Type::getInt8Ty(context_), {ptrTy, ptrTy, ptrTy, ptrTy}, false);
+        llvm::Function::Create(classAddMethodTy, llvm::Function::ExternalLinkage,
+                               "class_addMethod", module_.get());
+
+        // Class objc_allocateClassPair(Class superclass, const char *name, size_t extraBytes)
+        auto* allocateClassTy = llvm::FunctionType::get(ptrTy, {ptrTy, ptrTy,
+            llvm::Type::getInt64Ty(context_)}, false);
+        llvm::Function::Create(allocateClassTy, llvm::Function::ExternalLinkage,
+                               "objc_allocateClassPair", module_.get());
+
+        // void objc_registerClassPair(Class cls)
+        auto* registerClassTy = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+        llvm::Function::Create(registerClassTy, llvm::Function::ExternalLinkage,
+                               "objc_registerClassPair", module_.get());
     }
 
     // 生成所有声明 / Generate all declarations
@@ -518,6 +620,14 @@ void IRGenerator::genDecl(const Decl& decl) {
                 asmDecl.hasSideEffects
             );
             builder_->CreateCall(inlineAsm);
+            break;
+        }
+        case DeclKind::ExternBlock: {
+            // extern 块：处理所有外部声明 / extern block: process all external declarations
+            auto& eb = static_cast<const ExternBlockDecl&>(decl);
+            for (const auto& d : eb.declarations) {
+                if (d) genDecl(*d);
+            }
             break;
         }
         case DeclKind::Macro:

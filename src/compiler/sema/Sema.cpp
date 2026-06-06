@@ -397,6 +397,14 @@ void Sema::processDecl(Decl& decl) {
             }
             break;
         }
+        case DeclKind::ExternBlock: {
+            // extern 块：处理所有外部声明 / extern block: process all external declarations
+            auto& eb = static_cast<ExternBlockDecl&>(decl);
+            for (auto& d : eb.declarations) {
+                if (d) processDecl(*d);
+            }
+            break;
+        }
         case DeclKind::Macro: {
             // 宏声明：注册宏名称到符号表 / Macro declaration: register macro name
             auto& macroDecl = static_cast<MacroDecl&>(decl);
