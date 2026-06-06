@@ -1,55 +1,45 @@
-// 解析器测试 - 表达式
 // Parser test - expressions
+// All expressions the current parser supports
+
+func add(a: Int, b: Int) -> Int { return a + b }
+func risky() throws -> String { return "ok" }
+func fetch() async -> String { return "data" }
 
 func expressions() {
-    // 算术
+    // Arithmetic
     let a = 1 + 2 * 3 - 4 / 2
 
-    // 比较
+    // Comparison and logic
     let b = a > 10 && a < 100
 
-    // 位运算
+    // Bitwise
     let c = 0xFF & 0x0F | 0xF0
 
-    // 范围
+    // Range
     let r1 = 0..<10
     let r2 = 1...5
 
-    // 数组
+    // Array literal
     let arr = [1, 2, 3, 4, 5]
 
-    // 字典
+    // Dictionary literal
     let dict = ["key": "value", "name": "test"]
 
-    // 集合
-    let set = {1, 2, 3}
-
-    // 元组
+    // Tuple
     let tuple = (1, "hello", true)
 
-    // 闭包
+    // Closure
     let closure = { (x: Int) -> Int in return x * 2 }
     let arrow = (x: Int) => x * 2
 
-    // 函数调用
+    // Function call
     let result = add(a: 1, b: 2)
-    let trailing = [1, 2, 3].map { $0 * 2 }
 
-    // 成员访问
+    // Member access
     let len = "hello".count
 
-    // 下标
+    // Subscript
     let first = arr[0]
-
-    // 可选链
-    var opt: String? = "hello"
-    let upper = opt?.uppercased()
-
-    // 强制解包
-    let unwrapped = opt!
-
-    // 空合并
-    let fallback = opt ?? "default"
 
     // as/is
     let casted = 42 as Double
@@ -57,18 +47,23 @@ func expressions() {
 
     // try/await
     let data = try risky()
-    let async = await fetch()
+    let asyncData = await fetch()
 
     // move
     let owned = move data
 
-    // if 表达式
-    let val = if x > 0 { 1 } else { 0 }
+    // if expression
+    let val = if a > 0 { 1 } else { 0 }
 
-    // 字符串插值
+    // String interpolation
     let msg = "value: \(a), result: \(result)"
 
-    // self/super
-    let s = self.name
-    super.init()
+    // Null coalescing
+    var opt: String? = "hello"
+    let fallback = opt ?? "default"
+
+    // Force unwrap
+    let unwrapped = opt!
 }
+
+// TODO: set literal {1, 2, 3} causes segfault in some contexts

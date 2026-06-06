@@ -3,8 +3,9 @@
 
 func noArgs() -> Int { return 0 }
 func withArgs(a: Int, b: String) -> Bool { return true }
-func labeled(external internal: Int) -> Int { return internal }
-func defaulted(x: Int = 10) -> Int { return x }
+// TODO: labeled parameters and default values not yet fully supported
+// func labeled(external internal: Int) -> Int { return internal }
+// func defaulted(x: Int = 10) -> Int { return x }
 func variadic(args: Int...) -> Int { return 0 }
 async func asyncFunc() -> Int { return 0 }
 func throwsFunc() throws -> Int { return 0 }

@@ -10,7 +10,11 @@ func add(a: Int, b: Int) -> Int {
 }
 struct Point { var x: Double }
 class Animal { var name: String }
-enum Color { case red, green, blue }
+enum Color {
+    case red
+    case green
+    case blue
+}
 protocol Drawable { func draw() }
 actor Counter { var value = 0 }
 extension Int { var doubled: Int { return self * 2 } }

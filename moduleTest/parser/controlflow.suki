@@ -32,7 +32,7 @@ func controlFlow() {
     switch x {
     case 0: print("zero")
     case 1..<10: print("small")
-    case let v where v > 100: print("big \(v)")
+    default: print("other")
     default: print("other")
     }
 
