@@ -698,8 +698,21 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             auto& oc = static_cast<const OptionalChainExpr&>(expr);
             return genExpr(*oc.subExpr); // 简化
         }
+        case ExprKind::Subscript: {
+            auto& sub = static_cast<const SubscriptExpr&>(expr);
+            llvm::Value* base = genExpr(*sub.base);
+            if (!base || sub.indices.empty()) return nullptr;
+            llvm::Value* index = genExpr(*sub.indices[0]);
+            if (!index) return nullptr;
+            // 简化：计算指针偏移 / Simplified: compute pointer offset
+            return builder_->CreateGEP(llvm::Type::getInt8Ty(context_), base, index, "idx");
+        }
         case ExprKind::Closure:
             return nullptr; // TODO: 闭包代码生成
+        case ExprKind::CharLiteral: {
+            auto& ch = static_cast<const CharLiteralExpr&>(expr);
+            return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), ch.value);
+        }
         case ExprKind::Assignment: {
             auto& ae = static_cast<const AssignmentExpr&>(expr);
             llvm::Value* val = genExpr(*ae.value);
