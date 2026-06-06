@@ -44,6 +44,13 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
   - Self 返回当前处理的类型
   - 闭包变量捕获和返回类型
   - for-in 数组迭代、可选链、强制解包、类型检查
+  - 计算属性 getter/setter、属性观察器 willSet/didSet
+  - subscript 代码生成、deinit 代码生成
+  - vtable 方法调度、inout 参数指针传递
+  - try?/try! 代码生成、?? nil 合并运算符
+  - 泛型类型单态化、async/await 协程帧
+  - select 语句、泛型 where 子句、-O 优化级别
+  - 访问控制链接类型
 - **语义检查**: 协议符合性、switch 穷举性、修饰符传播、let/var 可变性
 - **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList
 - **系统库**: MemoryLayout、DynamicLibrary、SystemInfo、Process、File、Path、Date/Timer、sys 模块
