@@ -20,6 +20,7 @@ enum class TypeKind : uint8_t {
     Array, Dictionary, Set, Optional, Tuple, Function,
     Struct, Class, Enum, Protocol, Actor,
     Any, AnyObject, Self, Owned, Unresolved, Error,
+    UnsafePointer, UnsafeMutablePointer, UnsafeBufferPointer,
 };
 
 class Type {
@@ -294,6 +295,33 @@ public:
     std::string name() const override { return "<error>"; }
     size_t sizeInBytes() const override { return 0; }
     size_t alignment() const override { return 0; }
+};
+
+// 不安全指针类型 / Unsafe pointer types
+class UnsafePointerType : public Type {
+public:
+    explicit UnsafePointerType(TypePtr pointee)
+        : Type(TypeKind::UnsafePointer), pointee_(std::move(pointee)) {}
+    std::string name() const override { return "UnsafePointer<" + pointee_->name() + ">"; }
+    TypePtr pointeeType() const { return pointee_; }
+    bool isReferenceType() const override { return true; } // 指针是引用类型
+    size_t sizeInBytes() const override { return sizeof(void*); }
+    size_t alignment() const override { return sizeof(void*); }
+private:
+    TypePtr pointee_;
+};
+
+class UnsafeMutablePointerType : public Type {
+public:
+    explicit UnsafeMutablePointerType(TypePtr pointee)
+        : Type(TypeKind::UnsafeMutablePointer), pointee_(std::move(pointee)) {}
+    std::string name() const override { return "UnsafeMutablePointer<" + pointee_->name() + ">"; }
+    TypePtr pointeeType() const { return pointee_; }
+    bool isReferenceType() const override { return true; }
+    size_t sizeInBytes() const override { return sizeof(void*); }
+    size_t alignment() const override { return sizeof(void*); }
+private:
+    TypePtr pointee_;
 };
 
 // 类型工厂 / Type factories

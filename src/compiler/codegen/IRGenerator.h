@@ -149,6 +149,14 @@ private:
     };
     std::unordered_map<std::string, VTableInfo> vtables_;
 
+    // Actor executor 注册 / Actor executor registry
+    struct ActorInfo {
+        llvm::StructType* type = nullptr;
+        llvm::Function* executorFunc = nullptr; // 序列化执行器
+        std::unordered_map<std::string, llvm::Function*> methods;
+    };
+    std::unordered_map<std::string, ActorInfo> actors_;
+
     // 泛型类型单态化 / Generic type monomorphization
     // 记录泛型类型的特化版本: "Stack<Int>" -> LLVM struct type
     std::unordered_map<std::string, llvm::StructType*> genericTypeInstances_;

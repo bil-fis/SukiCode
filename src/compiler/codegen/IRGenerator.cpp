@@ -378,6 +378,34 @@ void IRGenerator::genDecl(const Decl& decl) {
             currentTypeNameForDeinit_ = prevDeinitType;
             break;
         }
+        case DeclKind::Actor: {
+            // Actor 生成：类似 Class，但添加 executor 序列化
+            auto& ad = static_cast<const ActorDecl&>(decl);
+            llvm::StructType* actorType = llvm::StructType::create(context_, ad.name);
+            std::vector<llvm::Type*> fieldTypes;
+            fieldTypes.push_back(llvm::PointerType::get(context_, 0)); // executor
+            for (const auto& member : ad.members) {
+                if (member && member->declKind == DeclKind::Variable) {
+                    auto& vd = static_cast<const VariableDecl&>(*member);
+                    fieldTypes.push_back(resolveType(vd.typeAnnotation.get()));
+                }
+            }
+            actorType->setBody(fieldTypes);
+            structTypes_[ad.name] = actorType;
+
+            // 注册 Actor 信息 / Register Actor info
+            ActorInfo actorInfo;
+            actorInfo.type = actorType;
+            for (const auto& member : ad.members) {
+                if (member && member->declKind == DeclKind::Function) {
+                    auto& fd = static_cast<const FunctionDecl&>(*member);
+                    std::string methodName = ad.name + "." + fd.name;
+                    actorInfo.methods[fd.name] = module_->getFunction(methodName);
+                }
+            }
+            actors_[ad.name] = actorInfo;
+            break;
+        }
         case DeclKind::Enum: {
             auto& ed = static_cast<const EnumDecl&>(decl);
             // Enum 生成 tagged union 类型
@@ -1469,32 +1497,83 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
         case ExprKind::Try: {
             auto& te = static_cast<const TryExpr&>(expr);
             if (te.isOptional) {
-                // try? expr: 捕获错误返回 nil / catch error and return nil
-                llvm::Value* val = genExpr(*te.subExpr);
-                if (!val) return nullptr;
-                // 简化实现：直接返回值（完整实现需要 setjmp/longjmp 包装）
-                // Simplified: return value directly (full impl needs setjmp/longjmp wrapper)
-                if (val->getType()->isPointerTy()) {
-                    return val;
+                // try? expr: 使用 setjmp/longjmp 捕获错误返回 nil
+                // Use setjmp/longjmp to catch errors and return nil
+                llvm::Function* setjmpFunc = module_->getFunction("setjmp");
+                if (!setjmpFunc) {
+                    llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+                    llvm::FunctionType* setjmpTy = llvm::FunctionType::get(
+                        llvm::Type::getInt32Ty(context_), {ptrTy}, false);
+                    setjmpFunc = llvm::Function::Create(setjmpTy, llvm::Function::ExternalLinkage,
+                                                        "setjmp", module_.get());
                 }
-                // 对于非指针类型，返回值
-                return val;
+                llvm::AllocaInst* jmpBuf = builder_->CreateAlloca(
+                    llvm::Type::getInt8Ty(context_),
+                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 256), "try.jmpbuf");
+                llvm::Value* jmpResult = builder_->CreateCall(setjmpFunc, {jmpBuf}, "try.setjmp");
+                llvm::Value* isThrow = builder_->CreateICmpNE(jmpResult,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0), "try.is_throw");
+
+                llvm::Function* func = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* tryBB = llvm::BasicBlock::Create(context_, "try.body", func);
+                llvm::BasicBlock* catchBB = llvm::BasicBlock::Create(context_, "try.catch", func);
+                llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "try.merge", func);
+
+                builder_->CreateCondBr(isThrow, catchBB, tryBB);
+
+                // Try 块 / Try block
+                builder_->SetInsertPoint(tryBB);
+                catchStack_.push_back(jmpBuf);
+                llvm::Value* val = genExpr(*te.subExpr);
+                catchStack_.pop_back();
+                if (val) {
+                    builder_->CreateBr(mergeBB);
+                }
+                llvm::BasicBlock* tryEndBB = builder_->GetInsertBlock();
+
+                // Catch 块：返回 nil / Catch block: return nil
+                builder_->SetInsertPoint(catchBB);
+                llvm::Value* nilVal = val && val->getType()->isPointerTy() ?
+                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)) :
+                    llvm::Constant::getNullValue(val ? val->getType() : llvm::Type::getInt64Ty(context_));
+                builder_->CreateBr(mergeBB);
+                llvm::BasicBlock* catchEndBB = builder_->GetInsertBlock();
+
+                // Merge 块 / Merge block
+                builder_->SetInsertPoint(mergeBB);
+                llvm::Type* resultType = val ? val->getType() : llvm::Type::getInt64Ty(context_);
+                llvm::PHINode* phi = builder_->CreatePHI(resultType, 2, "try.result");
+                if (val) phi->addIncoming(val, tryEndBB);
+                phi->addIncoming(nilVal, catchEndBB);
+                return phi;
             } else if (te.isForce) {
-                // try! expr: 出错时 abort / abort on error
-                llvm::Value* val = genExpr(*te.subExpr);
-                if (!val) {
-                    // 生成 abort 调用 / Generate abort call
-                    llvm::Function* abortFunc = module_->getFunction("abort");
-                    if (!abortFunc) {
-                        llvm::FunctionType* abortTy = llvm::FunctionType::get(
-                            llvm::Type::getVoidTy(context_), false);
-                        abortFunc = llvm::Function::Create(abortTy, llvm::Function::ExternalLinkage,
-                                                           "abort", module_.get());
-                    }
-                    builder_->CreateCall(abortFunc);
-                    builder_->CreateUnreachable();
-                    return nullptr;
+                // try! expr: 使用 setjmp/longjmp 捕获错误调用 abort
+                llvm::Function* setjmpFunc = module_->getFunction("setjmp");
+                if (!setjmpFunc) {
+                    llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+                    llvm::FunctionType* setjmpTy = llvm::FunctionType::get(
+                        llvm::Type::getInt32Ty(context_), {ptrTy}, false);
+                    setjmpFunc = llvm::Function::Create(setjmpTy, llvm::Function::ExternalLinkage,
+                                                        "setjmp", module_.get());
                 }
+                llvm::AllocaInst* jmpBuf = builder_->CreateAlloca(
+                    llvm::Type::getInt8Ty(context_),
+                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 256), "try.jmpbuf");
+                llvm::Value* jmpResult = builder_->CreateCall(setjmpFunc, {jmpBuf}, "try.setjmp");
+                llvm::Value* isThrow = builder_->CreateICmpNE(jmpResult,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0), "try.is_throw");
+
+                llvm::Function* func = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* tryBB = llvm::BasicBlock::Create(context_, "try.body", func);
+                llvm::BasicBlock* catchBB = llvm::BasicBlock::Create(context_, "try.catch", func);
+
+                builder_->CreateCondBr(isThrow, catchBB, tryBB);
+
+                // Try 块 / Try block
+                builder_->SetInsertPoint(tryBB);
+                catchStack_.push_back(jmpBuf);
+                llvm::Value* val = genExpr(*te.subExpr);
+                catchStack_.pop_back();
                 return val;
             } else {
                 // 普通 try / Regular try
