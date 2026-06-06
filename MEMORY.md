@@ -37,12 +37,21 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 
 ## 项目状态 (2026-06-06)
 - **编译器前端**: 词法分析、语法分析、语义分析完整实现
-- **代码生成**: LLVM IR 生成支持所有主要特性（结构体、类、枚举、泛型单态化、异常处理、闭包变量捕获、闭包返回类型、for-in 循环、可选链、强制解包、类型检查等）
-- **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList 等完整实现
-- **系统库**: MemoryLayout、DynamicLibrary、SystemInfo（OS/Hardware）、Process、File、Path、Date/Timer
-- **加密库**: SHA256、MD5、HMAC-SHA256、AES-128 ECB、ChaCha20 完整实现
-- **数据编码**: Base64、Hex、GZip、Zlib 压缩
-- **网络库**: URL（含百分号编码）、JSON（含科学计数法和Unicode转义）、Socket（TCP/UDP）
+- **代码生成**: LLVM IR 生成支持所有主要特性
+  - Optional 使用 {value, hasValue} 标记结构体
+  - Enum 根据 associated values 计算 payload 大小
+  - super 实现父类类型查找
+  - Self 返回当前处理的类型
+  - 闭包变量捕获和返回类型
+  - for-in 数组迭代、可选链、强制解包、类型检查
+- **语义检查**: 协议符合性、switch 穷举性、修饰符传播、let/var 可变性
+- **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList
+- **系统库**: MemoryLayout、DynamicLibrary、SystemInfo、Process、File、Path、Date/Timer、sys 模块
+- **并发库**: ThreadPool、DispatchQueue、Channel、Atomic、Mutex/RWLock/Semaphore
+- **加密库**: SHA256、MD5、HMAC-SHA256、AES-128 ECB、ChaCha20、RSA、Ed25519
+- **数据编码**: Base64、Hex、GZip、Zlib、XML、CSV、MessagePack
+- **网络库**: URL、JSON、Socket（TCP/UDP）、URLSession HTTP 客户端
+- **国际化**: LocalizedString、NumberFormatter、CurrencyFormatter、DateFormatter
 - **测试**: 20/20 测试全部通过
 - **TODO**: 0 个待办事项
 - **死代码**: 已清理 Scope.h/cpp、TypeConverter.h/cpp、StringInterner.h/cpp
