@@ -272,6 +272,7 @@ int main(int argc, char* argv[]) {
 
     std::string moduleName = fs::path(opts.inputFile).stem().string();
     suki::IRGenerator codegen(diag, moduleName);
+    codegen.setEmitDebugInfo(opts.debugInfo);
 
     if (!codegen.generate(*ast)) {
         diag.printAll(source, opts.inputFile);

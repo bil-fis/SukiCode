@@ -29,8 +29,40 @@ IRGenerator::IRGenerator(DiagnosticEngine& diag, const std::string& moduleName)
 
 IRGenerator::~IRGenerator() = default;
 
+#ifdef SUKI_HAS_LLVM
+void IRGenerator::initDebugInfo(const std::string& filename) {
+    if (!emitDebugInfo_) return;
+
+    diBuilder_ = std::make_unique<llvm::DIBuilder>(*module_);
+
+    // 创建编译单元 / Create compile unit
+    diFile_ = diBuilder_->createFile(filename, ".");
+    diCompileUnit_ = diBuilder_->createCompileUnit(
+        llvm::dwarf::DW_LANG_C_plus_plus, // 使用 C++ 语言标识
+        diFile_,
+        "SukiCode Compiler",
+        false, // isOptimized
+        "",    // flags
+        0      // runtime version
+    );
+
+    // 设置模块调试标志
+    module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                           llvm::DEBUG_METADATA_VERSION);
+    module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+}
+
+void IRGenerator::finalizeDebugInfo() {
+    if (!emitDebugInfo_ || !diBuilder_) return;
+    diBuilder_->finalize();
+}
+#endif
+
 bool IRGenerator::generate(const CompilationUnit& cu) {
 #ifdef SUKI_HAS_LLVM
+    // 初始化调试信息 / Initialize debug info
+    initDebugInfo(cu.filename);
+
     // 预注册所有函数声明 / Pre-register all function declarations
     for (const auto& decl : cu.declarations) {
         if (decl && decl->declKind == DeclKind::Function) {
@@ -81,6 +113,10 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
         diag_.error({}, moduleName_, "LLVM module verification failed: " + err);
         return false;
     }
+
+    // 完成调试信息 / Finalize debug info
+    finalizeDebugInfo();
+
     return !diag_.hadErrors();
 #else
     diag_.error({}, moduleName_, "LLVM not available");

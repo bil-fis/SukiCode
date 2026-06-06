@@ -9,6 +9,8 @@
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #endif
 
 #include "compiler/ast/ASTNode.h"
@@ -25,6 +27,9 @@ class IRGenerator {
 public:
     IRGenerator(DiagnosticEngine& diag, const std::string& moduleName);
     ~IRGenerator();
+
+    // 启用调试信息生成 / Enable debug info generation
+    void setEmitDebugInfo(bool emit) { emitDebugInfo_ = emit; }
 
     bool generate(const CompilationUnit& cu);
     std::string getIRString() const;
@@ -88,6 +93,14 @@ private:
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> builder_;
     TypeConverter typeConverter_;
+
+    // 调试信息 / Debug info
+    std::unique_ptr<llvm::DIBuilder> diBuilder_;
+    llvm::DICompileUnit* diCompileUnit_ = nullptr;
+    llvm::DIFile* diFile_ = nullptr;
+    bool emitDebugInfo_ = false;
+    void initDebugInfo(const std::string& filename);
+    void finalizeDebugInfo();
 
     llvm::Function* currentFunc_ = nullptr;
 
