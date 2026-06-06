@@ -120,6 +120,9 @@ private:
     int awaitPointCount_ = 0;
     llvm::Value* coroutineState_ = nullptr;
 
+    // 闭包计数器 / Closure counter
+    int nextClosureId_ = 0;
+
     // 控制流块 / Control flow blocks (for break/continue)
     struct LoopInfo {
         llvm::BasicBlock* condBlock;

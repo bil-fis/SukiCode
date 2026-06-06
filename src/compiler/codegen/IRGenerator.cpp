@@ -224,6 +224,27 @@ void IRGenerator::genDecl(const Decl& decl) {
         case DeclKind::If:
             genIfStmt(static_cast<const IfDecl&>(decl));
             break;
+        case DeclKind::Guard: {
+            // Guard: if condition is false, execute else body (which must exit)
+            auto& guard = static_cast<const GuardDecl&>(decl);
+            llvm::Value* cond = genExpr(*guard.condition);
+            if (!cond) break;
+            if (!cond->getType()->isIntegerTy(1)) {
+                cond = builder_->CreateICmpNE(cond, llvm::ConstantInt::get(cond->getType(), 0), "tobool");
+            }
+            llvm::Function* func = builder_->GetInsertBlock()->getParent();
+            llvm::BasicBlock* elseBB = llvm::BasicBlock::Create(context_, "guard.else", func);
+            llvm::BasicBlock* contBB = llvm::BasicBlock::Create(context_, "guard.cont", func);
+            builder_->CreateCondBr(cond, contBB, elseBB);
+            builder_->SetInsertPoint(elseBB);
+            for (const auto& s : guard.elseBody) { if (s) genStmt(*s); }
+            // Guard else body must exit (return/break/continue)
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                builder_->CreateBr(contBB); // fallback
+            }
+            builder_->SetInsertPoint(contBB);
+            break;
+        }
         case DeclKind::While:
             genWhileStmt(static_cast<const WhileDecl&>(decl));
             break;
@@ -707,8 +728,65 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             // 简化：计算指针偏移 / Simplified: compute pointer offset
             return builder_->CreateGEP(llvm::Type::getInt8Ty(context_), base, index, "idx");
         }
-        case ExprKind::Closure:
-            return nullptr; // TODO: 闭包代码生成
+        case ExprKind::Closure: {
+            // 闭包简化实现：生成匿名函数
+            // Simplified closure: generate anonymous function
+            auto& closure = static_cast<const ClosureExpr&>(expr);
+            std::string funcName = "__closure_" + std::to_string(nextClosureId_++);
+
+            // 创建函数类型
+            std::vector<llvm::Type*> paramTypes;
+            for (const auto& p : closure.params) {
+                paramTypes.push_back(llvm::Type::getInt64Ty(context_)); // 简化
+            }
+            llvm::Type* retType = llvm::Type::getVoidTy(context_);
+            llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
+            llvm::Function* func = llvm::Function::Create(
+                funcType, llvm::Function::InternalLinkage, funcName, module_.get());
+
+            // 生成函数体
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", func);
+            builder_->SetInsertPoint(entry);
+
+            // 保存当前上下文
+            auto savedValues = namedValues_;
+            auto savedTypes = namedTypes_;
+            llvm::Function* savedFunc = currentFunc_;
+            currentFunc_ = func;
+
+            // 设置参数
+            namedValues_.clear();
+            namedTypes_.clear();
+            size_t idx = 0;
+            for (auto& arg : func->args()) {
+                if (idx < closure.params.size()) {
+                    arg.setName(closure.params[idx].name);
+                    llvm::AllocaInst* alloca = createEntryBlockAlloca(func, arg.getType(), closure.params[idx].name);
+                    builder_->CreateStore(&arg, alloca);
+                    namedValues_[closure.params[idx].name] = alloca;
+                    namedTypes_[closure.params[idx].name] = arg.getType();
+                }
+                idx++;
+            }
+
+            // 生成闭包体
+            for (const auto& stmt : closure.body) {
+                if (stmt) genStmt(*stmt);
+            }
+
+            // 添加返回
+            if (!builder_->GetInsertBlock()->getTerminator()) {
+                builder_->CreateRetVoid();
+            }
+
+            // 恢复上下文
+            currentFunc_ = savedFunc;
+            namedValues_ = savedValues;
+            namedTypes_ = savedTypes;
+            builder_->SetInsertPoint(&currentFunc_->back());
+
+            return func;
+        }
         case ExprKind::CharLiteral: {
             auto& ch = static_cast<const CharLiteralExpr&>(expr);
             return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), ch.value);
