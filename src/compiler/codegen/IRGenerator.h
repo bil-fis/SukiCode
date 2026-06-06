@@ -115,6 +115,11 @@ private:
     std::unordered_map<std::string, const FunctionDecl*> genericFuncAsts_;
     const CompilationUnit* currentCu_ = nullptr;
 
+    // 协程状态 / Coroutine state
+    bool isInAsyncFunc_ = false;
+    int awaitPointCount_ = 0;
+    llvm::Value* coroutineState_ = nullptr;
+
     // 控制流块 / Control flow blocks (for break/continue)
     struct LoopInfo {
         llvm::BasicBlock* condBlock;

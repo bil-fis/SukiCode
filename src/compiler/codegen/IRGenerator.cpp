@@ -281,7 +281,10 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
     builder_->SetInsertPoint(entry);
 
     llvm::Function* prevFunc = currentFunc_;
+    bool prevAsync = isInAsyncFunc_;
     currentFunc_ = func;
+    isInAsyncFunc_ = decl.isAsync;
+    awaitPointCount_ = 0;
     namedValues_.clear();
     namedTypes_.clear();
 
@@ -313,6 +316,7 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
 
     llvm::verifyFunction(*func);
     currentFunc_ = prevFunc;
+    isInAsyncFunc_ = prevAsync;
     return func;
 }
 
