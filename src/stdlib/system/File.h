@@ -7,6 +7,9 @@
 #include <fstream>
 #include <sstream>
 #include <cstdint>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace suki::stdlib {
 
@@ -160,7 +163,13 @@ public:
     // 列出目录内容 / List directory
     static std::vector<std::string> contentsOfDirectory(const std::string& path) {
         std::vector<std::string> entries;
-        // TODO: 实际实现
+        try {
+            for (const auto& entry : fs::directory_iterator(path)) {
+                entries.push_back(entry.path().filename().string());
+            }
+        } catch (...) {
+            // Directory not found or permission error
+        }
         return entries;
     }
 };

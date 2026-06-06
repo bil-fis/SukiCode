@@ -5,6 +5,8 @@
 #include <ctime>
 #include <string>
 #include <chrono>
+#include <thread>
+#include <functional>
 
 namespace suki::stdlib {
 
@@ -106,16 +108,20 @@ public:
 
     // 一次性定时器 / One-shot timer
     static void scheduleAfter(TimeInterval delay, Callback callback) {
-        // TODO: 实际实现（需要线程）
-        // std::thread([delay, callback]() {
-        //     std::this_thread::sleep_for(std::chrono::milliseconds((int)delay.milliseconds()));
-        //     callback();
-        // }).detach();
+        std::thread([delay, callback]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds((int)delay.milliseconds()));
+            callback();
+        }).detach();
     }
 
     // 重复定时器 / Repeating timer
     static void scheduleRepeating(TimeInterval interval, Callback callback) {
-        // TODO: 实际实现
+        std::thread([interval, callback]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::milliseconds((int)interval.milliseconds()));
+                callback();
+            }
+        }).detach();
     }
 };
 

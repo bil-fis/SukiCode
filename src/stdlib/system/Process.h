@@ -69,8 +69,30 @@ public:
 
     // 获取命令行参数 / Get command line arguments
     static std::vector<std::string> arguments() {
-        // TODO: 实际实现
-        return {};
+        std::vector<std::string> args;
+#ifdef _WIN32
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            for (int i = 0; i < argc; i++) {
+                char buffer[1024];
+                WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, buffer, sizeof(buffer), nullptr, nullptr);
+                args.push_back(buffer);
+            }
+            LocalFree(argv);
+        }
+#else
+        // On Unix, read /proc/self/cmdline or use argc/argv passed to main
+        // For now, read from /proc/self/cmdline
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        if (cmdline.is_open()) {
+            std::string arg;
+            while (std::getline(cmdline, arg, '\0')) {
+                if (!arg.empty()) args.push_back(arg);
+            }
+        }
+#endif
+        return args;
     }
 };
 
