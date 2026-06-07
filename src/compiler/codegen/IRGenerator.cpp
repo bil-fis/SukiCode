@@ -1833,21 +1833,16 @@ void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
     // Catch 块 / Catch block
     builder_->SetInsertPoint(catchBB);
 
-    // 从线程局部变量加载错误值 / Load error value from thread-local variable
-    llvm::GlobalVariable* errorGlobal = module_->getGlobalVariable("__suki_thrown_error");
-    if (!errorGlobal) {
-        errorGlobal = new llvm::GlobalVariable(*module_,
-            llvm::PointerType::get(context_, 0), false,
-            llvm::GlobalValue::InternalLinkage,
-            llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
-            "__suki_thrown_error");
-        errorGlobal->setThreadLocal(true);
+    // 从错误栈弹出错误值 / Pop error value from error stack
+    llvm::Function* popErrorFunc = module_->getFunction("suki_pop_error");
+    if (!popErrorFunc) {
+        llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+        llvm::FunctionType* popErrorTy = llvm::FunctionType::get(
+            ptrTy, {}, false);
+        popErrorFunc = llvm::Function::Create(popErrorTy,
+            llvm::Function::ExternalLinkage, "suki_pop_error", module_.get());
     }
-    llvm::Value* thrownError = builder_->CreateLoad(
-        llvm::PointerType::get(context_, 0), errorGlobal, "thrown.error");
-    // 清除错误值 / Clear error value
-    builder_->CreateStore(
-        llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), errorGlobal);
+    llvm::Value* thrownError = builder_->CreateCall(popErrorFunc, {}, "thrown.error");
 
     // 生成 catch 块体 / Generate catch block body
     for (const auto& catchClause : decl.catches) {
@@ -1873,26 +1868,22 @@ void IRGenerator::genThrowStmt(const ThrowDecl& decl) {
         errorVal = genExpr(*decl.value);
     }
 
-    // 存储错误值到线程局部变量（供 catch 块使用）
-    // Store error value to thread-local variable (for catch block to use)
-    // 使用 thread_local 保证线程安全
+    // 存储错误值到线程局部错误栈（支持嵌套 throw）
+    // Store error value to thread-local error stack (supports nested throws)
     if (errorVal) {
-        llvm::GlobalVariable* errorGlobal = module_->getGlobalVariable("__suki_thrown_error");
-        if (!errorGlobal) {
-            // 使用 thread_local 存储 / Use thread_local storage
-            errorGlobal = new llvm::GlobalVariable(*module_,
-                llvm::PointerType::get(context_, 0), false,
-                llvm::GlobalValue::InternalLinkage,
-                llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
-                "__suki_thrown_error");
-            errorGlobal->setThreadLocal(true); // thread_local
+        llvm::Function* pushErrorFunc = module_->getFunction("suki_push_error");
+        if (!pushErrorFunc) {
+            llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+            llvm::FunctionType* pushErrorTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(context_), {ptrTy}, false);
+            pushErrorFunc = llvm::Function::Create(pushErrorTy,
+                llvm::Function::ExternalLinkage, "suki_push_error", module_.get());
         }
-        if (errorVal->getType()->isPointerTy()) {
-            builder_->CreateStore(errorVal, errorGlobal);
-        } else {
-            llvm::Value* ptr = builder_->CreateIntToPtr(errorVal, llvm::PointerType::get(context_, 0));
-            builder_->CreateStore(ptr, errorGlobal);
+        llvm::Value* ptr = errorVal;
+        if (!errorVal->getType()->isPointerTy()) {
+            ptr = builder_->CreateIntToPtr(errorVal, llvm::PointerType::get(context_, 0));
         }
+        builder_->CreateCall(pushErrorFunc, {ptr});
     }
 
     // 如果有活跃的 catch 块，使用 longjmp 跳转
@@ -2061,8 +2052,17 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                     coroSuspendFunc, {saveToken, llvm::ConstantInt::getFalse(context_)}, "coro.suspend.result");
 
                 // 根据结果跳转 / Branch based on result
+                // case 0: resume - 继续执行
+                // case 1: destroy - 销毁协程
+                // case 2: suspend - 挂起（默认）
                 llvm::SwitchInst* suspendSwitch = builder_->CreateSwitch(suspendResult, suspendBB, 3);
                 suspendSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 0), resumeBB);
+
+                // 挂起块：返回调用者 / Suspend block: return to caller
+                builder_->SetInsertPoint(suspendBB);
+                // 挂起时返回 null 指针表示协程已挂起
+                builder_->CreateRet(llvm::ConstantPointerNull::get(
+                    llvm::PointerType::get(context_, 0)));
 
                 // 恢复块 / Resume block
                 builder_->SetInsertPoint(resumeBB);

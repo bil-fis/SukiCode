@@ -103,6 +103,12 @@ public:
         return !queue_.empty();
     }
 
+    // C 兼容的就绪检查 / C-compatible readiness check
+    int hasDataC() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty() ? 0 : 1;
+    }
+
     // 检查通道是否已关闭 / Check if channel is closed
     bool isClosed() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -145,17 +151,24 @@ private:
 } // namespace suki::runtime
 
 // C 兼容的 channel 就绪检查函数 / C-compatible channel readiness check
-// Channel 对象的前 8 字节是 shared_ptr 的指针，
-// 接下来 8 字节是 count (size_t)
-// 实际布局: { shared_ptr<...> data_, ... } -> data_ 指针在偏移 0
-// 我们检查 channel 是否非空，并假设 channel 内部有数据
-// 完整实现需要 SukiCode 运行时类型信息
+// 使用 Channel 对象的 hasDataC 方法
+// 由于 Channel 是模板类，我们无法直接从 C 调用其方法
+// 因此使用函数指针回调机制
+typedef int (*ChannelHasDataFunc)(void*);
+
+// 全局函数指针，由 Channel 实例在创建时设置
+// Global function pointer, set by Channel instance on creation
+static ChannelHasDataFunc g_channelHasDataFunc = nullptr;
+
+extern "C" inline void suki_set_channel_has_data_func(ChannelHasDataFunc func) {
+    g_channelHasDataFunc = func;
+}
+
 extern "C" inline bool suki_channel_has_data(void* channel) {
     if (!channel) return false;
-    // 检查 channel 指针有效性 / Check channel pointer validity
-    // Channel 对象的第一个字段是 shared_ptr，检查其 use_count > 0
-    // 简化：检查指针非空且可读
-    volatile char probe = *static_cast<volatile char*>(channel);
-    (void)probe;
-    return true;
+    if (g_channelHasDataFunc) {
+        return g_channelHasDataFunc(channel) != 0;
+    }
+    // 回退：检查指针有效性 / Fallback: check pointer validity
+    return channel != nullptr;
 }
