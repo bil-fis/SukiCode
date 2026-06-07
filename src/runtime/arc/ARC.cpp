@@ -56,6 +56,21 @@ void weakRelease(void* obj) {
     header->weakRefCount.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void setDestructor(void* obj, void (*destructor)(void*)) {
+    if (!obj) return;
+    auto* header = reinterpret_cast<ARCHeader*>(obj);
+    header->destructor = destructor;
+}
+
+void* arcAlloc(size_t size, void (*destructor)(void*)) {
+    // 分配内存：ARCHeader + 用户数据
+    void* mem = ::operator new(sizeof(ARCHeader) + size);
+    auto* header = new (mem) ARCHeader();
+    header->destructor = destructor;
+    // 返回 ARCHeader 之后的地址
+    return reinterpret_cast<char*>(mem) + sizeof(ARCHeader);
+}
+
 // ─── AutoreleasePool ────────────────────────────────────────────────────
 
 struct AutoreleasePool::Impl {

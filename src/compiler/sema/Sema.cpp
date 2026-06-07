@@ -693,14 +693,21 @@ void Sema::processClassDecl(ClassDecl& decl) {
             // convenience init 检查 / convenience init checking
             if (id.isConvenience) {
                 // convenience init 必须调用 self.init
-                // 简化实现：检查 body 中是否有 self 或 super 调用
-                bool callsInit = false;
+                bool callsSelfInit = false;
+                // 检查 body 中是否有 self.init 或 super.init 调用
                 for (const auto& stmt : id.body) {
-                    // 简化检查：只要有语句就算通过
-                    if (stmt) callsInit = true;
+                    if (!stmt) continue;
+                    // 递归检查表达式中是否有 init 调用
+                    // 简化：检查是否有任何函数调用
+                    if (stmt->stmtKind == StmtKind::Expression) {
+                        auto& es = static_cast<const ExpressionStmt&>(*stmt);
+                        if (es.expression && es.expression->exprKind == ExprKind::Call) {
+                            callsSelfInit = true;
+                        }
+                    }
                 }
-                if (!callsInit && !id.body.empty()) {
-                    warning(id.loc, "convenience init should delegate to another init");
+                if (!callsSelfInit && !id.body.empty()) {
+                    warning(id.loc, "convenience init should delegate to another init via self.init()");
                 }
             }
         }
@@ -708,6 +715,46 @@ void Sema::processClassDecl(ClassDecl& decl) {
         processDecl(*m);
     }
     symbols_.leaveScope();
+
+    // 检查父类的 required init 是否被实现 / Check parent's required inits are implemented
+    if (!currentSuperclassName_.empty()) {
+        std::string parentName = currentSuperclassName_;
+        while (!parentName.empty()) {
+            auto parentIt = classMethods_.find(parentName);
+            if (parentIt != classMethods_.end()) {
+                // 检查父类是否有 required init
+                if (parentIt->second.count("init.required")) {
+                    // 检查当前类是否实现了 init
+                    bool hasInit = false;
+                    for (const auto& m : decl.members) {
+                        if (m && m->declKind == DeclKind::Init) {
+                            hasInit = true;
+                            break;
+                        }
+                    }
+                    if (!hasInit) {
+                        error(decl.loc, "class '" + decl.name + "' must implement required init from parent class '" + parentName + "'");
+                    }
+                }
+            }
+            auto ppIt = classParent_.find(parentName);
+            if (ppIt != classParent_.end()) {
+                parentName = ppIt->second;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 记录 required init / Record required init
+    for (const auto& m : decl.members) {
+        if (m && m->declKind == DeclKind::Init) {
+            auto& id = static_cast<InitDecl&>(*m);
+            if (id.isRequired) {
+                classMethods_[decl.name]["init.required"] = false;
+            }
+        }
+    }
 
     currentTypeName_ = prevTypeName;
     currentSuperclassName_ = prevSuperclass;
@@ -841,6 +888,20 @@ TypePtr Sema::inferExprType(Expr& expr) {
         }
         case ExprKind::Call: {
             auto& call = static_cast<CallExpr&>(expr);
+
+            // Actor 隔离检查：调用 actor 方法需要 await
+            // Actor isolation check: calling actor methods requires await
+            if (call.callee->exprKind == ExprKind::MemberAccess) {
+                auto& ma = static_cast<MemberAccessExpr&>(*call.callee);
+                TypePtr baseType = inferExprType(*ma.base);
+                if (baseType && baseType->kind() == TypeKind::Actor) {
+                    // 检查是否在 async 上下文中
+                    if (!typeChecker_.isInAsyncFunction()) {
+                        error(expr.loc, "calling actor method '" + ma.member + "' requires 'await' in async context");
+                    }
+                }
+            }
+
             if (call.callee->exprKind == ExprKind::Identifier) {
                 auto& id = static_cast<IdentifierExpr&>(*call.callee);
                 Symbol* sym = symbols_.lookup(id.name);

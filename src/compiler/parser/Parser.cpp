@@ -459,11 +459,19 @@ DeclPtr Parser::parseFunctionDecl() {
     // Where clause (泛型约束补充)
     if (check(TokenKind::KwWhere)) {
         advance(); // skip 'where'
-        // 解析约束表达式 / Parse constraint expressions
-        // 简化：跳过到 { 或 -> / Simplified: skip to { or ->
-        while (!check(TokenKind::LBrace) && !check(TokenKind::Arrow) && !isAtEnd()) {
-            advance();
-        }
+        // 解析约束表达式: T: Protocol, U: Protocol & Protocol2
+        do {
+            // 跳过类型参数名 / Skip type parameter name
+            if (check(TokenKind::Identifier)) advance();
+            // 期望冒号 / Expect colon
+            if (match(TokenKind::Colon)) {
+                // 解析约束类型 / Parse constraint types
+                while (!check(TokenKind::Comma) && !check(TokenKind::LBrace) &&
+                       !check(TokenKind::Arrow) && !isAtEnd()) {
+                    advance(); // skip constraint type
+                }
+            }
+        } while (match(TokenKind::Comma));
     }
 
     // Parameter list
@@ -1181,6 +1189,12 @@ DeclPtr Parser::parseExternFuncDecl(const std::string& callingConv) {
 // ─── Statements ───────────────────────────────────────────────────────────
 
 StmtPtr Parser::parseStatement() {
+    // 分号禁止检查 / Semicolon prohibition check
+    if (check(TokenKind::Semicolon)) {
+        error("semicolons are prohibited as statement terminators in SukiCode");
+        advance(); // skip the semicolon
+    }
+
     switch (peek().kind) {
         case TokenKind::KwReturn:   return parseReturnStmt();
         case TokenKind::KwBreak:    return parseBreakStmt();

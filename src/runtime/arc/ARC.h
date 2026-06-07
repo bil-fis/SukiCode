@@ -24,6 +24,12 @@ void release(void* obj);
 void* weakRetain(void* obj);
 void weakRelease(void* obj);
 
+// 设置对象的析构函数 / Set object's destructor function
+void setDestructor(void* obj, void (*destructor)(void*));
+
+// 分配带 ARC 头的对象 / Allocate object with ARC header
+void* arcAlloc(size_t size, void (*destructor)(void*) = nullptr);
+
 // Autorelease pool / 自动释放池
 class AutoreleasePool {
 public:

@@ -107,7 +107,7 @@ bool IRGenerator::generate(const CompilationUnit& cu) {
             llvm::Type* retType = fd.returnType ?
                 resolveType(fd.returnType.get()) :
                 llvm::Type::getVoidTy(context_);
-            llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
+            llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, fd.isVariadic);
             // 根据访问级别设置链接类型 / Set linkage based on access level
             llvm::GlobalValue::LinkageTypes linkage = llvm::Function::ExternalLinkage;
             if (fd.access == AccessLevel::Private || fd.access == AccessLevel::FilePrivate) {
@@ -772,7 +772,7 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
         return nullptr;
     }
 
-    // 处理属性 / Process attributes
+    // 处理属性和调用约定 / Process attributes and calling convention
     for (const auto& attr : decl.attributes) {
         if (attr.name == "_cdecl") {
             func->setCallingConv(llvm::CallingConv::C);
@@ -780,6 +780,16 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
         if (attr.name == "no_mangle") {
             // 已经使用函数名作为链接名，无需额外处理
         }
+    }
+    // 根据 callingConvention 字段设置调用约定
+    if (decl.callingConvention == "C" || decl.callingConvention == "cdecl") {
+        func->setCallingConv(llvm::CallingConv::C);
+    } else if (decl.callingConvention == "stdcall") {
+#ifdef LLVM_CALLINGCONV_X86_STDCALL
+        func->setCallingConv(llvm::CallingConv::X86_StdCall);
+#else
+        func->setCallingConv(llvm::CallingConv::C); // fallback
+#endif
     }
 
     // 如果没有函数体，只是声明 / If no body, just a declaration
@@ -1978,7 +1988,16 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                             result = builder_->CreateAShr(current, val, "shr");
                         }
                         if (result) {
+                            // 属性观察器：willSet（赋值前调用）
+                            auto obsIt2 = propertyObservers_.find(id.name);
+                            if (obsIt2 != propertyObservers_.end() && obsIt2->second.willSetFunc) {
+                                builder_->CreateCall(obsIt2->second.willSetFunc, {result});
+                            }
                             builder_->CreateStore(result, it->second);
+                            // 属性观察器：didSet（赋值后调用）
+                            if (obsIt2 != propertyObservers_.end() && obsIt2->second.didSetFunc) {
+                                builder_->CreateCall(obsIt2->second.didSetFunc, {result});
+                            }
                             return result;
                         }
                     }
@@ -2213,6 +2232,70 @@ llvm::Value* IRGenerator::genUnaryExpr(const UnaryExpr& expr) {
 }
 
 llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
+    // 处理成员方法调用（通过 vtable 调度）/ Handle member method calls (via vtable dispatch)
+    if (expr.callee->exprKind == ExprKind::MemberAccess) {
+        auto& ma = static_cast<const MemberAccessExpr&>(*expr.callee);
+        llvm::Value* base = genExpr(*ma.base);
+        if (!base) return nullptr;
+
+        // 查找基类型的 vtable / Find base type's vtable
+        std::string baseTypeName;
+        if (ma.base->exprKind == ExprKind::Identifier) {
+            auto& baseId = static_cast<const IdentifierExpr&>(*ma.base);
+            auto typeIt = namedTypes_.find(baseId.name);
+            if (typeIt != namedTypes_.end() && typeIt->second->isStructTy()) {
+                baseTypeName = typeIt->second->getStructName().str();
+            }
+        }
+
+        auto vtableIt = vtables_.find(baseTypeName);
+        if (vtableIt != vtables_.end() && vtableIt->second.vtableType) {
+            // 通过 vtable 调用方法 / Call method through vtable
+            auto methodIt = vtableIt->second.methodIndices.find(ma.member);
+            if (methodIt != vtableIt->second.methodIndices.end()) {
+                // 加载 vtable 指针（类的第一个字段）
+                llvm::Value* vtablePtr = builder_->CreateStructGEP(
+                    base->getType(), base, 0, "vtable.ptr");
+                llvm::Value* vtable = builder_->CreateLoad(
+                    llvm::PointerType::get(context_, 0), vtablePtr, "vtable");
+
+                // 加载方法函数指针
+                llvm::Value* methodPtr = builder_->CreateGEP(
+                    vtableIt->second.vtableType, vtable,
+                    {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0),
+                     llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), methodIt->second)},
+                    "method.ptr");
+                llvm::Value* methodFunc = builder_->CreateLoad(
+                    llvm::PointerType::get(context_, 0), methodPtr, "method");
+
+                // 生成参数
+                std::vector<llvm::Value*> args;
+                args.push_back(base); // self
+                for (const auto& arg : expr.args) {
+                    llvm::Value* argVal = genExpr(*arg.value);
+                    if (argVal) args.push_back(argVal);
+                }
+
+                // 调用方法
+                llvm::FunctionType* methodTy = vtableIt->second.methods[methodIt->second]->getFunctionType();
+                return builder_->CreateCall(methodTy, methodFunc, args, "vcall");
+            }
+        }
+
+        // 回退到直接函数调用 / Fallback to direct function call
+        std::string methodName = baseTypeName + "." + ma.member;
+        llvm::Function* method = module_->getFunction(methodName);
+        if (method) {
+            std::vector<llvm::Value*> args;
+            args.push_back(base); // self
+            for (const auto& arg : expr.args) {
+                llvm::Value* argVal = genExpr(*arg.value);
+                if (argVal) args.push_back(argVal);
+            }
+            return builder_->CreateCall(method, args, method->getReturnType()->isVoidTy() ? "" : "call");
+        }
+    }
+
     if (expr.callee->exprKind != ExprKind::Identifier) {
         error({}, "only direct function calls supported");
         return nullptr;
@@ -2826,28 +2909,24 @@ void IRGenerator::processMacroDecl(const MacroDecl& decl) {
 
 llvm::Value* IRGenerator::genMacroExpansion(const MacroExpansionExpr& expr) {
     // 展开宏 / Expand macro
-    auto result = macroExpander_.expandMacro(expr);
+    const MacroDecl* expanded = macroExpander_.expandMacro(expr);
 
-    if (!result.success) {
-        error(expr.loc, result.error);
+    if (!expanded) {
         return nullptr;
     }
 
     // 生成展开后的语句 / Generate expanded statements
-    llvm::Value* lastVal = nullptr;
-    for (const auto& stmt : result.statements) {
-        if (stmt) {
-            genStmt(*stmt);
+    if (!expanded->expansion.empty()) {
+        for (const auto& stmt : expanded->expansion) {
+            if (stmt) genStmt(*stmt);
+        }
+    } else {
+        for (const auto& stmt : expanded->body) {
+            if (stmt) genStmt(*stmt);
         }
     }
 
-    // 如果展开结果是表达式语句，返回最后一个表达式的值
-    // If expansion result is expression statements, return last expression value
-    if (!result.expressions.empty()) {
-        lastVal = genExpr(*result.expressions.back());
-    }
-
-    return lastVal;
+    return nullptr;
 }
 
 #endif
