@@ -2156,6 +2156,9 @@ ExprPtr Parser::parseMemberAccessExpr(ExprPtr base) {
     expr->base = std::move(base);
     if (check(TokenKind::Identifier)) {
         expr->member = std::string(advance().stringValue);
+    } else if (check(TokenKind::IntegerLiteral)) {
+        // 元组访问: tuple.0, tuple.1, etc.
+        expr->member = std::to_string(advance().literal.intValue);
     } else {
         error("expected member name");
     }

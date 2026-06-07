@@ -660,6 +660,72 @@ void IRGenerator::genDecl(const Decl& decl) {
                 }
             }
             currentTypeNameForDeinit_ = prevDeinitType;
+
+            // 生成方法函数体 / Generate method function bodies
+            for (const auto& member : cd.members) {
+                if (member && member->declKind == DeclKind::Function) {
+                    auto& fd = static_cast<const FunctionDecl&>(*member);
+                    std::string methodName = cd.name + "." + fd.name;
+                    llvm::Function* methodFunc = module_->getFunction(methodName);
+                    if (methodFunc && !fd.body.empty()) {
+                        // 保存当前状态 / Save current state
+                        llvm::Function* prevFunc = currentFunc_;
+                        llvm::BasicBlock* prevBB = builder_->GetInsertBlock();
+                        auto savedValues = namedValues_;
+                        auto savedTypes = namedTypes_;
+
+                        // 生成方法体 / Generate method body
+                        currentFunc_ = methodFunc;
+                        llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", methodFunc);
+                        builder_->SetInsertPoint(entry);
+                        namedValues_.clear();
+                        namedTypes_.clear();
+
+                        // 设置 self 参数
+                        auto argIt = methodFunc->arg_begin();
+                        llvm::AllocaInst* selfAlloca = createEntryBlockAlloca(methodFunc,
+                            argIt->getType(), "self");
+                        builder_->CreateStore(&*argIt, selfAlloca);
+                        namedValues_["self"] = selfAlloca;
+                        namedTypes_["self"] = argIt->getType();
+
+                        // 设置其他参数
+                        ++argIt;
+                        while (argIt != methodFunc->arg_end()) {
+                            llvm::AllocaInst* paramAlloca = createEntryBlockAlloca(methodFunc,
+                                argIt->getType(), std::string(argIt->getName()));
+                            builder_->CreateStore(&*argIt, paramAlloca);
+                            namedValues_[std::string(argIt->getName())] = paramAlloca;
+                            namedTypes_[std::string(argIt->getName())] = argIt->getType();
+                            ++argIt;
+                        }
+
+                        // 生成方法体语句
+                        for (const auto& stmt : fd.body) {
+                            if (stmt) genStmt(*stmt);
+                        }
+
+                        // 添加 return
+                        if (!builder_->GetInsertBlock()->getTerminator()) {
+                            llvm::Type* retType = methodFunc->getReturnType();
+                            if (retType->isVoidTy()) {
+                                builder_->CreateRetVoid();
+                            } else {
+                                builder_->CreateRet(llvm::Constant::getNullValue(retType));
+                            }
+                        }
+
+                        // 恢复状态 / Restore state
+                        namedValues_ = savedValues;
+                        namedTypes_ = savedTypes;
+                        currentFunc_ = prevFunc;
+                        if (prevBB) {
+                            builder_->SetInsertPoint(prevBB);
+                        }
+                    }
+                }
+            }
+
             currentSuperclassName_ = prevSuperclass;
             break;
         }
@@ -3093,8 +3159,26 @@ llvm::Value* IRGenerator::genMemberAccess(const MemberAccessExpr& expr) {
     // If base is a struct type, use GEP to access field
     if (base->getType()->isStructTy()) {
         llvm::StructType* structTy = llvm::cast<llvm::StructType>(base->getType());
+
+        // 检查是否是数字索引（元组访问）
+        // Check if it's a numeric index (tuple access)
+        bool isNumericIndex = true;
+        for (char c : memberName) {
+            if (!std::isdigit(c)) { isNumericIndex = false; break; }
+        }
+
+        if (isNumericIndex) {
+            // 数字索引访问 / Numeric index access
+            unsigned idx = static_cast<unsigned>(std::stoul(memberName));
+            if (idx < structTy->getNumElements()) {
+                llvm::Value* fieldPtr = builder_->CreateStructGEP(
+                    structTy, base, idx, "tuple.field.ptr");
+                return builder_->CreateLoad(
+                    structTy->getElementType(idx), fieldPtr, "tuple.field");
+            }
+        }
+
         // 查找字段索引 / Find field index
-        // 遍历当前 CU 的声明找到对应的结构体定义
         if (currentCu_) {
             for (const auto& decl : currentCu_->declarations) {
                 if (!decl) continue;

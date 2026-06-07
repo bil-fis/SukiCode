@@ -1,3 +1,5 @@
+> **
+
 # SukiCode
 
 A modern systems programming language that fuses Swift, TypeScript, and Objective-C syntax, with AOT compilation via LLVM, deterministic ARC memory management, and built-in async/await concurrency.
