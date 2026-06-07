@@ -48,6 +48,17 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
   - subscript 代码生成、deinit 代码生成
   - vtable 方法调度（含实例填充）、inout 参数指针传递
   - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
+  - 泛型类型单态化（含字段索引映射）、async/await LLVM 协程 intrinsics
+  - select 语句（channel 运行时就绪检查）、泛型 where 子句约束验证、-O 优化级别
+  - 访问控制语义检查（private/fileprivate/internal）、Opaque/Existential 类型
+  - 组合类型 A&B（CompositionType 跟踪所有协议）
+  - SetLiteral 实际存储元素（堆分配）、Selector 表达式代码生成
+  - import 实际加载模块文件（词法分析+语法分析+处理body+public符号导出）
+  - 协议见证表（动态分发+方法类型存储）
+  - 错误处理 thread_local 线程安全传播
+  - subscript 代码生成、deinit 代码生成
+  - vtable 方法调度（含实例填充）、inout 参数指针传递
+  - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
   - 泛型类型单态化（含字段索引映射）、async/await 协程帧
   - select 语句（channel 轮询）、泛型 where 子句约束验证、-O 优化级别
   - 访问控制语义检查（private/fileprivate/internal）、Opaque/Existential 类型
