@@ -702,11 +702,22 @@ void IRGenerator::genDecl(const Decl& decl) {
                 llvm::Value* channelVal = genExpr(*sd.cases[i].channel);
                 if (!channelVal) continue;
 
-                // 生成 channel 就绪检查（简化：检查 channel 指针非空）
-                // Generate channel readiness check (simplified: check channel pointer is not null)
-                llvm::Value* isReady = builder_->CreateICmpNE(
-                    channelVal,
-                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
+                // 生成 channel 就绪检查
+                // 检查 channel 的 count 字段是否 > 0（表示有数据可接收）
+                // Generate channel readiness check
+                // Check if channel's count field > 0 (data available)
+                // Channel 结构体布局: { data_ptr, count, capacity, mutex, ... }
+                // count 字段在偏移 8 处（data_ptr 是 8 字节指针）
+                llvm::Value* countPtr = builder_->CreateGEP(
+                    llvm::Type::getInt8Ty(context_), channelVal,
+                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 8),
+                    "channel.count.ptr");
+                llvm::Value* countPtrCast = builder_->CreatePointerCast(countPtr,
+                    llvm::PointerType::get(context_, 0));
+                llvm::Value* count = builder_->CreateLoad(
+                    llvm::Type::getInt64Ty(context_), countPtrCast, "channel.count");
+                llvm::Value* isReady = builder_->CreateICmpSGT(count,
+                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 0),
                     "channel.ready");
 
                 // 创建下一个检查块 / Create next check block

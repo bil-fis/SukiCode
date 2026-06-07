@@ -14,6 +14,7 @@ Sema::~Sema() = default;
 
 bool Sema::analyze(CompilationUnit& cu) {
     currentCu_ = &cu;
+    currentFilePath_ = cu.filename;
 
     // Register built-in types
     auto regType = [&](const char* name) {
@@ -488,7 +489,7 @@ void Sema::processVariableDecl(VariableDecl& decl) {
     sym.line = decl.loc.line;
     sym.column = decl.loc.column;
     sym.access = decl.access;
-    sym.declaringFile = currentModule_;
+    sym.declaringFile = currentFilePath_;
     sym.scopeDepth = symbols_.depth();
 
     if (decl.pattern && decl.pattern->patternKind == PatternKind::Identifier) {
@@ -558,7 +559,7 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     sym.column = decl.loc.column;
     sym.access = decl.access;
     sym.isPublic = (decl.access == AccessLevel::Public) || isMain || isCDecl;
-    sym.declaringFile = currentModule_;
+    sym.declaringFile = currentFilePath_;
     sym.scopeDepth = symbols_.depth();
 
     // 命名规范检查 / Naming convention check
@@ -1530,15 +1531,19 @@ TypePtr Sema::inferExprType(Expr& expr) {
                         return getVoidType();
                     }
                 }
-                // 如果没有 return 语句，检查最后一个表达式语句（箭头闭包）
-                if (closure.isArrow) {
-                    for (const auto& stmt : closure.body) {
+                // 如果没有 return 语句，检查最后一个表达式语句（隐式返回）
+                // For closures without explicit return, check last expression
+                if (!closure.body.empty()) {
+                    // 找到最后一个非空语句
+                    for (int si = static_cast<int>(closure.body.size()) - 1; si >= 0; si--) {
+                        const auto& stmt = closure.body[si];
                         if (stmt && stmt->stmtKind == StmtKind::Expression) {
                             auto& es = static_cast<const ExpressionStmt&>(*stmt);
                             if (es.expression) {
                                 TypePtr exprType = inferExprType(*es.expression);
                                 if (exprType) return exprType;
                             }
+                            break;
                         }
                     }
                 }

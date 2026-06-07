@@ -63,6 +63,7 @@ private:
     SymbolTable symbols_;
     TypeChecker typeChecker_;
     std::string currentModule_;
+    std::string currentFilePath_; // 当前文件路径（用于访问控制）
     TypePtr currentReturnType_; // Current function's return type for checking
     std::vector<std::string> importedModules_; // 已导入模块列表
     std::unordered_set<std::string> movedVariables_; // 已移动的变量集合
