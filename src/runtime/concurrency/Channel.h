@@ -23,17 +23,45 @@ enum class Backpressure {
 // Channel 满错误 / Channel full error
 struct ChannelFullError {};
 
+// Channel 基类，存储就绪检查回调 / Channel base class, stores readiness check callback
+struct ChannelBase {
+    using HasDataFunc = int(*)(void*, void*);
+    HasDataFunc hasDataFunc_ = nullptr;
+    void* hasDataSelf_ = nullptr;
+};
+
 template<typename T>
-class Channel {
+class Channel : public ChannelBase {
 public:
     // 创建有界通道 / Create bounded channel
     explicit Channel(size_t capacity, Backpressure bp = Backpressure::Block)
-        : capacity_(capacity), backpressure_(bp), closed_(false) {}
+        : capacity_(capacity), backpressure_(bp), closed_(false) {
+        registerHasDataFunc();
+    }
 
     // 创建无界通道 / Create unbounded channel
-    Channel() : capacity_(0), backpressure_(Backpressure::Block), closed_(false) {}
+    Channel() : capacity_(0), backpressure_(Backpressure::Block), closed_(false) {
+        registerHasDataFunc();
+    }
 
     ~Channel() { close(); }
+
+    // 注册 hasData 函数指针供 select 代码生成使用
+    // Register hasData function pointer for select codegen
+    void registerHasDataFunc() {
+        // 存储 this 指针和静态回调 / Store this pointer and static callback
+        hasDataSelf_ = this;
+        hasDataFunc_ = &Channel::staticHasData;
+    }
+
+    // 静态回调函数 / Static callback function
+    static int staticHasData(void* self, void*) {
+        if (!self) return 0;
+        Channel* ch = static_cast<Channel*>(self);
+        return ch->hasData() ? 1 : 0;
+    }
+
+    // hasDataFunc_ 和 hasDataSelf_ 继承自 ChannelBase
 
     // 发送值到通道 / Send value to channel
     // 返回 false 如果通道已关闭
@@ -141,12 +169,6 @@ public:
         notFull_.notify_all();
     }
 
-    // 检查通道是否已关闭 / Check if channel is closed
-    bool isClosed() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return closed_;
-    }
-
     // 获取当前缓冲区大小 / Get current buffer size
     size_t size() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -169,25 +191,16 @@ private:
 } // namespace suki::runtime
 
 // C 兼容的 channel 就绪检查函数 / C-compatible channel readiness check
-// 通过 Channel 实例存储的回调函数检查就绪状态
-// Uses callback stored by Channel instance to check readiness
-typedef int (*SukiChannelHasDataFunc)(void*, void*);
-
-// 全局回调注册 / Global callback registration
-static SukiChannelHasDataFunc g_channelHasDataFunc = nullptr;
-static void* g_channelHasDataCtx = nullptr;
-
-extern "C" inline void suki_set_channel_has_data_func(SukiChannelHasDataFunc func, void* ctx) {
-    g_channelHasDataFunc = func;
-    g_channelHasDataCtx = ctx;
-}
-
-extern "C" inline bool suki_channel_has_data(void* channel) {
-    if (!channel) return false;
-    // 通过全局回调检查 / Check via global callback
-    if (g_channelHasDataFunc) {
-        return g_channelHasDataFunc(channel, g_channelHasDataCtx) != 0;
+// 通过 ChannelBase 基类的 hasDataFunc_ 回调检查就绪状态
+// Uses hasDataFunc_ callback from ChannelBase to check readiness
+extern "C" inline bool suki_channel_has_data(void* channelPtr) {
+    if (!channelPtr) return false;
+    // ChannelBase 是 Channel 的基类，hasDataFunc_ 在固定偏移处
+    // ChannelBase is base class of Channel, hasDataFunc_ at fixed offset
+    ChannelBase* base = static_cast<ChannelBase*>(channelPtr);
+    if (base->hasDataFunc_) {
+        return base->hasDataFunc_(base->hasDataSelf_, nullptr) != 0;
     }
     // 回退：检查指针有效性 / Fallback: check pointer validity
-    return channel != nullptr;
+    return channelPtr != nullptr;
 }
