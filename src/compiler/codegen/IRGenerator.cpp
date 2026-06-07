@@ -317,19 +317,34 @@ llvm::Type* IRGenerator::resolveType(const TypeRepr* tr) {
 
                 // 替换字段类型中的泛型参数
                 std::vector<llvm::Type*> bodyTypes;
-                for (size_t i = 0; i < structIt->second->getNumElements(); i++) {
-                    llvm::Type* fieldType = structIt->second->getElementType(i);
-                    // 检查字段类型名是否匹配泛型参数
-                    if (fieldType->isStructTy()) {
-                        std::string fieldTypeName = fieldType->getStructName().str();
-                        for (size_t j = 0; j < genericParamNames.size(); j++) {
-                            if (fieldTypeName == genericParamNames[j] && j < concreteTypes.size()) {
-                                fieldType = concreteTypes[j];
-                                break;
+                auto metaIt = genericTypeMeta_.find(n.name);
+                if (metaIt != genericTypeMeta_.end()) {
+                    // 使用元数据进行精确替换
+                    for (size_t i = 0; i < structIt->second->getNumElements(); i++) {
+                        llvm::Type* fieldType = structIt->second->getElementType(i);
+                        if (i < metaIt->second.fieldToParam.size()) {
+                            int paramIdx = metaIt->second.fieldToParam[i];
+                            if (paramIdx >= 0 && static_cast<size_t>(paramIdx) < concreteTypes.size()) {
+                                fieldType = concreteTypes[paramIdx];
                             }
                         }
+                        bodyTypes.push_back(fieldType);
                     }
-                    bodyTypes.push_back(fieldType);
+                } else {
+                    // 回退：按类型名匹配
+                    for (size_t i = 0; i < structIt->second->getNumElements(); i++) {
+                        llvm::Type* fieldType = structIt->second->getElementType(i);
+                        if (fieldType->isStructTy()) {
+                            std::string fieldTypeName = fieldType->getStructName().str();
+                            for (size_t j = 0; j < genericParamNames.size(); j++) {
+                                if (fieldTypeName == genericParamNames[j] && j < concreteTypes.size()) {
+                                    fieldType = concreteTypes[j];
+                                    break;
+                                }
+                            }
+                        }
+                        bodyTypes.push_back(fieldType);
+                    }
                 }
                 specType->setBody(bodyTypes);
                 genericTypeInstances_[specName] = specType;
@@ -431,15 +446,45 @@ void IRGenerator::genDecl(const Decl& decl) {
             auto& sd = static_cast<const StructDecl&>(decl);
             // 生成 LLVM struct 类型 / Generate LLVM struct type
             std::vector<llvm::Type*> fieldTypes;
+            std::vector<int> fieldToParam; // 字段到泛型参数的映射
+
+            // 收集泛型参数名 / Collect generic parameter names
+            std::vector<std::string> genericParamNames;
+            for (const auto& gp : sd.genericParams) {
+                genericParamNames.push_back(gp.name);
+            }
+
             for (const auto& member : sd.members) {
                 if (member && member->declKind == DeclKind::Variable) {
                     auto& vd = static_cast<const VariableDecl&>(*member);
-                    fieldTypes.push_back(resolveType(vd.typeAnnotation.get()));
+                    llvm::Type* fieldType = resolveType(vd.typeAnnotation.get());
+                    fieldTypes.push_back(fieldType);
+
+                    // 检查字段类型是否是泛型参数 / Check if field type is a generic param
+                    int paramIdx = -1;
+                    if (vd.typeAnnotation && vd.typeAnnotation->typeReprKind == TypeReprKind::Named) {
+                        auto& ntr = static_cast<const NamedTypeRepr&>(*vd.typeAnnotation);
+                        for (size_t i = 0; i < genericParamNames.size(); i++) {
+                            if (ntr.name == genericParamNames[i]) {
+                                paramIdx = static_cast<int>(i);
+                                break;
+                            }
+                        }
+                    }
+                    fieldToParam.push_back(paramIdx);
                 }
             }
             llvm::StructType* structType = llvm::StructType::create(context_, sd.name);
             structType->setBody(fieldTypes);
             structTypes_[sd.name] = structType;
+
+            // 存储泛型类型元数据 / Store generic type metadata
+            if (!genericParamNames.empty()) {
+                GenericTypeInfo meta;
+                meta.paramNames = genericParamNames;
+                meta.fieldToParam = fieldToParam;
+                genericTypeMeta_[sd.name] = meta;
+            }
             break;
         }
         case DeclKind::Class: {

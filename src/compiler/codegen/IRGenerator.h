@@ -141,6 +141,13 @@ private:
     };
     std::unordered_map<std::string, SubscriptInfo> subscripts_;
 
+    // 泛型类型元数据 / Generic type metadata
+    struct GenericTypeInfo {
+        std::vector<std::string> paramNames; // 泛型参数名列表
+        std::vector<int> fieldToParam;       // 字段索引 -> 泛型参数索引（-1表示非泛型字段）
+    };
+    std::unordered_map<std::string, GenericTypeInfo> genericTypeMeta_;
+
     // deinit 函数注册 / Deinit function registry
     std::unordered_map<std::string, llvm::Function*> deinitFuncs_;
     std::string currentTypeNameForDeinit_; // 当前类名（用于关联 deinit）
