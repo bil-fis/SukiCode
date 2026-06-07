@@ -505,9 +505,12 @@ void IRGenerator::genDecl(const Decl& decl) {
                     std::string implName = sd.name + "." + methodName;
                     llvm::Function* implFunc = module_->getFunction(implName);
                     if (!implFunc) {
-                        // 创建空函数作为占位 / Create empty function as placeholder
-                        llvm::FunctionType* funcTy = llvm::FunctionType::get(
-                            llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
+                        // 方法未实现：创建存根函数（链接时解析）
+                        // Method not implemented: create stub (resolved at link time)
+                        llvm::FunctionType* funcTy = wtableIt->second.methodTypes[i] ?
+                            wtableIt->second.methodTypes[i] :
+                            llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
                         implFunc = llvm::Function::Create(funcTy,
                             llvm::Function::ExternalLinkage, implName, module_.get());
                     }
@@ -625,8 +628,11 @@ void IRGenerator::genDecl(const Decl& decl) {
                     std::string implName = cd.name + "." + methodName;
                     llvm::Function* implFunc = module_->getFunction(implName);
                     if (!implFunc) {
-                        llvm::FunctionType* funcTy = llvm::FunctionType::get(
-                            llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
+                        // 方法未实现：使用协议定义的函数类型
+                        llvm::FunctionType* funcTy = (i < wtableIt->second.methodTypes.size() && wtableIt->second.methodTypes[i]) ?
+                            wtableIt->second.methodTypes[i] :
+                            llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
                         implFunc = llvm::Function::Create(funcTy,
                             llvm::Function::ExternalLinkage, implName, module_.get());
                     }
@@ -2099,12 +2105,22 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                 suspendSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 0), resumeBB);
                 suspendSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 1), destroyBB);
 
-                // 销毁块：释放协程帧并返回 / Destroy block: free coroutine frame and return
+                // 销毁块：coro.end + 释放协程帧并返回
+                // Destroy block: coro.end + free coroutine frame and return
                 builder_->SetInsertPoint(destroyBB);
                 if (coroHandle_ && coroId_) {
+                    // coro.end(handle, unwind=true, token)
+                    llvm::Function* coroEndFunc = llvm::Intrinsic::getOrInsertDeclaration(
+                        module_.get(), llvm::Intrinsic::coro_end);
+                    builder_->CreateCall(coroEndFunc, {coroHandle_,
+                        llvm::ConstantInt::getTrue(context_), coroId_});
+
+                    // coro.free(handle, token)
                     llvm::Function* coroFreeFunc = llvm::Intrinsic::getOrInsertDeclaration(
                         module_.get(), llvm::Intrinsic::coro_free);
                     llvm::Value* framePtr = builder_->CreateCall(coroFreeFunc, {coroId_, coroHandle_}, "coro.frame");
+
+                    // free(frame)
                     llvm::Function* freeFunc = module_->getFunction("free");
                     if (!freeFunc) {
                         llvm::FunctionType* freeTy = llvm::FunctionType::get(
