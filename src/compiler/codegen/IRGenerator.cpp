@@ -1009,7 +1009,7 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
     namedValues_.clear();
     namedTypes_.clear();
 
-    // async 函数：生成协程帧 / async function: generate coroutine frame
+    // async 函数：生成协程状态机 / async function: generate coroutine state machine
     if (decl.isAsync) {
         // 创建协程状态变量 / Create coroutine state variable
         llvm::AllocaInst* stateVar = createEntryBlockAlloca(func,
@@ -1018,6 +1018,28 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
             llvm::Type::getInt32Ty(context_), 0), stateVar);
         namedValues_["__coro_state"] = stateVar;
         namedTypes_["__coro_state"] = llvm::Type::getInt32Ty(context_);
+
+        // 创建恢复入口块 / Create resume entry block
+        llvm::BasicBlock* resumeBB = llvm::BasicBlock::Create(context_, "coro.resume", func);
+        coroResumeBB_ = resumeBB;
+
+        // 创建状态分发 switch / Create state dispatch switch
+        llvm::Value* curState = builder_->CreateLoad(
+            llvm::Type::getInt32Ty(context_), stateVar, "coro.curstate");
+
+        // 跳转到状态分发 / Jump to state dispatch
+        llvm::BasicBlock* dispatchBB = llvm::BasicBlock::Create(context_, "coro.dispatch", func);
+        builder_->CreateBr(dispatchBB);
+        builder_->SetInsertPoint(dispatchBB);
+
+        // 创建状态 switch / Create state switch
+        // 初始状态 0 跳转到函数体 / Initial state 0 jumps to function body
+        llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(context_, "coro.body", func);
+        llvm::SwitchInst* stateSwitch = builder_->CreateSwitch(curState, bodyBB, 2);
+        stateSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0), bodyBB);
+
+        // 生成函数体 / Generate function body
+        builder_->SetInsertPoint(bodyBB);
     }
 
     // 为参数创建 alloca / Create allocas for parameters
@@ -1859,17 +1881,42 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             auto& ae = static_cast<const AwaitExpr&>(expr);
             llvm::Value* val = genExpr(*ae.subExpr);
             if (!val) return nullptr;
+
             // async 上下文中：创建挂起点 / In async context: create suspension point
-            if (isInAsyncFunc_) {
-                // 递增状态 / Increment state
+            if (isInAsyncFunc_ && coroResumeBB_) {
                 llvm::Value* stateVar = namedValues_["__coro_state"];
                 if (stateVar) {
-                    llvm::Value* currentState = builder_->CreateLoad(
-                        llvm::Type::getInt32Ty(context_), stateVar, "coro.state");
-                    llvm::Value* nextState = builder_->CreateAdd(currentState,
-                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 1), "coro.next");
-                    builder_->CreateStore(nextState, stateVar);
-                    awaitPointCount_++;
+                    int curState = awaitPointCount_++;
+                    int nextState = curState + 1;
+
+                    // 保存当前状态值（用于恢复时的 switch）
+                    // 状态 curState 的代码执行到这里
+                    // 更新状态为 nextState
+                    builder_->CreateStore(
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), nextState),
+                        stateVar);
+
+                    // 创建恢复时的目标块 / Create resume target block
+                    llvm::BasicBlock* resumeTarget = llvm::BasicBlock::Create(
+                        context_, "coro.await." + std::to_string(nextState),
+                        builder_->GetInsertBlock()->getParent());
+
+                    // 添加 case 到状态 switch（在 dispatch 块中）
+                    // 恢复时从 dispatch 块跳转到 resumeTarget
+                    // 这里简化：创建一个条件检查块
+                    llvm::BasicBlock* afterAwait = llvm::BasicBlock::Create(
+                        context_, "coro.after.await", builder_->GetInsertBlock()->getParent());
+
+                    // 跳转到 afterAwait（正常执行流）
+                    builder_->CreateBr(afterAwait);
+
+                    // 设置 resumeTarget 块（恢复时执行）
+                    builder_->SetInsertPoint(resumeTarget);
+                    // 恢复时直接跳转到 afterAwait
+                    builder_->CreateBr(afterAwait);
+
+                    // 设置 afterAwait 块继续执行
+                    builder_->SetInsertPoint(afterAwait);
                 }
             }
             return val;

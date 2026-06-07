@@ -186,6 +186,7 @@ private:
     bool isInAsyncFunc_ = false;
     int awaitPointCount_ = 0;
     llvm::Value* coroutineState_ = nullptr;
+    llvm::BasicBlock* coroResumeBB_ = nullptr; // 协程恢复入口块
 
     // 闭包计数器 / Closure counter
     int nextClosureId_ = 0;

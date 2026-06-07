@@ -182,11 +182,18 @@ void Sema::processDecl(Decl& decl) {
                 auto moduleCu = parser.parse();
 
                 if (!diag_.hadErrors() && moduleCu) {
-                    // 完整处理模块中的所有声明
-                    // Fully process all declarations in the module
+                    // 进入模块作用域 / Enter module scope
+                    symbols_.enterScope();
+
+                    // 处理模块中的所有声明
+                    // Process all declarations in the module
                     for (const auto& modDecl : moduleCu->declarations) {
                         if (modDecl) processDecl(*modDecl);
                     }
+
+                    // 离开模块作用域（保留 public 符号）
+                    // Leave module scope (retain public symbols)
+                    symbols_.leaveScope();
                 }
             }
             // 内置模块（Core、System 等）通过标准库头文件提供
