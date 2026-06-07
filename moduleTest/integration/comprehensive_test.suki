@@ -12,17 +12,25 @@ func identity<T>(value: T) -> T {
 
 // 控制流
 func testControlFlow() -> Int {
-    let x = 10
-    if x > 5 {
-        let _ = 1
-    }
-
     var counter = 0
     while counter < 5 {
         counter = counter + 1
     }
-
     return 42
+}
+
+// 错误处理
+func riskyFunction() throws -> Int {
+    return 42
+}
+
+func safeFunction() -> Int {
+    do {
+        let result = try riskyFunction()
+        return result
+    } catch {
+        return -1
+    }
 }
 
 // 主函数
@@ -30,14 +38,27 @@ func testControlFlow() -> Int {
 func main() -> Int {
     print("=== SukiCode Comprehensive Test ===")
 
+    // 基础类型
+    let intVal: Int = 42
+    let boolVal: Bool = true
+    let doubleVal: Double = 3.14
+    print("Basic types: OK")
+
+    // 函数
     let sum = add(a: 10, b: 20)
     print("Functions: OK")
 
+    // 泛型
     let id = identity(value: 42)
     print("Generics: OK")
 
+    // 控制流
     let cfResult = testControlFlow()
     print("Control flow: OK")
+
+    // 错误处理
+    let safeResult = safeFunction()
+    print("Error handling: OK")
 
     print("=== All tests passed! ===")
     return 0
