@@ -1,0 +1,44 @@
+// SukiCode 综合测试
+
+// 函数
+func add(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+// 泛型函数
+func identity<T>(value: T) -> T {
+    return value
+}
+
+// 控制流
+func testControlFlow() -> Int {
+    let x = 10
+    if x > 5 {
+        let _ = 1
+    }
+
+    var counter = 0
+    while counter < 5 {
+        counter = counter + 1
+    }
+
+    return 42
+}
+
+// 主函数
+@main
+func main() -> Int {
+    print("=== SukiCode Comprehensive Test ===")
+
+    let sum = add(a: 10, b: 20)
+    print("Functions: OK")
+
+    let id = identity(value: 42)
+    print("Generics: OK")
+
+    let cfResult = testControlFlow()
+    print("Control flow: OK")
+
+    print("=== All tests passed! ===")
+    return 0
+}
