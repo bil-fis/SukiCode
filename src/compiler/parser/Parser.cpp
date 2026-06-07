@@ -104,7 +104,8 @@ std::unique_ptr<CompilationUnit> Parser::parse() {
         } else {
             error("expected module name after 'module'");
         }
-        // Semicolons are optional (spec says no semicolons, but allow for module line)
+        // 分号检查：module 声明后的分号是允许的（不是语句终止符）
+        // Semicolons after module declaration are allowed (not a statement terminator)
         match(TokenKind::Semicolon);
         cu->moduleDecl = mod.get();
         cu->declarations.push_back(std::move(mod));
@@ -293,6 +294,7 @@ DeclPtr Parser::parseModuleDecl() {
     } else {
         error("expected module name");
     }
+    // module 声明后的分号是允许的
     match(TokenKind::Semicolon);
     return decl;
 }
@@ -305,6 +307,7 @@ DeclPtr Parser::parseImportDecl() {
     } else {
         error("expected module name after 'import'");
     }
+    // import 声明后的分号是允许的
     match(TokenKind::Semicolon);
     return decl;
 }

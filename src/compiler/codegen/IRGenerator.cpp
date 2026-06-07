@@ -466,6 +466,20 @@ void IRGenerator::genDecl(const Decl& decl) {
             if (!vtableFieldTypes.empty()) {
                 vtable.vtableType = llvm::StructType::create(context_, cd.name + ".VTable");
                 vtable.vtableType->setBody(vtableFieldTypes);
+
+                // 创建全局 vtable 变量并填充方法指针
+                // Create global vtable variable and populate with method pointers
+                std::vector<llvm::Constant*> vtableEntries;
+                for (auto* method : vtable.methods) {
+                    // 将函数指针转换为 i8*
+                    llvm::Constant* funcPtr = llvm::ConstantExpr::getBitCast(method,
+                        llvm::PointerType::get(context_, 0));
+                    vtableEntries.push_back(funcPtr);
+                }
+                llvm::Constant* vtableInit = llvm::ConstantStruct::get(
+                    llvm::cast<llvm::StructType>(vtable.vtableType), vtableEntries);
+                new llvm::GlobalVariable(*module_, vtable.vtableType, true,
+                    llvm::GlobalValue::InternalLinkage, vtableInit, cd.name + ".vtable");
             }
             vtables_[cd.name] = vtable;
 
@@ -570,7 +584,6 @@ void IRGenerator::genDecl(const Decl& decl) {
             llvm::Function* func = builder_->GetInsertBlock()->getParent();
             llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "select.end", func);
             llvm::BasicBlock* defaultBB = nullptr;
-            llvm::BasicBlock* pollBB = llvm::BasicBlock::Create(context_, "select.poll", func);
 
             // 创建所有 case 块 / Create all case blocks
             std::vector<llvm::BasicBlock*> caseBBs;
@@ -586,14 +599,15 @@ void IRGenerator::genDecl(const Decl& decl) {
             }
             if (!defaultBB) defaultBB = mergeBB;
 
-            // 跳转到轮询块 / Jump to poll block
+            // 创建轮询循环块 / Create polling loop block
+            llvm::BasicBlock* pollBB = llvm::BasicBlock::Create(context_, "select.poll", func);
             builder_->CreateBr(pollBB);
-
-            // 轮询块：检查每个 channel 的状态
             builder_->SetInsertPoint(pollBB);
 
             // 为每个非 default case 生成 channel 就绪检查
             // Generate channel readiness check for each non-default case
+            // 使用条件分支：如果 channel 就绪则跳转到对应 case
+            llvm::BasicBlock* nextCheckBB = nullptr;
             for (size_t i = 0; i < sd.cases.size(); i++) {
                 if (sd.cases[i].kind == SelectCase::Kind::Default) continue;
 
@@ -601,17 +615,31 @@ void IRGenerator::genDecl(const Decl& decl) {
                 llvm::Value* channelVal = genExpr(*sd.cases[i].channel);
                 if (!channelVal) continue;
 
-                // 简化：假设 channel 总是就绪，直接跳转到 case
-                // Simplified: assume channel is always ready, jump to case
-                // 完整实现需要调用 runtime 的 tryReceive/trySend
-                builder_->CreateBr(caseBBs[i]);
-                break; // 只处理第一个非 default case
+                // 生成 channel 就绪检查（简化：检查 channel 指针非空）
+                // Generate channel readiness check (simplified: check channel pointer is not null)
+                llvm::Value* isReady = builder_->CreateICmpNE(
+                    channelVal,
+                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
+                    "channel.ready");
+
+                // 创建下一个检查块 / Create next check block
+                nextCheckBB = llvm::BasicBlock::Create(context_, "select.next", func);
+
+                // 如果 channel 就绪，跳转到 case；否则继续检查下一个
+                builder_->CreateCondBr(isReady, caseBBs[i], nextCheckBB);
+
+                // 设置下一个检查块 / Set next check block
+                builder_->SetInsertPoint(nextCheckBB);
             }
 
-            // 如果没有非 default case，跳转到 default
-            // If no non-default case, jump to default
-            if (builder_->GetInsertBlock()->getTerminator() == nullptr) {
+            // 所有 channel 都未就绪，跳转到 default 或重新轮询
+            // All channels not ready, jump to default or re-poll
+            if (defaultBB != mergeBB) {
+                // 有 default 分支，执行 default
                 builder_->CreateBr(defaultBB);
+            } else {
+                // 无 default 分支，重新轮询（阻塞等待）
+                builder_->CreateBr(pollBB);
             }
 
             // 生成每个 case 的代码 / Generate code for each case
@@ -753,6 +781,45 @@ void IRGenerator::genDecl(const Decl& decl) {
             }
 
             subscripts_["__subscript__" + std::to_string(nextClosureId_)] = info;
+            break;
+        }
+        case DeclKind::Init: {
+            // 生成 init 函数 / Generate init function
+            auto& id = static_cast<const InitDecl&>(decl);
+            // init 函数名使用类名.init
+            std::string initName = currentTypeNameForDeinit_ + ".init";
+            llvm::Function* initFunc = module_->getFunction(initName);
+            if (!initFunc) {
+                // 创建 init 函数类型：接收 self 指针，返回 void
+                std::vector<llvm::Type*> paramTypes;
+                paramTypes.push_back(llvm::PointerType::get(context_, 0)); // self
+                for (const auto& p : id.params) {
+                    paramTypes.push_back(resolveType(p.type.get()));
+                }
+                llvm::FunctionType* initTy = llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(context_), paramTypes, false);
+                initFunc = llvm::Function::Create(
+                    initTy, llvm::Function::ExternalLinkage, initName, module_.get());
+                functions_[initName] = initFunc;
+            }
+            // 生成 init 函数体（抑制属性观察器）
+            if (!id.body.empty()) {
+                llvm::BasicBlock* entry = llvm::BasicBlock::Create(context_, "entry", initFunc);
+                llvm::Function* prevFunc = currentFunc_;
+                bool prevInit = isInInitBody_;
+                currentFunc_ = initFunc;
+                isInInitBody_ = true;
+                builder_->SetInsertPoint(entry);
+                for (const auto& s : id.body) {
+                    if (s) genStmt(*s);
+                }
+                if (!builder_->GetInsertBlock()->getTerminator()) {
+                    builder_->CreateRetVoid();
+                }
+                currentFunc_ = prevFunc;
+                isInInitBody_ = prevInit;
+                builder_->SetInsertPoint(&currentFunc_->back());
+            }
             break;
         }
         case DeclKind::Deinit: {
@@ -2009,15 +2076,20 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                             result = builder_->CreateAShr(current, val, "shr");
                         }
                         if (result) {
-                            // 属性观察器：willSet（赋值前调用）
-                            auto obsIt2 = propertyObservers_.find(id.name);
-                            if (obsIt2 != propertyObservers_.end() && obsIt2->second.willSetFunc) {
-                                builder_->CreateCall(obsIt2->second.willSetFunc, {result});
+                            // 属性观察器：willSet（赋值前调用，init 中不调用）
+                            if (!isInInitBody_) {
+                                auto obsIt2 = propertyObservers_.find(id.name);
+                                if (obsIt2 != propertyObservers_.end() && obsIt2->second.willSetFunc) {
+                                    builder_->CreateCall(obsIt2->second.willSetFunc, {result});
+                                }
                             }
                             builder_->CreateStore(result, it->second);
-                            // 属性观察器：didSet（赋值后调用）
-                            if (obsIt2 != propertyObservers_.end() && obsIt2->second.didSetFunc) {
-                                builder_->CreateCall(obsIt2->second.didSetFunc, {result});
+                            // 属性观察器：didSet（赋值后调用，init 中不调用）
+                            if (!isInInitBody_) {
+                                auto obsIt2 = propertyObservers_.find(id.name);
+                                if (obsIt2 != propertyObservers_.end() && obsIt2->second.didSetFunc) {
+                                    builder_->CreateCall(obsIt2->second.didSetFunc, {result});
+                                }
                             }
                             return result;
                         }
@@ -2029,17 +2101,18 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                             val = builder_->CreateSIToFP(val, varType, "cast");
                         }
                     }
-                    // 属性观察器：willSet（赋值前调用）
-                    auto obsIt = propertyObservers_.find(id.name);
-                    if (obsIt != propertyObservers_.end()) {
-                        if (obsIt->second.willSetFunc) {
+                    // 属性观察器：willSet（赋值前调用，init 中不调用）
+                    if (!isInInitBody_) {
+                        auto obsIt = propertyObservers_.find(id.name);
+                        if (obsIt != propertyObservers_.end() && obsIt->second.willSetFunc) {
                             builder_->CreateCall(obsIt->second.willSetFunc, {val});
                         }
                     }
                     builder_->CreateStore(val, it->second);
-                    // 属性观察器：didSet（赋值后调用）
-                    if (obsIt != propertyObservers_.end()) {
-                        if (obsIt->second.didSetFunc) {
+                    // 属性观察器：didSet（赋值后调用，init 中不调用）
+                    if (!isInInitBody_) {
+                        auto obsIt = propertyObservers_.find(id.name);
+                        if (obsIt != propertyObservers_.end() && obsIt->second.didSetFunc) {
                             builder_->CreateCall(obsIt->second.didSetFunc, {val});
                         }
                     }

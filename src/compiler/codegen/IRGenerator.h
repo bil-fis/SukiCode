@@ -127,6 +127,7 @@ private:
         llvm::Type* valueType = nullptr;
     };
     std::unordered_map<std::string, PropertyObserver> propertyObservers_;
+    bool isInInitBody_ = false; // 是否在 init 函数体中（init 中不调用观察器）
 
     // subscript 注册 / Subscript registry
     struct SubscriptInfo {
