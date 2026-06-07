@@ -43,8 +43,22 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
   - super 实现父类类型查找
   - Self 返回当前处理的类型
   - 闭包变量捕获（支持 weak/unowned 语义）和返回类型
-  - for-in 数组迭代、可选链、强制解包、RTTI is 类型检查（类型标签比较）
+  - for-in 数组迭代、可选链、强制解包、RTTI is 类型检查
   - 计算属性 getter/setter、属性观察器 willSet/didSet（init 中抑制）
+  - subscript 代码生成、deinit 代码生成
+  - vtable 方法调度（含实例填充）、inout 参数指针传递
+  - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
+  - 泛型类型单态化（含字段索引映射）
+  - async/await LLVM 协程 intrinsics（coro.id/alloc/begin/suspend/end/free）
+  - select 语句（ChannelBase 回调机制检查就绪）
+  - 泛型 where 子句约束验证、-O 优化级别
+  - 访问控制语义检查、Opaque/Existential 类型
+  - 组合类型 A&B（CompositionType 跟踪所有协议）
+  - SetLiteral 堆分配存储、Selector 表达式代码生成
+  - import 实际加载模块文件（public 符号导出）
+  - 协议见证表（动态分发 + 类型填充 + ChannelBase 回调）
+  - 错误处理线程安全错误栈（ErrorStack.h/cpp）
+  - 类协议见证表生成
   - subscript 代码生成、deinit 代码生成
   - vtable 方法调度（含实例填充）、inout 参数指针传递
   - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
