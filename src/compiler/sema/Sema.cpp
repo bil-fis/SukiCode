@@ -2,6 +2,8 @@
 // Performs type checking, scope resolution, and validation on the parsed AST.
 
 #include "Sema.h"
+#include "compiler/lexer/Lexer.h"
+#include "compiler/parser/Parser.h"
 #include <fstream>
 #include <set>
 
@@ -148,12 +150,11 @@ void Sema::processDecl(Decl& decl) {
 
             importedModules_.push_back(imp.moduleName);
 
-            // 尝试查找模块文件 / Try to find module file
+            // 尝试查找并加载模块文件 / Try to find and load module file
             std::vector<std::string> searchPaths = {
                 imp.moduleName + ".suki",
-                "src/stdlib/" + imp.moduleName + ".suki",
                 "Sources/" + imp.moduleName + "/" + imp.moduleName + ".suki",
-                "../src/stdlib/" + imp.moduleName + ".suki",
+                "../Sources/" + imp.moduleName + "/" + imp.moduleName + ".suki",
             };
 
             std::string foundPath;
@@ -166,10 +167,50 @@ void Sema::processDecl(Decl& decl) {
             }
 
             if (!foundPath.empty()) {
-                // 模块文件存在，记录路径供后续加载
-                // Module file found, record path for later loading
-                // 实际的模块解析需要完整的编译管道支持
-                // Actual module parsing requires full compilation pipeline support
+                // 加载模块文件 / Load module file
+                std::ifstream file(foundPath);
+                std::string source((std::istreambuf_iterator<char>(file)),
+                                    std::istreambuf_iterator<char>());
+
+                // 词法分析 / Lexical analysis
+                Lexer lexer(source, foundPath, diag_);
+                auto tokens = lexer.lexAll();
+
+                // 语法分析 / Parsing
+                Parser parser(std::move(tokens), source, foundPath, diag_);
+                auto moduleCu = parser.parse();
+
+                if (!diag_.hadErrors() && moduleCu) {
+                    // 注册模块中的类型和函数 / Register types and functions from module
+                    for (const auto& modDecl : moduleCu->declarations) {
+                        if (!modDecl) continue;
+                        if (modDecl->declKind == DeclKind::Struct ||
+                            modDecl->declKind == DeclKind::Class ||
+                            modDecl->declKind == DeclKind::Enum ||
+                            modDecl->declKind == DeclKind::Protocol) {
+                            auto& td = static_cast<TypeDecl&>(*modDecl);
+                            Symbol* existing = symbols_.lookup(td.name);
+                            if (!existing) {
+                                Symbol sym;
+                                sym.kind = SymbolKind::Type;
+                                sym.name = td.name;
+                                sym.isPublic = true;
+                                symbols_.define(sym);
+                            }
+                        } else if (modDecl->declKind == DeclKind::Function) {
+                            auto& fd = static_cast<FunctionDecl&>(*modDecl);
+                            Symbol* existing = symbols_.lookup(fd.name);
+                            if (!existing) {
+                                Symbol sym;
+                                sym.kind = SymbolKind::Function;
+                                sym.name = fd.name;
+                                sym.isPublic = true;
+                                sym.isInitialized = true;
+                                symbols_.define(sym);
+                            }
+                        }
+                    }
+                }
             }
             // 内置模块（Core、System 等）通过标准库头文件提供
             // Built-in modules (Core, System etc.) are provided via stdlib headers
