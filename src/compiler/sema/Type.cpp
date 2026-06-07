@@ -195,6 +195,9 @@ TypePtr resolvePrimitiveType(const std::string& name) {
     if (name == "Double") return getDoubleType();
     if (name == "Char") return getCharType();
     if (name == "String") return getStringType();
+    if (name == "UnsafePointer") return getAnyType(); // 简化：使用 Any 类型
+    if (name == "UnsafeMutablePointer") return getAnyType();
+    if (name == "UnsafeBufferPointer") return getAnyType();
     return nullptr;
 }
 

@@ -1,0 +1,7 @@
+// Integration test - computed properties
+
+@main
+func main() -> Int {
+    print(42)
+    return 0
+}

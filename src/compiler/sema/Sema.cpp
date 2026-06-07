@@ -37,6 +37,9 @@ bool Sema::analyze(CompilationUnit& cu) {
     regType("UInt16");
     regType("UInt32");
     regType("UInt64");
+    regType("UnsafePointer");
+    regType("UnsafeMutablePointer");
+    regType("UnsafeBufferPointer");
     regType("Float");
     regType("Double");
     regType("Char");
