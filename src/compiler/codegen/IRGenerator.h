@@ -72,6 +72,7 @@ private:
     llvm::Value* genMemberAccess(const MemberAccessExpr& expr);
     llvm::Value* genArrayLiteral(const ArrayLiteralExpr& expr);
     llvm::Value* genDictLiteral(const DictLiteralExpr& expr);
+    llvm::Value* genSetLiteral(const SetLiteralExpr& expr);
     llvm::Value* genTupleExpr(const TupleExpr& expr);
     llvm::Value* genUnaryExpr(const UnaryExpr& expr);
     llvm::Value* genIfExpr(const IfExpr& expr);
@@ -128,6 +129,8 @@ private:
     };
     std::unordered_map<std::string, PropertyObserver> propertyObservers_;
     bool isInInitBody_ = false; // 是否在 init 函数体中（init 中不调用观察器）
+    bool isSuperCall_ = false; // 是否是 super 调用（用于父类方法分发）
+    std::string currentSuperclassName_; // 当前类的父类名称
 
     // subscript 注册 / Subscript registry
     struct SubscriptInfo {

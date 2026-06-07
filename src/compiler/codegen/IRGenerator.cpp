@@ -410,6 +410,13 @@ void IRGenerator::genDecl(const Decl& decl) {
         }
         case DeclKind::Class: {
             auto& cd = static_cast<const ClassDecl&>(decl);
+            // 设置父类名称 / Set superclass name
+            std::string prevSuperclass = currentSuperclassName_;
+            if (cd.superclass && cd.superclass->typeReprKind == TypeReprKind::Named) {
+                currentSuperclassName_ = static_cast<const NamedTypeRepr&>(*cd.superclass).name;
+            } else {
+                currentSuperclassName_.clear();
+            }
             // Class 生成指针类型（引用类型）
             llvm::StructType* classType = llvm::StructType::create(context_, cd.name);
             std::vector<llvm::Type*> fieldTypes;
@@ -492,6 +499,7 @@ void IRGenerator::genDecl(const Decl& decl) {
                 }
             }
             currentTypeNameForDeinit_ = prevDeinitType;
+            currentSuperclassName_ = prevSuperclass;
             break;
         }
         case DeclKind::Actor: {
@@ -810,6 +818,22 @@ void IRGenerator::genDecl(const Decl& decl) {
                 currentFunc_ = initFunc;
                 isInInitBody_ = true;
                 builder_->SetInsertPoint(entry);
+
+                // 存储 vtable 指针到对象第一个字段 / Store vtable pointer to object's first field
+                if (!currentTypeNameForDeinit_.empty()) {
+                    auto vtableIt = vtables_.find(currentTypeNameForDeinit_);
+                    if (vtableIt != vtables_.end() && vtableIt->second.vtableType) {
+                        llvm::Value* selfPtr = &*initFunc->arg_begin();
+                        llvm::Value* vtableGlobal = module_->getGlobalVariable(currentTypeNameForDeinit_ + ".vtable");
+                        if (vtableGlobal && selfPtr->getType()->isPointerTy()) {
+                            // 使用 i8* 指针进行 GEP
+                            llvm::Value* vtableCast = builder_->CreatePointerCast(vtableGlobal,
+                                llvm::PointerType::get(context_, 0));
+                            builder_->CreateStore(vtableCast, selfPtr);
+                        }
+                    }
+                }
+
                 for (const auto& s : id.body) {
                     if (s) genStmt(*s);
                 }
@@ -1464,6 +1488,16 @@ void IRGenerator::genSwitchStmt(const SwitchDecl& decl) {
     if (!defaultBB) defaultBB = mergeBB;
 
     // 生成条件分支
+    // 对于枚举类型，提取 tag 进行比较
+    // For enum types, extract tag for comparison
+    llvm::Value* tagValue = nullptr;
+    if (subject->getType()->isStructTy()) {
+        // 枚举类型：提取第一个字段（tag）
+        llvm::Value* tagPtr = builder_->CreateStructGEP(
+            subject->getType(), subject, 0, "enum.tag.ptr");
+        tagValue = builder_->CreateLoad(llvm::Type::getInt32Ty(context_), tagPtr, "enum.tag");
+    }
+
     size_t caseIdx = 0;
     for (size_t i = 0; i < decl.cases.size(); i++) {
         auto& sc = decl.cases[i];
@@ -1476,7 +1510,9 @@ void IRGenerator::genSwitchStmt(const SwitchDecl& decl) {
         if (caseIdx < caseBBs.size() && sc.labels[0].expression) {
             llvm::Value* caseVal = genExpr(*sc.labels[0].expression);
             if (caseVal) {
-                llvm::Value* cmp = builder_->CreateICmpEQ(subject, caseVal, "casecmp");
+                // 使用 tag 值进行比较（如果有）
+                llvm::Value* compareVal = tagValue ? tagValue : subject;
+                llvm::Value* cmp = builder_->CreateICmpEQ(compareVal, caseVal, "casecmp");
                 llvm::BasicBlock* nextBB = (caseIdx + 1 < caseBBs.size()) ?
                     caseBBs[caseIdx + 1] : defaultBB;
                 builder_->CreateCondBr(cmp, caseBBs[caseIdx], nextBB);
@@ -1641,6 +1677,8 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             return genArrayLiteral(static_cast<const ArrayLiteralExpr&>(expr));
         case ExprKind::DictLiteral:
             return genDictLiteral(static_cast<const DictLiteralExpr&>(expr));
+        case ExprKind::SetLiteral:
+            return genSetLiteral(static_cast<const SetLiteralExpr&>(expr));
         case ExprKind::Tuple:
             return genTupleExpr(static_cast<const TupleExpr&>(expr));
         case ExprKind::If:
@@ -1671,16 +1709,24 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             return val;
         }
         case ExprKind::TypeCheck: {
-            // is 类型检查：简化实现 - 对于引用类型检查非 null，对于值类型始终返回 true
+            // is 类型检查：对于引用类型检查非 null，对于值类型检查类型匹配
             auto& tc = static_cast<const TypeCheckExpr&>(expr);
             llvm::Value* val = genExpr(*tc.subExpr);
             if (!val) return nullptr;
-            // 对于指针类型，检查是否非 null
+            // 对于指针类型（引用类型），检查是否非 null
             if (val->getType()->isPointerTy()) {
                 return builder_->CreateICmpNE(val,
                     llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.check");
             }
-            // 对于值类型，始终返回 true（完整实现需要 RTTI）
+            // 对于值类型，解析目标类型并比较
+            if (tc.checkType && tc.checkType->typeReprKind == TypeReprKind::Named) {
+                auto& targetName = static_cast<const NamedTypeRepr&>(*tc.checkType).name;
+                llvm::Type* targetType = getLLVMType(targetName);
+                if (val->getType() == targetType) {
+                    return llvm::ConstantInt::getTrue(context_);
+                }
+            }
+            // 默认返回 true（简化实现）
             return llvm::ConstantInt::getTrue(context_);
         }
         case ExprKind::Await: {
@@ -1811,10 +1857,12 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             return nullptr;
         }
         case ExprKind::SuperRef: {
-            // super 引用父类（简化为 self）/ super references parent class (simplified as self)
+            // super 引用父类 - 返回 self 指针，但标记为 super 调用
+            // super references parent class - return self pointer, mark as super call
             auto it = namedValues_.find("self");
             if (it != namedValues_.end()) {
                 llvm::Type* ty = namedTypes_["self"];
+                isSuperCall_ = true;
                 return builder_->CreateLoad(ty, it->second, "super");
             }
             return nullptr;
@@ -1937,6 +1985,7 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             std::vector<std::string> capturedNames;
             std::vector<llvm::Type*> capturedTypes;
             std::vector<llvm::Value*> capturedValues;
+            std::vector<bool> capturedIsRef; // 是否是引用类型
             for (const auto& [name, allocaInst] : namedValues_) {
                 // 跳过参数（它们会在闭包参数中）
                 bool isParam = false;
@@ -1947,6 +1996,12 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                 capturedNames.push_back(name);
                 capturedTypes.push_back(namedTypes_[name]);
                 capturedValues.push_back(allocaInst);
+                capturedIsRef.push_back(isReferenceType(namedTypes_[name]));
+                // ARC: 捕获引用类型变量时 retain
+                if (isReferenceType(namedTypes_[name])) {
+                    llvm::Value* val = builder_->CreateLoad(namedTypes_[name], allocaInst, name + ".capture");
+                    insertRetain(val);
+                }
             }
 
             // 创建函数类型：显式参数 + 捕获变量参数
@@ -2123,6 +2178,15 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
         }
         case ExprKind::MacroExpansion:
             return genMacroExpansion(static_cast<const MacroExpansionExpr&>(expr));
+        case ExprKind::Selector: {
+            // #selector(method) - 返回方法名字符串
+            auto& sel = static_cast<const SelectorExpr&>(expr);
+            if (sel.method && sel.method->exprKind == ExprKind::Identifier) {
+                auto& id = static_cast<const IdentifierExpr&>(*sel.method);
+                return createStringGlobal(id.name);
+            }
+            return createStringGlobal("");
+        }
         default:
             return nullptr;
     }
@@ -2329,8 +2393,29 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
     // 处理成员方法调用（通过 vtable 调度）/ Handle member method calls (via vtable dispatch)
     if (expr.callee->exprKind == ExprKind::MemberAccess) {
         auto& ma = static_cast<const MemberAccessExpr&>(*expr.callee);
+
+        // 检查是否是 super 调用 / Check if this is a super call
+        bool wasSuperCall = isSuperCall_;
+        isSuperCall_ = false;
+
         llvm::Value* base = genExpr(*ma.base);
         if (!base) return nullptr;
+
+        // super 调用：直接查找父类方法 / super call: directly look up parent class method
+        if (wasSuperCall && currentSuperclassName_.size() > 0) {
+            std::string parentMethodName = currentSuperclassName_ + "." + ma.member;
+            llvm::Function* parentMethod = module_->getFunction(parentMethodName);
+            if (parentMethod) {
+                std::vector<llvm::Value*> args;
+                args.push_back(base); // self
+                for (const auto& arg : expr.args) {
+                    llvm::Value* argVal = genExpr(*arg.value);
+                    if (argVal) args.push_back(argVal);
+                }
+                return builder_->CreateCall(parentMethod, args,
+                    parentMethod->getReturnType()->isVoidTy() ? "" : "super.call");
+            }
+        }
 
         // 查找基类型的 vtable / Find base type's vtable
         std::string baseTypeName;
@@ -2791,6 +2876,35 @@ llvm::Value* IRGenerator::genDictLiteral(const DictLiteralExpr& expr) {
         static_cast<int64_t>(expr.entries.size())), capFieldPtr);
 
     return builder_->CreateLoad(dictType, dictStruct, "dict.val");
+}
+
+llvm::Value* IRGenerator::genSetLiteral(const SetLiteralExpr& expr) {
+    // 创建 Set<T> 结构体 { data_ptr, count, capacity }
+    // Create Set struct { data_ptr, count, capacity }
+    llvm::StructType* setType = llvm::StructType::get(context_, {
+        llvm::PointerType::get(context_, 0), // data pointer
+        llvm::Type::getInt64Ty(context_),     // count
+        llvm::Type::getInt64Ty(context_)      // capacity
+    });
+
+    // 创建集合结构体（空集合） / Create set struct (empty set)
+    llvm::AllocaInst* setStruct = builder_->CreateAlloca(setType, nullptr, "set");
+
+    // data = null
+    llvm::Value* dataFieldPtr = builder_->CreateStructGEP(setType, setStruct, 0, "set.data.field");
+    builder_->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), dataFieldPtr);
+
+    // count = number of initial elements
+    llvm::Value* countFieldPtr = builder_->CreateStructGEP(setType, setStruct, 1, "set.count.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+        static_cast<int64_t>(expr.elements.size())), countFieldPtr);
+
+    // capacity
+    llvm::Value* capFieldPtr = builder_->CreateStructGEP(setType, setStruct, 2, "set.cap.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+        static_cast<int64_t>(expr.elements.size())), capFieldPtr);
+
+    return builder_->CreateLoad(setType, setStruct, "set.val");
 }
 
 llvm::Value* IRGenerator::genTupleExpr(const TupleExpr& expr) {

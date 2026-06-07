@@ -923,6 +923,54 @@ void Sema::processClassDecl(ClassDecl& decl) {
         }
     }
 
+    // 协议符合性检查 / Protocol conformance checking
+    for (const auto& proto : decl.conformsTo) {
+        if (!proto) continue;
+        std::string protoName;
+        if (proto->typeReprKind == TypeReprKind::Named) {
+            protoName = static_cast<const NamedTypeRepr&>(*proto).name;
+        }
+        if (protoName.empty()) continue;
+
+        Symbol* protoSym = symbols_.lookup(protoName);
+        if (!protoSym || protoSym->kind != SymbolKind::Type) {
+            warning(decl.loc, "protocol '" + protoName + "' not found");
+            continue;
+        }
+
+        std::set<std::string> requiredMethods;
+        if (currentCu_) {
+            for (const auto& d : currentCu_->declarations) {
+                if (d && d->declKind == DeclKind::Protocol) {
+                    auto& pd = static_cast<const ProtocolDecl&>(*d);
+                    if (pd.name == protoName) {
+                        for (const auto& member : pd.members) {
+                            if (member && member->declKind == DeclKind::Function) {
+                                requiredMethods.insert(static_cast<const FunctionDecl&>(*member).name);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (const auto& methodName : requiredMethods) {
+            bool found = false;
+            for (const auto& member : decl.members) {
+                if (member && member->declKind == DeclKind::Function) {
+                    if (static_cast<const FunctionDecl&>(*member).name == methodName) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                error(decl.loc, "class '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
+            }
+        }
+    }
+
     currentTypeName_ = prevTypeName;
     currentSuperclassName_ = prevSuperclass;
 }
@@ -938,6 +986,55 @@ void Sema::processEnumDecl(EnumDecl& decl) {
             cs.name = c->name;
             cs.isPublic = isPublic;
             symbols_.define(cs);
+        }
+    }
+
+    // 协议符合性检查 / Protocol conformance checking
+    for (const auto& proto : decl.conformsTo) {
+        if (!proto) continue;
+        std::string protoName;
+        if (proto->typeReprKind == TypeReprKind::Named) {
+            protoName = static_cast<const NamedTypeRepr&>(*proto).name;
+        }
+        if (protoName.empty()) continue;
+
+        Symbol* protoSym = symbols_.lookup(protoName);
+        if (!protoSym || protoSym->kind != SymbolKind::Type) {
+            warning(decl.loc, "protocol '" + protoName + "' not found");
+            continue;
+        }
+
+        std::set<std::string> requiredMethods;
+        if (currentCu_) {
+            for (const auto& d : currentCu_->declarations) {
+                if (d && d->declKind == DeclKind::Protocol) {
+                    auto& pd = static_cast<const ProtocolDecl&>(*d);
+                    if (pd.name == protoName) {
+                        for (const auto& member : pd.members) {
+                            if (member && member->declKind == DeclKind::Function) {
+                                requiredMethods.insert(static_cast<const FunctionDecl&>(*member).name);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (const auto& methodName : requiredMethods) {
+            bool found = false;
+            // 枚举的方法在 cases 中，不在 members 中
+            // Enum methods are in cases, not members
+            // 检查是否有同名的 case（简化）
+            for (const auto& c : decl.cases) {
+                if (c && c->name == methodName) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                warning(decl.loc, "enum '" + decl.name + "' may not implement required method '" + methodName + "' from protocol '" + protoName + "'");
+            }
         }
     }
 }
@@ -1374,11 +1471,20 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
             return std::make_shared<TupleType>(std::move(elems));
         }
         case TypeReprKind::Composition: {
-            // A & B 组合类型 — 返回所有协议的联合类型
-            // Composition type: return the primary protocol type
+            // A & B 组合类型 — 返回第一个协议类型（主协议）
+            // Composition type: return the first protocol type (primary)
             auto& c = static_cast<const CompositionTypeRepr&>(tr);
             if (!c.protocols.empty()) {
-                // 返回第一个协议类型（主协议）
+                // 验证所有协议类型存在 / Verify all protocol types exist
+                for (const auto& proto : c.protocols) {
+                    if (proto) {
+                        TypePtr protoType = resolveTypeRepr(*proto);
+                        if (!protoType || protoType->kind() == TypeKind::Error) {
+                            error(tr.loc, "protocol in composition type not found");
+                        }
+                    }
+                }
+                // 返回第一个协议类型
                 return resolveTypeRepr(*c.protocols[0]);
             }
             return getAnyType();
