@@ -620,6 +620,11 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
                 Symbol* constraintSym = symbols_.lookup(ntr.name);
                 if (!constraintSym) {
                     warning(decl.loc, "where clause constraint type '" + ntr.name + "' not found");
+                } else {
+                    // 验证约束类型是协议或类 / Verify constraint is a protocol or class
+                    if (constraintSym->kind != SymbolKind::Type) {
+                        warning(decl.loc, "where clause constraint '" + ntr.name + "' is not a type");
+                    }
                 }
             }
         }
