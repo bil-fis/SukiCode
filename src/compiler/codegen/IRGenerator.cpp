@@ -1743,25 +1743,61 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             return val;
         }
         case ExprKind::TypeCheck: {
-            // is 类型检查：对于引用类型检查非 null，对于值类型检查类型匹配
+            // is 类型检查：RTTI 类型标签比较
             auto& tc = static_cast<const TypeCheckExpr&>(expr);
             llvm::Value* val = genExpr(*tc.subExpr);
             if (!val) return nullptr;
-            // 对于指针类型（引用类型），检查是否非 null
-            if (val->getType()->isPointerTy()) {
-                return builder_->CreateICmpNE(val,
-                    llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.check");
+
+            if (!tc.checkType) return llvm::ConstantInt::getTrue(context_);
+
+            // 解析目标类型名
+            std::string targetTypeName;
+            if (tc.checkType->typeReprKind == TypeReprKind::Named) {
+                targetTypeName = static_cast<const NamedTypeRepr&>(*tc.checkType).name;
             }
-            // 对于值类型，解析目标类型并比较
-            if (tc.checkType && tc.checkType->typeReprKind == TypeReprKind::Named) {
-                auto& targetName = static_cast<const NamedTypeRepr&>(*tc.checkType).name;
-                llvm::Type* targetType = getLLVMType(targetName);
+
+            // 对于值类型，比较 LLVM 类型
+            if (!val->getType()->isPointerTy()) {
+                llvm::Type* targetType = getLLVMType(targetTypeName);
                 if (val->getType() == targetType) {
                     return llvm::ConstantInt::getTrue(context_);
                 }
+                return llvm::ConstantInt::getFalse(context_);
             }
-            // 默认返回 true（简化实现）
-            return llvm::ConstantInt::getTrue(context_);
+
+            // 对于引用类型（指针），检查是否非 null
+            // 完整 RTTI 需要类型标签比较
+            llvm::Value* isNonNull = builder_->CreateICmpNE(val,
+                llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.nonnull");
+
+            // 如果目标类型是已知的结构体/类，生成类型 ID 比较
+            auto structIt = structTypes_.find(targetTypeName);
+            if (structIt != structTypes_.end()) {
+                // 生成类型 ID 常量
+                llvm::GlobalVariable* typeIdGlobal = module_->getGlobalVariable(targetTypeName + ".typeid");
+                if (!typeIdGlobal) {
+                    llvm::Constant* typeId = llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(context_), std::hash<std::string>{}(targetTypeName));
+                    typeIdGlobal = new llvm::GlobalVariable(*module_,
+                        llvm::Type::getInt64Ty(context_), true,
+                        llvm::GlobalValue::InternalLinkage, typeId, targetTypeName + ".typeid");
+                }
+                // 从对象加载类型 ID（假设在 vtable 指针之后）
+                llvm::Value* typeIdPtr = builder_->CreateGEP(
+                    llvm::Type::getInt8Ty(context_), val,
+                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), sizeof(void*)),
+                    "typeid.ptr");
+                llvm::Value* typeIdCast = builder_->CreatePointerCast(typeIdPtr,
+                    llvm::PointerType::get(context_, 0));
+                llvm::Value* loadedTypeId = builder_->CreateLoad(
+                    llvm::Type::getInt64Ty(context_), typeIdCast, "typeid.loaded");
+                llvm::Value* expectedTypeId = builder_->CreateLoad(
+                    llvm::Type::getInt64Ty(context_), typeIdGlobal, "typeid.expected");
+                llvm::Value* typeMatch = builder_->CreateICmpEQ(loadedTypeId, expectedTypeId, "typeid.match");
+                return builder_->CreateAnd(isNonNull, typeMatch, "is.check");
+            }
+
+            return isNonNull;
         }
         case ExprKind::Await: {
             auto& ae = static_cast<const AwaitExpr&>(expr);
