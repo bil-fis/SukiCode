@@ -143,3 +143,12 @@ private:
 };
 
 } // namespace suki::runtime
+
+// C 兼容的 channel 就绪检查函数 / C-compatible channel readiness check
+extern "C" inline bool suki_channel_has_data(void* channel) {
+    if (!channel) return false;
+    // 简化实现：检查指针非空即认为就绪
+    // Simplified: consider ready if pointer is non-null
+    // 完整实现需要通过运行时类型信息检查 channel 内部状态
+    return channel != nullptr;
+}

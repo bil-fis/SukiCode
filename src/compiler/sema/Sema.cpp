@@ -191,8 +191,18 @@ void Sema::processDecl(Decl& decl) {
                         if (modDecl) processDecl(*modDecl);
                     }
 
-                    // 离开模块作用域（保留 public 符号）
-                    // Leave module scope (retain public symbols)
+                    // 收集 public 符号并复制到父作用域
+                    // Collect public symbols and copy to parent scope
+                    auto currentScope = symbols_.currentScope();
+                    if (currentScope && currentScope->parent()) {
+                        for (const auto& [name, sym] : currentScope->symbols()) {
+                            if (sym.isPublic) {
+                                currentScope->parent()->define(sym);
+                            }
+                        }
+                    }
+
+                    // 离开模块作用域
                     symbols_.leaveScope();
                 }
             }

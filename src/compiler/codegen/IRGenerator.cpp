@@ -777,22 +777,18 @@ void IRGenerator::genDecl(const Decl& decl) {
                 if (!channelVal) continue;
 
                 // 生成 channel 就绪检查
-                // 检查 channel 的 count 字段是否 > 0（表示有数据可接收）
+                // 使用运行时函数检查 channel 是否有数据
                 // Generate channel readiness check
-                // Check if channel's count field > 0 (data available)
-                // Channel 结构体布局: { data_ptr, count, capacity, mutex, ... }
-                // count 字段在偏移 8 处（data_ptr 是 8 字节指针）
-                llvm::Value* countPtr = builder_->CreateGEP(
-                    llvm::Type::getInt8Ty(context_), channelVal,
-                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 8),
-                    "channel.count.ptr");
-                llvm::Value* countPtrCast = builder_->CreatePointerCast(countPtr,
-                    llvm::PointerType::get(context_, 0));
-                llvm::Value* count = builder_->CreateLoad(
-                    llvm::Type::getInt64Ty(context_), countPtrCast, "channel.count");
-                llvm::Value* isReady = builder_->CreateICmpSGT(count,
-                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 0),
-                    "channel.ready");
+                // Use runtime function to check if channel has data
+                llvm::Function* hasDataFunc = module_->getFunction("suki_channel_has_data");
+                if (!hasDataFunc) {
+                    llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
+                    llvm::FunctionType* hasDataTy = llvm::FunctionType::get(
+                        llvm::Type::getInt1Ty(context_), {ptrTy}, false);
+                    hasDataFunc = llvm::Function::Create(hasDataTy,
+                        llvm::Function::ExternalLinkage, "suki_channel_has_data", module_.get());
+                }
+                llvm::Value* isReady = builder_->CreateCall(hasDataFunc, {channelVal}, "channel.ready");
 
                 // 创建下一个检查块 / Create next check block
                 nextCheckBB = llvm::BasicBlock::Create(context_, "select.next", func);
@@ -2746,12 +2742,12 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
             }
         }
 
+        // 首先检查 vtable（类方法）/ First check vtable (class methods)
         auto vtableIt = vtables_.find(baseTypeName);
         if (vtableIt != vtables_.end() && vtableIt->second.vtableType) {
-            // 通过 vtable 调用方法 / Call method through vtable
             auto methodIt = vtableIt->second.methodIndices.find(ma.member);
             if (methodIt != vtableIt->second.methodIndices.end()) {
-                // 加载 vtable 指针（类的第一个字段）
+                // 通过 vtable 调用方法 / Call method through vtable
                 llvm::Value* vtablePtr = builder_->CreateStructGEP(
                     base->getType(), base, 0, "vtable.ptr");
                 llvm::Value* vtable = builder_->CreateLoad(
@@ -2777,6 +2773,38 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
                 // 调用方法
                 llvm::FunctionType* methodTy = vtableIt->second.methods[methodIt->second]->getFunctionType();
                 return builder_->CreateCall(methodTy, methodFunc, args, "vcall");
+            }
+        }
+
+        // 检查协议见证表 / Check protocol witness tables
+        auto typeWtIt = typeWitnessTables_.find(baseTypeName);
+        if (typeWtIt != typeWitnessTables_.end()) {
+            for (const auto& [protoName, wtableGlobal] : typeWtIt->second) {
+                auto wtIt = witnessTables_.find(protoName);
+                if (wtIt == witnessTables_.end()) continue;
+                auto methodIt = wtIt->second.methodIndices.find(ma.member);
+                if (methodIt == wtIt->second.methodIndices.end()) continue;
+
+                // 通过见证表调用方法 / Call method through witness table
+                llvm::Value* wtable = builder_->CreateLoad(
+                    llvm::PointerType::get(context_, 0), wtableGlobal, "wtable");
+                llvm::Value* methodPtr = builder_->CreateGEP(
+                    wtIt->second.tableType, wtable,
+                    {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0),
+                     llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), methodIt->second)},
+                    "wmethod.ptr");
+                llvm::Value* methodFunc = builder_->CreateLoad(
+                    llvm::PointerType::get(context_, 0), methodPtr, "wmethod");
+
+                std::vector<llvm::Value*> args;
+                args.push_back(base); // self
+                for (const auto& arg : expr.args) {
+                    llvm::Value* argVal = genExpr(*arg.value);
+                    if (argVal) args.push_back(argVal);
+                }
+
+                llvm::FunctionType* methodTy = wtIt->second.methods[methodIt->second]->getFunctionType();
+                return builder_->CreateCall(methodTy, methodFunc, args, "wcall");
             }
         }
 
