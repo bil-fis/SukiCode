@@ -109,19 +109,22 @@ public:
         return queue_.empty() ? 0 : 1;
     }
 
-    // 静态回调用于 select 代码生成 / Static callback for select codegen
-    static int channelHasDataCallback(void* channel) {
-        if (!channel) return 0;
-        // 类型擦除的就绪检查 / Type-erased readiness check
-        // 实际实现需要运行时类型信息
-        // 简化：检查指针有效性
-        try {
-            volatile char probe = *static_cast<volatile char*>(channel);
-            (void)probe;
-            return 1;
-        } catch (...) {
-            return 0;
-        }
+    // 实例级就绪检查回调 / Instance-level readiness check callback
+    // 存储类型擦除的检查函数
+    using HasDataFunc = int(*)(void*, void*);
+    HasDataFunc hasDataFunc_ = nullptr;
+    void* hasDataCtx_ = nullptr;
+
+    // 设置就绪检查 / Set readiness check
+    void setHasDataFunc(HasDataFunc func, void* ctx) {
+        hasDataFunc_ = func;
+        hasDataCtx_ = ctx;
+    }
+
+    // 调用就绪检查 / Invoke readiness check
+    int invokeHasDataCheck() const {
+        if (hasDataFunc_) return hasDataFunc_(hasDataCtx_, nullptr);
+        return hasData() ? 1 : 0;
     }
 
     // 检查通道是否已关闭 / Check if channel is closed
@@ -166,23 +169,24 @@ private:
 } // namespace suki::runtime
 
 // C 兼容的 channel 就绪检查函数 / C-compatible channel readiness check
-// 使用 Channel 对象的 hasDataC 方法
-// 由于 Channel 是模板类，我们无法直接从 C 调用其方法
-// 因此使用函数指针回调机制
-typedef int (*ChannelHasDataFunc)(void*);
+// 通过 Channel 实例存储的回调函数检查就绪状态
+// Uses callback stored by Channel instance to check readiness
+typedef int (*SukiChannelHasDataFunc)(void*, void*);
 
-// 全局函数指针，由 Channel 实例在创建时设置
-// Global function pointer, set by Channel instance on creation
-static ChannelHasDataFunc g_channelHasDataFunc = nullptr;
+// 全局回调注册 / Global callback registration
+static SukiChannelHasDataFunc g_channelHasDataFunc = nullptr;
+static void* g_channelHasDataCtx = nullptr;
 
-extern "C" inline void suki_set_channel_has_data_func(ChannelHasDataFunc func) {
+extern "C" inline void suki_set_channel_has_data_func(SukiChannelHasDataFunc func, void* ctx) {
     g_channelHasDataFunc = func;
+    g_channelHasDataCtx = ctx;
 }
 
 extern "C" inline bool suki_channel_has_data(void* channel) {
     if (!channel) return false;
+    // 通过全局回调检查 / Check via global callback
     if (g_channelHasDataFunc) {
-        return g_channelHasDataFunc(channel) != 0;
+        return g_channelHasDataFunc(channel, g_channelHasDataCtx) != 0;
     }
     // 回退：检查指针有效性 / Fallback: check pointer validity
     return channel != nullptr;
