@@ -292,10 +292,44 @@ llvm::Type* IRGenerator::resolveType(const TypeRepr* tr) {
             if (structIt != structTypes_.end()) {
                 // 创建特化版本 / Create specialized version
                 llvm::StructType* specType = llvm::StructType::create(context_, specName);
-                // 获取原始类型的字段类型并替换泛型参数
+
+                // 收集泛型参数名和对应的具体类型
+                std::vector<std::string> genericParamNames;
+                std::vector<llvm::Type*> concreteTypes;
+                for (size_t i = 0; i < n.genericArgs.size(); i++) {
+                    concreteTypes.push_back(resolveType(n.genericArgs[i].get()));
+                }
+
+                // 查找原始结构体声明以获取泛型参数名
+                if (currentCu_) {
+                    for (const auto& d : currentCu_->declarations) {
+                        if (d && d->declKind == DeclKind::Struct) {
+                            auto& sd = static_cast<const StructDecl&>(*d);
+                            if (sd.name == n.name) {
+                                for (const auto& gp : sd.genericParams) {
+                                    genericParamNames.push_back(gp.name);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 替换字段类型中的泛型参数
                 std::vector<llvm::Type*> bodyTypes;
                 for (size_t i = 0; i < structIt->second->getNumElements(); i++) {
-                    bodyTypes.push_back(structIt->second->getElementType(i));
+                    llvm::Type* fieldType = structIt->second->getElementType(i);
+                    // 检查字段类型名是否匹配泛型参数
+                    if (fieldType->isStructTy()) {
+                        std::string fieldTypeName = fieldType->getStructName().str();
+                        for (size_t j = 0; j < genericParamNames.size(); j++) {
+                            if (fieldTypeName == genericParamNames[j] && j < concreteTypes.size()) {
+                                fieldType = concreteTypes[j];
+                                break;
+                            }
+                        }
+                    }
+                    bodyTypes.push_back(fieldType);
                 }
                 specType->setBody(bodyTypes);
                 genericTypeInstances_[specName] = specType;
@@ -1980,12 +2014,29 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             auto& closure = static_cast<const ClosureExpr&>(expr);
             std::string funcName = "__closure_" + std::to_string(nextClosureId_++);
 
+            // 解析捕获列表 / Parse capture list
+            // 格式: "weak self", "unowned delegate", "strong varName"
+            std::unordered_map<std::string, std::string> captureSemantics; // name -> "weak"/"unowned"/"strong"
+            for (const auto& capture : closure.captureList) {
+                std::string name = capture;
+                std::string semantic = "strong"; // 默认强引用
+                if (name.substr(0, 5) == "weak ") {
+                    semantic = "weak";
+                    name = name.substr(5);
+                } else if (name.substr(0, 8) == "unowned ") {
+                    semantic = "unowned";
+                    name = name.substr(8);
+                }
+                captureSemantics[name] = semantic;
+            }
+
             // 收集需要捕获的变量（当前作用域中的所有变量）
             // Collect variables to capture (all variables in current scope)
             std::vector<std::string> capturedNames;
             std::vector<llvm::Type*> capturedTypes;
             std::vector<llvm::Value*> capturedValues;
-            std::vector<bool> capturedIsRef; // 是否是引用类型
+            std::vector<bool> capturedIsRef;
+            std::vector<std::string> capturedSemantic; // "weak"/"unowned"/"strong"
             for (const auto& [name, allocaInst] : namedValues_) {
                 // 跳过参数（它们会在闭包参数中）
                 bool isParam = false;
@@ -1997,10 +2048,19 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                 capturedTypes.push_back(namedTypes_[name]);
                 capturedValues.push_back(allocaInst);
                 capturedIsRef.push_back(isReferenceType(namedTypes_[name]));
-                // ARC: 捕获引用类型变量时 retain
+
+                // 确定捕获语义 / Determine capture semantics
+                auto capIt = captureSemantics.find(name);
+                std::string semantic = (capIt != captureSemantics.end()) ? capIt->second : "strong";
+                capturedSemantic.push_back(semantic);
+
+                // ARC: 根据捕获语义处理引用类型
                 if (isReferenceType(namedTypes_[name])) {
                     llvm::Value* val = builder_->CreateLoad(namedTypes_[name], allocaInst, name + ".capture");
-                    insertRetain(val);
+                    if (semantic == "strong") {
+                        insertRetain(val);
+                    }
+                    // weak 和 unowned 不需要 retain
                 }
             }
 
@@ -2887,22 +2947,50 @@ llvm::Value* IRGenerator::genSetLiteral(const SetLiteralExpr& expr) {
         llvm::Type::getInt64Ty(context_)      // capacity
     });
 
-    // 创建集合结构体（空集合） / Create set struct (empty set)
+    // 确定元素类型 / Determine element type
+    llvm::Type* elemType = llvm::Type::getInt64Ty(context_); // 默认 i64
+    if (!expr.elements.empty()) {
+        llvm::Value* first = genExpr(*expr.elements[0]);
+        if (first) elemType = first->getType();
+    }
+
+    int64_t elemCount = static_cast<int64_t>(expr.elements.size());
+
+    // 分配元素缓冲区 / Allocate element buffer
+    llvm::AllocaInst* dataBuf = builder_->CreateAlloca(elemType,
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), "set.data");
+
+    // 存储每个元素 / Store each element
+    for (size_t i = 0; i < expr.elements.size(); i++) {
+        llvm::Value* elem = genExpr(*expr.elements[i]);
+        if (!elem) continue;
+        if (elem->getType() != elemType) {
+            if (elemType->isDoubleTy() && elem->getType()->isIntegerTy()) {
+                elem = builder_->CreateSIToFP(elem, elemType, "set.cast");
+            } else if (elemType->isIntegerTy(64) && elem->getType()->isIntegerTy()) {
+                elem = builder_->CreateSExt(elem, elemType, "set.cast");
+            }
+        }
+        llvm::Value* ptr = builder_->CreateGEP(elemType, dataBuf,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), i), "set.elem.ptr");
+        builder_->CreateStore(elem, ptr);
+    }
+
+    // 创建集合结构体 / Create set struct
     llvm::AllocaInst* setStruct = builder_->CreateAlloca(setType, nullptr, "set");
 
-    // data = null
+    // data = pointer to buffer
     llvm::Value* dataFieldPtr = builder_->CreateStructGEP(setType, setStruct, 0, "set.data.field");
-    builder_->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), dataFieldPtr);
+    llvm::Value* dataAsPtr = builder_->CreatePointerCast(dataBuf, llvm::PointerType::get(context_, 0));
+    builder_->CreateStore(dataAsPtr, dataFieldPtr);
 
-    // count = number of initial elements
+    // count = number of elements
     llvm::Value* countFieldPtr = builder_->CreateStructGEP(setType, setStruct, 1, "set.count.field");
-    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
-        static_cast<int64_t>(expr.elements.size())), countFieldPtr);
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), countFieldPtr);
 
-    // capacity
+    // capacity = count
     llvm::Value* capFieldPtr = builder_->CreateStructGEP(setType, setStruct, 2, "set.cap.field");
-    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
-        static_cast<int64_t>(expr.elements.size())), capFieldPtr);
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), capFieldPtr);
 
     return builder_->CreateLoad(setType, setStruct, "set.val");
 }

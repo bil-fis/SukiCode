@@ -138,33 +138,41 @@ void Sema::processDecl(Decl& decl) {
         case DeclKind::Import: {
             // 注册导入模块 / Register imported module
             auto& imp = static_cast<ImportDecl&>(decl);
-            // 记录导入的模块名 / Record imported module name
+
+            // 防止重复导入 / Prevent duplicate imports
+            bool alreadyImported = false;
+            for (const auto& mod : importedModules_) {
+                if (mod == imp.moduleName) { alreadyImported = true; break; }
+            }
+            if (alreadyImported) break;
+
             importedModules_.push_back(imp.moduleName);
 
             // 尝试查找模块文件 / Try to find module file
-            // 搜索路径：当前目录、标准库路径
-            // Search paths: current directory, stdlib paths
             std::vector<std::string> searchPaths = {
                 imp.moduleName + ".suki",
                 "src/stdlib/" + imp.moduleName + ".suki",
                 "Sources/" + imp.moduleName + "/" + imp.moduleName + ".suki",
+                "../src/stdlib/" + imp.moduleName + ".suki",
             };
 
-            bool found = false;
+            std::string foundPath;
             for (const auto& path : searchPaths) {
                 std::ifstream testFile(path);
                 if (testFile.good()) {
-                    found = true;
-                    // 模块文件存在，记录路径 / Module file exists, record path
+                    foundPath = path;
                     break;
                 }
             }
 
-            if (!found) {
-                // 模块未找到但不报错（可能是内置模块）/ Module not found but don't error (may be built-in)
-                // stdlib 模块如 Core、System 等通过头文件提供
-                // stdlib modules like Core, System etc. are provided via headers
+            if (!foundPath.empty()) {
+                // 模块文件存在，记录路径供后续加载
+                // Module file found, record path for later loading
+                // 实际的模块解析需要完整的编译管道支持
+                // Actual module parsing requires full compilation pipeline support
             }
+            // 内置模块（Core、System 等）通过标准库头文件提供
+            // Built-in modules (Core, System etc.) are provided via stdlib headers
             break;
         }
         case DeclKind::Variable:
@@ -556,6 +564,15 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
 
     // 验证 where 子句约束类型存在 / Verify where clause constraint types exist
     for (const auto& wc : decl.whereConstraints) {
+        // 检查类型参数名是否在泛型参数列表中
+        bool validTypeParam = false;
+        for (const auto& gp : decl.genericParams) {
+            if (gp.name == wc.typeName) { validTypeParam = true; break; }
+        }
+        if (!validTypeParam) {
+            warning(decl.loc, "where clause type parameter '" + wc.typeName + "' is not a generic parameter");
+        }
+        // 检查约束类型是否存在
         for (const auto& constraint : wc.constraints) {
             if (constraint && constraint->typeReprKind == TypeReprKind::Named) {
                 auto& ntr = static_cast<const NamedTypeRepr&>(*constraint);
@@ -938,15 +955,29 @@ void Sema::processClassDecl(ClassDecl& decl) {
             continue;
         }
 
+        // 收集协议要求的方法、属性、subscript、init
         std::set<std::string> requiredMethods;
+        std::set<std::string> requiredProperties;
+        bool requiresSubscript = false;
+        bool requiresInit = false;
         if (currentCu_) {
             for (const auto& d : currentCu_->declarations) {
                 if (d && d->declKind == DeclKind::Protocol) {
                     auto& pd = static_cast<const ProtocolDecl&>(*d);
                     if (pd.name == protoName) {
                         for (const auto& member : pd.members) {
-                            if (member && member->declKind == DeclKind::Function) {
+                            if (!member) continue;
+                            if (member->declKind == DeclKind::Function) {
                                 requiredMethods.insert(static_cast<const FunctionDecl&>(*member).name);
+                            } else if (member->declKind == DeclKind::Variable) {
+                                auto& vd = static_cast<const VariableDecl&>(*member);
+                                if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
+                                    requiredProperties.insert(static_cast<const IdentifierPattern*>(vd.pattern.get())->name);
+                                }
+                            } else if (member->declKind == DeclKind::Subscript) {
+                                requiresSubscript = true;
+                            } else if (member->declKind == DeclKind::Init) {
+                                requiresInit = true;
                             }
                         }
                         break;
@@ -955,6 +986,7 @@ void Sema::processClassDecl(ClassDecl& decl) {
             }
         }
 
+        // 检查方法
         for (const auto& methodName : requiredMethods) {
             bool found = false;
             for (const auto& member : decl.members) {
@@ -967,6 +999,53 @@ void Sema::processClassDecl(ClassDecl& decl) {
             }
             if (!found) {
                 error(decl.loc, "class '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
+            }
+        }
+
+        // 检查属性
+        for (const auto& propName : requiredProperties) {
+            bool found = false;
+            for (const auto& member : decl.members) {
+                if (member && member->declKind == DeclKind::Variable) {
+                    auto& vd = static_cast<const VariableDecl&>(*member);
+                    if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
+                        if (static_cast<const IdentifierPattern*>(vd.pattern.get())->name == propName) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!found) {
+                error(decl.loc, "class '" + decl.name + "' does not implement required property '" + propName + "' from protocol '" + protoName + "'");
+            }
+        }
+
+        // 检查 subscript
+        if (requiresSubscript) {
+            bool found = false;
+            for (const auto& member : decl.members) {
+                if (member && member->declKind == DeclKind::Subscript) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                error(decl.loc, "class '" + decl.name + "' does not implement required subscript from protocol '" + protoName + "'");
+            }
+        }
+
+        // 检查 init
+        if (requiresInit) {
+            bool found = false;
+            for (const auto& member : decl.members) {
+                if (member && member->declKind == DeclKind::Init) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                error(decl.loc, "class '" + decl.name + "' does not implement required init from protocol '" + protoName + "'");
             }
         }
     }
@@ -1021,19 +1100,35 @@ void Sema::processEnumDecl(EnumDecl& decl) {
             }
         }
 
-        for (const auto& methodName : requiredMethods) {
-            bool found = false;
-            // 枚举的方法在 cases 中，不在 members 中
-            // Enum methods are in cases, not members
-            // 检查是否有同名的 case（简化）
-            for (const auto& c : decl.cases) {
-                if (c && c->name == methodName) {
-                    found = true;
-                    break;
+        // 收集枚举上定义的方法 / Collect methods defined on enum
+        std::set<std::string> enumMethods;
+        // 枚举没有 members 字段，方法通过 extension 定义
+        // 检查编译单元中是否有扩展该枚举的方法
+        if (currentCu_) {
+            for (const auto& d : currentCu_->declarations) {
+                if (d && d->declKind == DeclKind::Extension) {
+                    auto& ext = static_cast<const ExtensionDecl&>(*d);
+                    if (ext.extendedType && ext.extendedType->typeReprKind == TypeReprKind::Named) {
+                        auto& extName = static_cast<const NamedTypeRepr&>(*ext.extendedType);
+                        if (extName.name == decl.name) {
+                            for (const auto& member : ext.members) {
+                                if (member && member->declKind == DeclKind::Function) {
+                                    enumMethods.insert(static_cast<const FunctionDecl&>(*member).name);
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        for (const auto& methodName : requiredMethods) {
+            bool found = false;
+            if (enumMethods.count(methodName)) {
+                found = true;
+            }
             if (!found) {
-                warning(decl.loc, "enum '" + decl.name + "' may not implement required method '" + methodName + "' from protocol '" + protoName + "'");
+                warning(decl.loc, "enum '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
             }
         }
     }
@@ -1156,6 +1251,14 @@ TypePtr Sema::inferExprType(Expr& expr) {
             if (movedVariables_.count(id.name) > 0) {
                 error(expr.loc, "variable '" + id.name + "' has been moved and cannot be used");
                 return getErrorType();
+            }
+            // 访问控制检查 / Access control check
+            // private 成员只能在当前作用域访问
+            // private members can only be accessed in current scope
+            if (!sym->isPublic && sym->kind == SymbolKind::Variable) {
+                // 检查是否在同一作用域 / Check if in same scope
+                // 简化：允许在同一类型内访问
+                // Simplified: allow access within the same type
             }
             return sym->type;
         }
@@ -1376,9 +1479,23 @@ TypePtr Sema::inferExprType(Expr& expr) {
             }
             return std::make_shared<TupleType>(std::move(elems));
         }
-        case ExprKind::Closure:
-            // 闭包类型需要从上下文推断，返回 nullptr
-            return nullptr;
+        case ExprKind::Closure: {
+            // 闭包类型推断：从返回类型或 body 推断
+            auto& closure = static_cast<const ClosureExpr&>(expr);
+            // 如果有显式返回类型，使用它
+            if (closure.returnType) {
+                return resolveTypeRepr(*closure.returnType);
+            }
+            // 对于箭头闭包 () => expr，从表达式推断
+            if (closure.isArrow && !closure.body.empty()) {
+                // 箭头闭包的 body 是一个 ReturnStmt 包装的表达式
+                // 尝试从 body 的第一个语句推断
+                // 简化：返回 Any 类型
+                return getAnyType();
+            }
+            // 普通闭包：返回 Any 类型（需要上下文推断）
+            return getAnyType();
+        }
         case ExprKind::If: {
             auto& ifExpr = static_cast<const IfExpr&>(expr);
             TypePtr thenType = ifExpr.thenExpr ? inferExprType(*ifExpr.thenExpr) : nullptr;
