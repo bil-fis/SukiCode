@@ -1713,6 +1713,23 @@ void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
 
     // Catch 块 / Catch block
     builder_->SetInsertPoint(catchBB);
+
+    // 从全局变量加载错误值 / Load error value from global variable
+    llvm::GlobalVariable* errorGlobal = module_->getGlobalVariable("__suki_thrown_error");
+    if (!errorGlobal) {
+        errorGlobal = new llvm::GlobalVariable(*module_,
+            llvm::PointerType::get(context_, 0), false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
+            "__suki_thrown_error");
+    }
+    llvm::Value* thrownError = builder_->CreateLoad(
+        llvm::PointerType::get(context_, 0), errorGlobal, "thrown.error");
+    // 清除错误值 / Clear error value
+    builder_->CreateStore(
+        llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), errorGlobal);
+
+    // 生成 catch 块体 / Generate catch block body
     for (const auto& catchClause : decl.catches) {
         for (const auto& s : catchClause.body) {
             if (s) genStmt(*s);
@@ -1729,7 +1746,6 @@ void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
 void IRGenerator::genThrowStmt(const ThrowDecl& decl) {
     // 使用 longjmp 进行异常跳转 / Use longjmp for exception jumping
     // 如果有 catch 块，跳转到 catch 块；否则直接返回
-    // If there is a catch block, jump to it; otherwise return directly
 
     // 生成错误值 / Generate error value
     llvm::Value* errorVal = nullptr;
@@ -1737,10 +1753,27 @@ void IRGenerator::genThrowStmt(const ThrowDecl& decl) {
         errorVal = genExpr(*decl.value);
     }
 
+    // 存储错误值到全局变量（供 catch 块使用）
+    // Store error value to global variable (for catch block to use)
+    if (errorVal) {
+        llvm::GlobalVariable* errorGlobal = module_->getGlobalVariable("__suki_thrown_error");
+        if (!errorGlobal) {
+            errorGlobal = new llvm::GlobalVariable(*module_,
+                llvm::PointerType::get(context_, 0), false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
+                "__suki_thrown_error");
+        }
+        if (errorVal->getType()->isPointerTy()) {
+            builder_->CreateStore(errorVal, errorGlobal);
+        } else {
+            llvm::Value* ptr = builder_->CreateIntToPtr(errorVal, llvm::PointerType::get(context_, 0));
+            builder_->CreateStore(ptr, errorGlobal);
+        }
+    }
+
     // 如果有活跃的 catch 块，使用 longjmp 跳转
-    // If there is an active catch block, use longjmp to jump
     if (!catchStack_.empty()) {
-        // 调用 longjmp 跳转到 catch 块
         llvm::Function* longjmpFunc = module_->getFunction("longjmp");
         if (!longjmpFunc) {
             llvm::Type* ptrTy = llvm::PointerType::get(context_, 0);
@@ -1844,7 +1877,6 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             }
 
             // 对于引用类型（指针），检查是否非 null
-            // 完整 RTTI 需要类型标签比较
             llvm::Value* isNonNull = builder_->CreateICmpNE(val,
                 llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "is.nonnull");
 
@@ -1860,7 +1892,7 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                         llvm::Type::getInt64Ty(context_), true,
                         llvm::GlobalValue::InternalLinkage, typeId, targetTypeName + ".typeid");
                 }
-                // 从对象加载类型 ID（假设在 vtable 指针之后）
+                // 从对象加载类型 ID（vtable 指针之后）
                 llvm::Value* typeIdPtr = builder_->CreateGEP(
                     llvm::Type::getInt8Ty(context_), val,
                     llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), sizeof(void*)),
