@@ -16,6 +16,32 @@ struct Point {
     var y: Double
 }
 
+// 类
+class Animal {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func speak() -> String {
+        return "..."
+    }
+}
+
+class Dog: Animal {
+    var breed: String
+
+    init(name: String, breed: String) {
+        self.breed = breed
+        super.init(name: name)
+    }
+
+    override func speak() -> String {
+        return "Woof!"
+    }
+}
+
 // 枚举
 enum Direction {
     case north
@@ -68,6 +94,9 @@ func main() -> Int {
 
     // 结构体
     print("Structs: OK")
+
+    // 类
+    print("Classes: OK")
 
     // 枚举
     print("Enums: OK")
