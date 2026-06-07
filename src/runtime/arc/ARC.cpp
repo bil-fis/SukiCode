@@ -4,6 +4,12 @@
 #include <vector>
 #include <mutex>
 
+// C 兼容的 ARC 函数 / C-compatible ARC functions
+extern "C" {
+    void suki_retain(void* obj) { suki::runtime::retain(obj); }
+    void suki_release(void* obj) { suki::runtime::release(obj); }
+}
+
 namespace suki::runtime {
 
 // Global set of objects with weak references (for zeroing weak pointers)

@@ -47,9 +47,10 @@ endforeach()
 
 foreach(test_file ${MODULETEST_INTEGRATION})
     get_filename_component(test_name ${test_file} NAME_WE)
-    # Integration tests: compile to object file
+    # Integration tests: compile, link, and run
+    set(exe_file ${CMAKE_BINARY_DIR}/moduleTest_${test_name}${CMAKE_EXECUTABLE_SUFFIX})
     add_test(NAME "Integration_${test_name}"
-        COMMAND sukic -c -o ${CMAKE_BINARY_DIR}/moduleTest_${test_name}.obj ${test_file}
+        COMMAND ${CMAKE_BINARY_DIR}/bin/sukic -o ${exe_file} ${test_file}
     )
     set_tests_properties("Integration_${test_name}" PROPERTIES TIMEOUT 30)
 endforeach()

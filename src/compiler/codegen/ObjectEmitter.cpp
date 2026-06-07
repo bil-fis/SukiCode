@@ -25,6 +25,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
 
 namespace suki {
 
@@ -194,9 +195,26 @@ bool ObjectEmitter::linkExecutable(const std::vector<std::string>& objectFiles,
     for (const auto& obj : objectFiles) {
         cmd += " \"" + obj + "\"";
     }
-    // 添加 C 运行时库和 printf 支持
+    // 添加 SukiCode 运行时库、C 运行时库和 printf 支持
     cmd += " /link /SUBSYSTEM:CONSOLE /NOLOGO";
     cmd += " libcmt.lib legacy_stdio_definitions.lib";
+    // 查找并链接 SukiCode 运行时库
+    // 尝试在编译器所在目录查找 runtime 库
+    std::string runtimeLib = "sukirt.lib";
+    // 检查当前目录是否存在
+    {
+        std::ifstream test(runtimeLib);
+        if (!test.good()) {
+            // 尝试在 build/lib 目录查找
+            runtimeLib = "lib/sukirt.lib";
+            std::ifstream test2(runtimeLib);
+            if (!test2.good()) {
+                // 使用绝对路径
+                runtimeLib = "D:/Projects/SukiCode/build/lib/sukirt.lib";
+            }
+        }
+    }
+    cmd += " " + runtimeLib;
 #else
     // Unix: 使用 cc 链接
     cmd = "cc -o \"" + outputPath + "\"";

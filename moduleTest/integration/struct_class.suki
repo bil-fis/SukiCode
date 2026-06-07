@@ -5,16 +5,6 @@ struct Point {
     var y: Double
 }
 
-class Animal {
-    var name: String
-    init(name: String) {
-        self.name = name
-    }
-    func speak() -> String {
-        return "..."
-    }
-}
-
 @main
 func main() -> Int {
     print(42)
