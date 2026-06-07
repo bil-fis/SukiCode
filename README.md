@@ -1,4 +1,6 @@
-> **
+> ***<span style="color:red">Warning:</span>*** **This language is under developement and co-worked with Xiaomi MiMo V2.5-pro**  
+> Now it currently not work properly, and i cannot fix it now XD  
+> So that's it.
 
 # SukiCode
 
