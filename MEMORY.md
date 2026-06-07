@@ -35,26 +35,29 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 - 泛型单态化：当泛型函数被调用时，根据参数类型生成特化版本
 - 复合赋值运算符需要在 AST 中存储运算符种类
 
-## 项目状态 (2026-06-06)
+## 项目状态 (2026-06-07)
 - **编译器前端**: 词法分析、语法分析、语义分析完整实现
 - **代码生成**: LLVM IR 生成支持所有主要特性
   - Optional 使用 {value, hasValue} 标记结构体
   - Enum 根据 associated values 计算 payload 大小
   - super 实现父类类型查找
   - Self 返回当前处理的类型
-  - 闭包变量捕获和返回类型
-  - for-in 数组迭代、可选链、强制解包、类型检查
-  - 计算属性 getter/setter、属性观察器 willSet/didSet
+  - 闭包变量捕获（支持 weak/unowned 语义）和返回类型
+  - for-in 数组迭代、可选链、强制解包、RTTI is 类型检查（类型标签比较）
+  - 计算属性 getter/setter、属性观察器 willSet/didSet（init 中抑制）
   - subscript 代码生成、deinit 代码生成
-  - vtable 方法调度、inout 参数指针传递
+  - vtable 方法调度（含实例填充）、inout 参数指针传递
   - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
-  - 泛型类型单态化、async/await 协程帧
-  - select 语句、泛型 where 子句、-O 优化级别
-  - 访问控制链接类型、Opaque/Existential 类型
-- **语义检查**: override/final 检查、required/convenience init 检查、协议符合性、switch 穷举性、修饰符传播、let/var 可变性、代码风格检查（命名规范）
-- **类型系统**: UnsafePointer/UnsafeMutablePointer 类型支持
-- **Actor**: ActorDecl 代码生成、executor 注册、方法注册
-- **互操作**: extern "C" 声明语法、@_cdecl 链接
+  - 泛型类型单态化（含字段替换）、async/await 协程帧
+  - select 语句（channel 轮询）、泛型 where 子句约束验证、-O 优化级别
+  - 访问控制语义检查（private/fileprivate/internal）、Opaque/Existential 类型
+  - 组合类型 A&B（CompositionType 跟踪所有协议）
+  - SetLiteral 实际存储元素、Selector 表达式代码生成
+- **语义检查**: override/final 检查、required/convenience init 检查（递归嵌套块）、协议符合性（struct/class/enum + 方法/属性/subscript/init）、switch 穷举性、修饰符传播、let/var 可变性、代码风格检查（命名规范）
+- **类型系统**: UnsafePointer/UnsafeMutablePointer/CompositionType 类型支持
+- **Actor**: ActorDecl 代码生成、executor 注册、方法注册、await 检查
+- **互操作**: extern "C" 声明语法、@_cdecl 链接、ObjC 运行时预声明
+- **模块系统**: import 实际加载模块文件（词法分析+语法分析+注册类型/函数）
 - **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList
 - **系统库**: MemoryLayout、DynamicLibrary、SystemInfo、Process、File、Path、Date/Timer、sys 模块、MMapRegion
 - **并发库**: ThreadPool、DispatchQueue、Channel、Atomic、Mutex/RWLock/Semaphore
