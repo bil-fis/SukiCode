@@ -9,6 +9,7 @@ add_library(sukirt STATIC
     pool/Collection.cpp
     concurrency/ThreadPool.cpp
     concurrency/Coroutine.cpp
+    ErrorStack.cpp
 )
 
 target_include_directories(sukirt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

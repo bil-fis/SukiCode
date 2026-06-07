@@ -609,6 +609,42 @@ void IRGenerator::genDecl(const Decl& decl) {
             }
             vtables_[cd.name] = vtable;
 
+            // 为类的协议符合性生成见证表 / Generate witness tables for class protocol conformances
+            for (const auto& proto : cd.conformsTo) {
+                if (!proto || proto->typeReprKind != TypeReprKind::Named) continue;
+                auto& protoName = static_cast<const NamedTypeRepr&>(*proto).name;
+                auto wtableIt = witnessTables_.find(protoName);
+                if (wtableIt == witnessTables_.end()) continue;
+
+                std::vector<llvm::Constant*> wtableEntries;
+                for (size_t i = 0; i < wtableIt->second.methods.size(); i++) {
+                    std::string methodName;
+                    for (const auto& [name, idx] : wtableIt->second.methodIndices) {
+                        if (idx == i) { methodName = name; break; }
+                    }
+                    std::string implName = cd.name + "." + methodName;
+                    llvm::Function* implFunc = module_->getFunction(implName);
+                    if (!implFunc) {
+                        llvm::FunctionType* funcTy = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
+                        implFunc = llvm::Function::Create(funcTy,
+                            llvm::Function::ExternalLinkage, implName, module_.get());
+                    }
+                    wtableEntries.push_back(llvm::ConstantExpr::getBitCast(implFunc,
+                        llvm::PointerType::get(context_, 0)));
+                }
+
+                if (!wtableEntries.empty() && wtableIt->second.tableType) {
+                    llvm::Constant* wtableInit = llvm::ConstantStruct::get(
+                        llvm::cast<llvm::StructType>(wtableIt->second.tableType), wtableEntries);
+                    llvm::GlobalVariable* wtableGlobal = new llvm::GlobalVariable(
+                        *module_, wtableIt->second.tableType, true,
+                        llvm::GlobalValue::InternalLinkage, wtableInit,
+                        cd.name + "." + protoName + ".witness");
+                    typeWitnessTables_[cd.name][protoName] = wtableGlobal;
+                }
+            }
+
             // 只处理 deinit / Only process deinit
             std::string prevDeinitType = currentTypeNameForDeinit_;
             currentTypeNameForDeinit_ = cd.name;
@@ -2051,16 +2087,38 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
                 llvm::Value* suspendResult = builder_->CreateCall(
                     coroSuspendFunc, {saveToken, llvm::ConstantInt::getFalse(context_)}, "coro.suspend.result");
 
+                // 创建销毁块 / Create destroy block
+                llvm::BasicBlock* destroyBB = llvm::BasicBlock::Create(
+                    context_, "coro.destroy", builder_->GetInsertBlock()->getParent());
+
                 // 根据结果跳转 / Branch based on result
                 // case 0: resume - 继续执行
                 // case 1: destroy - 销毁协程
                 // case 2: suspend - 挂起（默认）
                 llvm::SwitchInst* suspendSwitch = builder_->CreateSwitch(suspendResult, suspendBB, 3);
                 suspendSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 0), resumeBB);
+                suspendSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 1), destroyBB);
+
+                // 销毁块：释放协程帧并返回 / Destroy block: free coroutine frame and return
+                builder_->SetInsertPoint(destroyBB);
+                if (coroHandle_ && coroId_) {
+                    llvm::Function* coroFreeFunc = llvm::Intrinsic::getOrInsertDeclaration(
+                        module_.get(), llvm::Intrinsic::coro_free);
+                    llvm::Value* framePtr = builder_->CreateCall(coroFreeFunc, {coroId_, coroHandle_}, "coro.frame");
+                    llvm::Function* freeFunc = module_->getFunction("free");
+                    if (!freeFunc) {
+                        llvm::FunctionType* freeTy = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
+                        freeFunc = llvm::Function::Create(freeTy, llvm::Function::ExternalLinkage,
+                                                          "free", module_.get());
+                    }
+                    builder_->CreateCall(freeFunc, {framePtr});
+                }
+                builder_->CreateRet(llvm::ConstantPointerNull::get(
+                    llvm::PointerType::get(context_, 0)));
 
                 // 挂起块：返回调用者 / Suspend block: return to caller
                 builder_->SetInsertPoint(suspendBB);
-                // 挂起时返回 null 指针表示协程已挂起
                 builder_->CreateRet(llvm::ConstantPointerNull::get(
                     llvm::PointerType::get(context_, 0)));
 

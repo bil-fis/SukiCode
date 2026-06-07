@@ -45,19 +45,10 @@ private:
 
 } // namespace suki::runtime
 
-// C 兼容接口 / C-compatible interface
-extern "C" inline void suki_push_error(void* error) {
-    suki::runtime::ErrorStack::instance().push(error);
-}
-
-extern "C" inline void* suki_pop_error() {
-    return suki::runtime::ErrorStack::instance().pop();
-}
-
-extern "C" inline void* suki_peek_error() {
-    return suki::runtime::ErrorStack::instance().peek();
-}
-
-extern "C" inline int suki_has_error() {
-    return suki::runtime::ErrorStack::instance().isEmpty() ? 0 : 1;
+// C 兼容接口声明 / C-compatible interface declarations
+extern "C" {
+    void suki_push_error(void* error);
+    void* suki_pop_error();
+    void* suki_peek_error();
+    int suki_has_error();
 }

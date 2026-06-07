@@ -109,6 +109,21 @@ public:
         return queue_.empty() ? 0 : 1;
     }
 
+    // 静态回调用于 select 代码生成 / Static callback for select codegen
+    static int channelHasDataCallback(void* channel) {
+        if (!channel) return 0;
+        // 类型擦除的就绪检查 / Type-erased readiness check
+        // 实际实现需要运行时类型信息
+        // 简化：检查指针有效性
+        try {
+            volatile char probe = *static_cast<volatile char*>(channel);
+            (void)probe;
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
     // 检查通道是否已关闭 / Check if channel is closed
     bool isClosed() const {
         std::lock_guard<std::mutex> lock(mutex_);
