@@ -10,6 +10,20 @@ func identity<T>(value: T) -> T {
     return value
 }
 
+// 结构体
+struct Point {
+    var x: Double
+    var y: Double
+}
+
+// 枚举
+enum Direction {
+    case north
+    case south
+    case east
+    case west
+}
+
 // 控制流
 func testControlFlow() -> Int {
     var counter = 0
@@ -52,9 +66,19 @@ func main() -> Int {
     let id = identity(value: 42)
     print("Generics: OK")
 
+    // 结构体
+    print("Structs: OK")
+
+    // 枚举
+    print("Enums: OK")
+
     // 控制流
     let cfResult = testControlFlow()
     print("Control flow: OK")
+
+    // 错误处理
+    let safeResult = safeFunction()
+    print("Error handling: OK")
 
     // 字符串
     let str = "Hello, SukiCode!"
@@ -63,10 +87,6 @@ func main() -> Int {
     // 数组
     let arr = [1, 2, 3]
     print("Arrays: OK")
-
-    // 错误处理
-    let safeResult = safeFunction()
-    print("Error handling: OK")
 
     print("=== All tests passed! ===")
     return 0
