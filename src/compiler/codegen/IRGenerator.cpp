@@ -1160,6 +1160,29 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
 
     // 如果没有终结指令，添加 return / Add return if missing
     if (!builder_->GetInsertBlock()->getTerminator()) {
+        // async 函数需要 coro.end 清理 / async functions need coro.end cleanup
+        if (decl.isAsync && coroHandle_) {
+            llvm::Function* coroEndFunc = llvm::Intrinsic::getOrInsertDeclaration(
+                module_.get(), llvm::Intrinsic::coro_end);
+            llvm::Value* coroId = coroId_;
+            llvm::Value* handle = coroHandle_;
+            // coro.end(handle, unwind)
+            builder_->CreateCall(coroEndFunc, {handle, llvm::ConstantInt::getFalse(context_), coroId});
+
+            // 释放协程帧 / Free coroutine frame
+            llvm::Function* coroFreeFunc = llvm::Intrinsic::getOrInsertDeclaration(
+                module_.get(), llvm::Intrinsic::coro_free);
+            llvm::Value* framePtr = builder_->CreateCall(coroFreeFunc, {coroId, handle}, "coro.frame");
+            llvm::Function* freeFunc = module_->getFunction("free");
+            if (!freeFunc) {
+                llvm::FunctionType* freeTy = llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
+                freeFunc = llvm::Function::Create(freeTy, llvm::Function::ExternalLinkage,
+                                                  "free", module_.get());
+            }
+            builder_->CreateCall(freeFunc, {framePtr});
+        }
+
         llvm::Type* retType = func->getReturnType();
         if (retType->isVoidTy()) {
             builder_->CreateRetVoid();
@@ -1167,6 +1190,10 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
             builder_->CreateRet(llvm::Constant::getNullValue(retType));
         }
     }
+
+    // 清理协程状态 / Cleanup coroutine state
+    coroHandle_ = nullptr;
+    coroId_ = nullptr;
 
     llvm::verifyFunction(*func);
     currentFunc_ = prevFunc;
@@ -1805,7 +1832,7 @@ void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
     // Catch 块 / Catch block
     builder_->SetInsertPoint(catchBB);
 
-    // 从全局变量加载错误值 / Load error value from global variable
+    // 从线程局部变量加载错误值 / Load error value from thread-local variable
     llvm::GlobalVariable* errorGlobal = module_->getGlobalVariable("__suki_thrown_error");
     if (!errorGlobal) {
         errorGlobal = new llvm::GlobalVariable(*module_,
@@ -1813,6 +1840,7 @@ void IRGenerator::genDoCatchStmt(const DoCatchDecl& decl) {
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
             "__suki_thrown_error");
+        errorGlobal->setThreadLocal(true);
     }
     llvm::Value* thrownError = builder_->CreateLoad(
         llvm::PointerType::get(context_, 0), errorGlobal, "thrown.error");
@@ -1844,16 +1872,19 @@ void IRGenerator::genThrowStmt(const ThrowDecl& decl) {
         errorVal = genExpr(*decl.value);
     }
 
-    // 存储错误值到全局变量（供 catch 块使用）
-    // Store error value to global variable (for catch block to use)
+    // 存储错误值到线程局部变量（供 catch 块使用）
+    // Store error value to thread-local variable (for catch block to use)
+    // 使用 thread_local 保证线程安全
     if (errorVal) {
         llvm::GlobalVariable* errorGlobal = module_->getGlobalVariable("__suki_thrown_error");
         if (!errorGlobal) {
+            // 使用 thread_local 存储 / Use thread_local storage
             errorGlobal = new llvm::GlobalVariable(*module_,
                 llvm::PointerType::get(context_, 0), false,
                 llvm::GlobalValue::InternalLinkage,
                 llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)),
                 "__suki_thrown_error");
+            errorGlobal->setThreadLocal(true); // thread_local
         }
         if (errorVal->getType()->isPointerTy()) {
             builder_->CreateStore(errorVal, errorGlobal);
