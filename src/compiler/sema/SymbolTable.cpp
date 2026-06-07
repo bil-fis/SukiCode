@@ -73,7 +73,8 @@ bool SymbolTable::isAccessible(const Symbol& sym) const {
         return sym.declaringFile.empty() || sym.declaringFile == currentFile_;
     }
 
-    // private: 同作用域或外层作用域可访问 / same or outer scope accessible
+    // private: 同作用域或内层作用域可访问 / same scope or inner scopes
+    // depth_ >= sym.scopeDepth 表示当前在声明作用域内或更深层
     if (sym.access == AccessLevel::Private) {
         return depth_ >= sym.scopeDepth;
     }

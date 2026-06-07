@@ -2908,9 +2908,21 @@ llvm::Value* IRGenerator::genArrayLiteral(const ArrayLiteralExpr& expr) {
     // 计算元素数量 / Count elements
     int64_t elemCount = static_cast<int64_t>(expr.elements.size());
 
-    // 分配数据缓冲区（在栈上） / Allocate data buffer (on stack)
-    llvm::AllocaInst* dataBuf = builder_->CreateAlloca(elemType,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), "arr.data");
+    // 使用堆分配确保数据在函数返回后仍然有效
+    // Use heap allocation to ensure data survives function return
+    llvm::Function* mallocFunc = module_->getFunction("malloc");
+    if (!mallocFunc) {
+        llvm::FunctionType* mallocTy = llvm::FunctionType::get(
+            llvm::PointerType::get(context_, 0),
+            {llvm::Type::getInt64Ty(context_)}, false);
+        mallocFunc = llvm::Function::Create(mallocTy, llvm::Function::ExternalLinkage,
+                                            "malloc", module_.get());
+    }
+
+    uint64_t allocSize = elemCount * 8; // 假设每个元素 8 字节
+    llvm::Value* allocSizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), allocSize);
+    llvm::Value* dataBuf = builder_->CreateCall(mallocFunc, {allocSizeVal}, "arr.heap.data");
+    dataBuf = builder_->CreatePointerCast(dataBuf, llvm::PointerType::get(context_, 0));
 
     // 存储每个元素 / Store each element
     for (size_t i = 0; i < expr.elements.size(); i++) {
@@ -2924,9 +2936,14 @@ llvm::Value* IRGenerator::genArrayLiteral(const ArrayLiteralExpr& expr) {
                 elem = builder_->CreateSExt(elem, elemType, "arr.cast");
             }
         }
-        llvm::Value* ptr = builder_->CreateGEP(elemType, dataBuf,
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), i), "arr.elem.ptr");
-        builder_->CreateStore(elem, ptr);
+        // 计算元素偏移地址 / Calculate element offset address
+        llvm::Value* offset = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+            i * 8); // 假设每个元素 8 字节
+        llvm::Value* elemPtr = builder_->CreateGEP(llvm::Type::getInt8Ty(context_),
+            dataBuf, offset, "arr.elem.ptr");
+        llvm::Value* elemPtrCast = builder_->CreatePointerCast(elemPtr,
+            llvm::PointerType::get(context_, 0));
+        builder_->CreateStore(elem, elemPtrCast);
     }
 
     // 创建数组结构体 / Create array struct
@@ -2992,9 +3009,20 @@ llvm::Value* IRGenerator::genSetLiteral(const SetLiteralExpr& expr) {
 
     int64_t elemCount = static_cast<int64_t>(expr.elements.size());
 
-    // 分配元素缓冲区 / Allocate element buffer
-    llvm::AllocaInst* dataBuf = builder_->CreateAlloca(elemType,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), "set.data");
+    // 使用堆分配确保数据在函数返回后仍然有效
+    llvm::Function* mallocFunc = module_->getFunction("malloc");
+    if (!mallocFunc) {
+        llvm::FunctionType* mallocTy = llvm::FunctionType::get(
+            llvm::PointerType::get(context_, 0),
+            {llvm::Type::getInt64Ty(context_)}, false);
+        mallocFunc = llvm::Function::Create(mallocTy, llvm::Function::ExternalLinkage,
+                                            "malloc", module_.get());
+    }
+
+    uint64_t allocSize = elemCount * 8;
+    llvm::Value* allocSizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), allocSize);
+    llvm::Value* dataBuf = builder_->CreateCall(mallocFunc, {allocSizeVal}, "set.heap.data");
+    dataBuf = builder_->CreatePointerCast(dataBuf, llvm::PointerType::get(context_, 0));
 
     // 存储每个元素 / Store each element
     for (size_t i = 0; i < expr.elements.size(); i++) {
@@ -3007,9 +3035,12 @@ llvm::Value* IRGenerator::genSetLiteral(const SetLiteralExpr& expr) {
                 elem = builder_->CreateSExt(elem, elemType, "set.cast");
             }
         }
-        llvm::Value* ptr = builder_->CreateGEP(elemType, dataBuf,
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), i), "set.elem.ptr");
-        builder_->CreateStore(elem, ptr);
+        llvm::Value* offset = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), i * 8);
+        llvm::Value* elemPtr = builder_->CreateGEP(llvm::Type::getInt8Ty(context_),
+            dataBuf, offset, "set.elem.ptr");
+        llvm::Value* elemPtrCast = builder_->CreatePointerCast(elemPtr,
+            llvm::PointerType::get(context_, 0));
+        builder_->CreateStore(elem, elemPtrCast);
     }
 
     // 创建集合结构体 / Create set struct

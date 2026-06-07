@@ -1530,15 +1530,33 @@ TypePtr Sema::inferExprType(Expr& expr) {
             if (closure.returnType) {
                 return resolveTypeRepr(*closure.returnType);
             }
-            // 对于箭头闭包 () => expr，从表达式推断
-            if (closure.isArrow && !closure.body.empty()) {
-                // 箭头闭包的 body 是一个 ReturnStmt 包装的表达式
-                // 尝试从 body 的第一个语句推断
-                // 简化：返回 Any 类型
-                return getAnyType();
+            // 从 body 推断返回类型
+            if (!closure.body.empty()) {
+                // 查找 return 语句并推断其类型
+                for (const auto& stmt : closure.body) {
+                    if (stmt && stmt->stmtKind == StmtKind::Return) {
+                        auto& ret = static_cast<const ReturnStmt&>(*stmt);
+                        if (ret.value) {
+                            TypePtr retType = inferExprType(*ret.value);
+                            if (retType) return retType;
+                        }
+                        return getVoidType();
+                    }
+                }
+                // 如果没有 return 语句，检查最后一个表达式语句（箭头闭包）
+                if (closure.isArrow) {
+                    for (const auto& stmt : closure.body) {
+                        if (stmt && stmt->stmtKind == StmtKind::Expression) {
+                            auto& es = static_cast<const ExpressionStmt&>(*stmt);
+                            if (es.expression) {
+                                TypePtr exprType = inferExprType(*es.expression);
+                                if (exprType) return exprType;
+                            }
+                        }
+                    }
+                }
             }
-            // 普通闭包：返回 Any 类型（需要上下文推断）
-            return getAnyType();
+            return getVoidType();
         }
         case ExprKind::If: {
             auto& ifExpr = static_cast<const IfExpr&>(expr);
