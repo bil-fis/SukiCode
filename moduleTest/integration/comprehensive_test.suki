@@ -56,6 +56,14 @@ func main() -> Int {
     let cfResult = testControlFlow()
     print("Control flow: OK")
 
+    // 字符串
+    let str = "Hello, SukiCode!"
+    print("Strings: OK")
+
+    // 数组
+    let arr = [1, 2, 3]
+    print("Arrays: OK")
+
     // 错误处理
     let safeResult = safeFunction()
     print("Error handling: OK")

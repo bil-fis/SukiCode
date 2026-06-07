@@ -2519,7 +2519,32 @@ llvm::Value* IRGenerator::genFloatLiteral(const FloatLiteralExpr& expr) {
 }
 
 llvm::Value* IRGenerator::genStringLiteral(const StringLiteralExpr& expr) {
-    return createStringGlobal(expr.value);
+    // 创建 String 结构体 { i8*, i64 } (pointer, length)
+    // Create String struct { i8*, i64 } (pointer, length)
+
+    // 获取字符串常量指针 / Get string constant pointer
+    llvm::Value* strPtr = createStringGlobal(expr.value);
+
+    // 创建 String 结构体类型 / Create String struct type
+    llvm::StructType* stringType = llvm::StructType::get(context_, {
+        llvm::PointerType::get(context_, 0), // data pointer
+        llvm::Type::getInt64Ty(context_)      // length
+    });
+
+    // 在栈上分配 String 结构体 / Allocate String struct on stack
+    llvm::AllocaInst* strStruct = builder_->CreateAlloca(stringType, nullptr, "str");
+
+    // 设置 data 指针 / Set data pointer
+    llvm::Value* dataFieldPtr = builder_->CreateStructGEP(stringType, strStruct, 0, "str.data.field");
+    builder_->CreateStore(strPtr, dataFieldPtr);
+
+    // 设置长度 / Set length
+    llvm::Value* lenFieldPtr = builder_->CreateStructGEP(stringType, strStruct, 1, "str.len.field");
+    builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+        static_cast<int64_t>(expr.value.size())), lenFieldPtr);
+
+    // 加载并返回结构体值 / Load and return struct value
+    return builder_->CreateLoad(stringType, strStruct, "str.val");
 }
 
 llvm::Value* IRGenerator::genBoolLiteral(const BoolLiteralExpr& expr) {
@@ -2860,8 +2885,14 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
                 // Double: 使用 %g 格式
                 llvm::Value* fmt = createStringGlobal("%g\n");
                 return builder_->CreateCall(printfFunc, {fmt, arg}, "printf");
+            } else if (arg->getType()->isStructTy()) {
+                // String 结构体 {i8*, i64}：提取 data 指针
+                // String struct {i8*, i64}: extract data pointer
+                llvm::Value* data = builder_->CreateExtractValue(arg, 0, "str.data");
+                llvm::Value* fmt = createStringGlobal("%s\n");
+                return builder_->CreateCall(printfFunc, {fmt, data}, "printf");
             } else if (arg->getType()->isPointerTy()) {
-                // String: 使用 %s 格式
+                // 指针类型：使用 %s 格式
                 llvm::Value* fmt = createStringGlobal("%s\n");
                 return builder_->CreateCall(printfFunc, {fmt, arg}, "printf");
             }
@@ -2905,9 +2936,29 @@ llvm::Value* IRGenerator::genCallExpr(const CallExpr& expr) {
                     paramTypes.push_back(resolveType(genericAst->params[i].type.get()));
                 }
             }
-            llvm::Type* retType = genericAst->returnType ?
-                resolveType(genericAst->returnType.get()) :
-                llvm::Type::getVoidTy(context_);
+
+            // 解析返回类型：如果返回类型是泛型参数，使用实际参数类型
+            // Resolve return type: if return type is a generic param, use actual argument type
+            llvm::Type* retType = llvm::Type::getVoidTy(context_);
+            if (genericAst->returnType) {
+                // 检查返回类型是否是泛型参数名
+                if (genericAst->returnType->typeReprKind == TypeReprKind::Named) {
+                    auto& retName = static_cast<const NamedTypeRepr&>(*genericAst->returnType);
+                    bool isGenericParam = false;
+                    for (size_t i = 0; i < genericAst->genericParams.size(); i++) {
+                        if (genericAst->genericParams[i].name == retName.name && i < argTypes.size()) {
+                            retType = argTypes[i];
+                            isGenericParam = true;
+                            break;
+                        }
+                    }
+                    if (!isGenericParam) {
+                        retType = resolveType(genericAst->returnType.get());
+                    }
+                } else {
+                    retType = resolveType(genericAst->returnType.get());
+                }
+            }
 
             llvm::FunctionType* funcType = llvm::FunctionType::get(retType, paramTypes, false);
             specFunc = llvm::Function::Create(
@@ -3139,13 +3190,68 @@ llvm::Value* IRGenerator::genMemberAccess(const MemberAccessExpr& expr) {
 }
 
 llvm::Value* IRGenerator::genArrayLiteral(const ArrayLiteralExpr& expr) {
-    // 简化实现：返回第一个元素或 null
-    // Simplified: return first element or null
-    if (expr.elements.empty()) {
-        return llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0));
+    // 创建 Array<T> 结构体 { data_ptr, count, capacity }
+    // Create Array<T> struct { data_ptr, count, capacity }
+
+    // 确定元素类型 / Determine element type
+    llvm::Type* elemType = llvm::Type::getInt64Ty(context_); // 默认 i64
+    if (!expr.elements.empty()) {
+        llvm::Value* first = genExpr(*expr.elements[0]);
+        if (first) elemType = first->getType();
     }
-    // 返回第一个元素（简化实现）
-    return genExpr(*expr.elements[0]);
+
+    // 创建数组结构体类型 / Create array struct type
+    llvm::StructType* arrType = llvm::StructType::get(context_, {
+        llvm::PointerType::get(context_, 0), // data pointer
+        llvm::Type::getInt64Ty(context_),     // count
+        llvm::Type::getInt64Ty(context_)      // capacity
+    });
+
+    // 计算元素数量 / Count elements
+    int64_t elemCount = static_cast<int64_t>(expr.elements.size());
+
+    // 创建全局常量数组 / Create global constant array
+    if (!expr.elements.empty()) {
+        // 收集元素常量 / Collect element constants
+        std::vector<llvm::Constant*> elemConstants;
+        for (const auto& elemExpr : expr.elements) {
+            llvm::Value* elem = genExpr(*elemExpr);
+            if (elem && llvm::isa<llvm::Constant>(elem)) {
+                elemConstants.push_back(llvm::cast<llvm::Constant>(elem));
+            } else {
+                // 非常量元素，使用零值 / Non-constant element, use zero
+                elemConstants.push_back(llvm::Constant::getNullValue(elemType));
+            }
+        }
+
+        // 创建全局数组 / Create global array
+        llvm::ArrayType* arrayType = llvm::ArrayType::get(elemType, elemCount);
+        llvm::Constant* arrayInit = llvm::ConstantArray::get(arrayType, elemConstants);
+        llvm::GlobalVariable* globalArray = new llvm::GlobalVariable(
+            *module_, arrayType, true, llvm::GlobalValue::InternalLinkage,
+            arrayInit, ".arr");
+
+        // 创建数组结构体 / Create array struct
+        llvm::AllocaInst* arrStruct = builder_->CreateAlloca(arrType, nullptr, "arr");
+
+        // data = 指向全局数组
+        llvm::Value* dataFieldPtr = builder_->CreateStructGEP(arrType, arrStruct, 0, "arr.data.field");
+        llvm::Value* dataPtr = builder_->CreatePointerCast(globalArray, llvm::PointerType::get(context_, 0));
+        builder_->CreateStore(dataPtr, dataFieldPtr);
+
+        // count
+        llvm::Value* countFieldPtr = builder_->CreateStructGEP(arrType, arrStruct, 1, "arr.count.field");
+        builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), countFieldPtr);
+
+        // capacity
+        llvm::Value* capFieldPtr = builder_->CreateStructGEP(arrType, arrStruct, 2, "arr.cap.field");
+        builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), elemCount), capFieldPtr);
+
+        return builder_->CreateLoad(arrType, arrStruct, "arr.val");
+    }
+
+    // 空数组 / Empty array
+    return llvm::Constant::getNullValue(arrType);
 }
 
 llvm::Value* IRGenerator::genDictLiteral(const DictLiteralExpr& expr) {
