@@ -1632,21 +1632,23 @@ TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
             return std::make_shared<TupleType>(std::move(elems));
         }
         case TypeReprKind::Composition: {
-            // A & B 组合类型 — 返回第一个协议类型（主协议）
-            // Composition type: return the first protocol type (primary)
+            // A & B 组合类型 — 创建包含所有协议的组合类型
             auto& c = static_cast<const CompositionTypeRepr&>(tr);
             if (!c.protocols.empty()) {
-                // 验证所有协议类型存在 / Verify all protocol types exist
+                std::vector<TypePtr> protocolTypes;
                 for (const auto& proto : c.protocols) {
                     if (proto) {
                         TypePtr protoType = resolveTypeRepr(*proto);
-                        if (!protoType || protoType->kind() == TypeKind::Error) {
+                        if (protoType && protoType->kind() != TypeKind::Error) {
+                            protocolTypes.push_back(protoType);
+                        } else {
                             error(tr.loc, "protocol in composition type not found");
                         }
                     }
                 }
-                // 返回第一个协议类型
-                return resolveTypeRepr(*c.protocols[0]);
+                if (!protocolTypes.empty()) {
+                    return std::make_shared<CompositionType>(std::move(protocolTypes));
+                }
             }
             return getAnyType();
         }

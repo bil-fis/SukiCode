@@ -21,6 +21,7 @@ enum class TypeKind : uint8_t {
     Struct, Class, Enum, Protocol, Actor,
     Any, AnyObject, Self, Owned, Unresolved, Error,
     UnsafePointer, UnsafeMutablePointer, UnsafeBufferPointer,
+    Composition, // A & B 组合类型
 };
 
 class Type {
@@ -322,6 +323,26 @@ public:
     size_t alignment() const override { return sizeof(void*); }
 private:
     TypePtr pointee_;
+};
+
+// 组合类型 / Composition type (A & B)
+class CompositionType : public Type {
+public:
+    explicit CompositionType(std::vector<TypePtr> protocols)
+        : Type(TypeKind::Composition), protocols_(std::move(protocols)) {}
+    std::string name() const override {
+        std::string result;
+        for (size_t i = 0; i < protocols_.size(); i++) {
+            if (i > 0) result += " & ";
+            result += protocols_[i]->name();
+        }
+        return result;
+    }
+    const std::vector<TypePtr>& protocols() const { return protocols_; }
+    size_t sizeInBytes() const override { return sizeof(void*); }
+    size_t alignment() const override { return sizeof(void*); }
+private:
+    std::vector<TypePtr> protocols_;
 };
 
 // 类型工厂 / Type factories
