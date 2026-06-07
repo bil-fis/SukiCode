@@ -3,6 +3,7 @@
 // Symbol table and scope management for SukiCode semantic analysis.
 
 #include "Type.h"
+#include "compiler/ast/ASTNode.h"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,9 @@ struct Symbol {
     bool isConstant = false;     // let vs var
     bool isPublic = false;
     bool isInitialized = false;
+    AccessLevel access = AccessLevel::Internal;
+    std::string declaringFile;   // 声明所在文件
+    int scopeDepth = 0;          // 声明时的作用域深度
 
     // 函数特有 / Function-specific
     std::vector<TypePtr> paramTypes;
@@ -86,9 +90,17 @@ public:
     // 作用域深度 / Scope depth
     int depth() const { return depth_; }
 
+    // 设置当前文件 / Set current file
+    void setCurrentFile(const std::string& file) { currentFile_ = file; }
+    const std::string& currentFile() const { return currentFile_; }
+
+    // 检查访问权限 / Check access permission
+    bool isAccessible(const Symbol& sym) const;
+
 private:
     std::shared_ptr<Scope> currentScope_;
     int depth_ = 0;
+    std::string currentFile_;
 };
 
 } // namespace suki

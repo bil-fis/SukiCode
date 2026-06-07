@@ -1294,12 +1294,15 @@ TypePtr Sema::inferExprType(Expr& expr) {
                 return getErrorType();
             }
             // 访问控制检查 / Access control check
-            // private 成员只能在当前作用域访问
-            // private members can only be accessed in current scope
-            if (!sym->isPublic && sym->kind == SymbolKind::Variable) {
-                // 检查是否在同一作用域 / Check if in same scope
-                // 简化：允许在同一类型内访问
-                // Simplified: allow access within the same type
+            if (!symbols_.isAccessible(*sym)) {
+                std::string accessName;
+                switch (sym->access) {
+                    case AccessLevel::Private: accessName = "private"; break;
+                    case AccessLevel::FilePrivate: accessName = "fileprivate"; break;
+                    case AccessLevel::Internal: accessName = "internal"; break;
+                    default: accessName = "private"; break;
+                }
+                error(expr.loc, "'" + id.name + "' is " + accessName + " and cannot be accessed here");
             }
             return sym->type;
         }
