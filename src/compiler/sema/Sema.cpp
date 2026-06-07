@@ -181,34 +181,10 @@ void Sema::processDecl(Decl& decl) {
                 auto moduleCu = parser.parse();
 
                 if (!diag_.hadErrors() && moduleCu) {
-                    // 注册模块中的类型和函数 / Register types and functions from module
+                    // 完整处理模块中的所有声明
+                    // Fully process all declarations in the module
                     for (const auto& modDecl : moduleCu->declarations) {
-                        if (!modDecl) continue;
-                        if (modDecl->declKind == DeclKind::Struct ||
-                            modDecl->declKind == DeclKind::Class ||
-                            modDecl->declKind == DeclKind::Enum ||
-                            modDecl->declKind == DeclKind::Protocol) {
-                            auto& td = static_cast<TypeDecl&>(*modDecl);
-                            Symbol* existing = symbols_.lookup(td.name);
-                            if (!existing) {
-                                Symbol sym;
-                                sym.kind = SymbolKind::Type;
-                                sym.name = td.name;
-                                sym.isPublic = true;
-                                symbols_.define(sym);
-                            }
-                        } else if (modDecl->declKind == DeclKind::Function) {
-                            auto& fd = static_cast<FunctionDecl&>(*modDecl);
-                            Symbol* existing = symbols_.lookup(fd.name);
-                            if (!existing) {
-                                Symbol sym;
-                                sym.kind = SymbolKind::Function;
-                                sym.name = fd.name;
-                                sym.isPublic = true;
-                                sym.isInitialized = true;
-                                symbols_.define(sym);
-                            }
-                        }
+                        if (modDecl) processDecl(*modDecl);
                     }
                 }
             }
@@ -511,6 +487,9 @@ void Sema::processVariableDecl(VariableDecl& decl) {
     sym.isConstant = decl.isLet;
     sym.line = decl.loc.line;
     sym.column = decl.loc.column;
+    sym.access = decl.access;
+    sym.declaringFile = currentModule_;
+    sym.scopeDepth = symbols_.depth();
 
     if (decl.pattern && decl.pattern->patternKind == PatternKind::Identifier) {
         auto* idPat = static_cast<IdentifierPattern*>(decl.pattern.get());
@@ -577,7 +556,10 @@ void Sema::processFunctionDecl(FunctionDecl& decl) {
     sym.name = decl.name;
     sym.line = decl.loc.line;
     sym.column = decl.loc.column;
+    sym.access = decl.access;
     sym.isPublic = (decl.access == AccessLevel::Public) || isMain || isCDecl;
+    sym.declaringFile = currentModule_;
+    sym.scopeDepth = symbols_.depth();
 
     // 命名规范检查 / Naming convention check
     checkNamingConvention(decl.name, false, decl.loc);
