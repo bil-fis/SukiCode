@@ -139,6 +139,9 @@ public:
     // Unicode 视图 / Unicode views
     std::vector<UnicodeScalar> unicodeScalars() const;
 
+    // 字符视图（同 unicodeScalars，因为 Char = UnicodeScalar）/ Characters view
+    std::vector<UnicodeScalar> characters() const { return unicodeScalars(); }
+
 private:
     // 确保数据唯一（COW）/ Ensure data is unique (COW)
     void ensureUnique() {

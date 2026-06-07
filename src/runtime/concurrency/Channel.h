@@ -97,6 +97,18 @@ public:
         return value;
     }
 
+    // 检查是否有数据可接收 / Check if data is available to receive
+    bool hasData() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !queue_.empty();
+    }
+
+    // 检查通道是否已关闭 / Check if channel is closed
+    bool isClosed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
     // 关闭通道 / Close channel
     void close() {
         std::lock_guard<std::mutex> lock(mutex_);
