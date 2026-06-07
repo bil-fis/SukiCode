@@ -48,6 +48,15 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
   - subscript 代码生成、deinit 代码生成
   - vtable 方法调度（含实例填充）、inout 参数指针传递
   - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
+  - 泛型类型单态化（含字段索引映射）、async/await 协程帧
+  - select 语句（channel 轮询）、泛型 where 子句约束验证、-O 优化级别
+  - 访问控制语义检查（private/fileprivate/internal）、Opaque/Existential 类型
+  - 组合类型 A&B（CompositionType 跟踪所有协议）
+  - SetLiteral 实际存储元素（堆分配）、Selector 表达式代码生成
+  - import 实际加载模块文件（词法分析+语法分析+处理body）
+  - subscript 代码生成、deinit 代码生成
+  - vtable 方法调度（含实例填充）、inout 参数指针传递
+  - try?/try! setjmp/longjmp 包装实现、?? nil 合并运算符
   - 泛型类型单态化（含字段替换）、async/await 协程帧
   - select 语句（channel 轮询）、泛型 where 子句约束验证、-O 优化级别
   - 访问控制语义检查（private/fileprivate/internal）、Opaque/Existential 类型
@@ -58,9 +67,9 @@ SukiCode 是一门融合 Swift、TypeScript 与 Objective-C 语法的现代系�
 - **Actor**: ActorDecl 代码生成、executor 注册、方法注册、await 检查
 - **互操作**: extern "C" 声明语法、@_cdecl 链接、ObjC 运行时预声明
 - **模块系统**: import 实际加载模块文件（词法分析+语法分析+注册类型/函数）
-- **标准库**: Array、Dictionary、Set、String、Optional、Result、Range、Stack、Queue、LinkedList
+- **标准库**: Array(COW)、Dictionary(COW)、Set(COW)、String(COW+views)、Optional、Result、Range、Stack、Queue、LinkedList
 - **系统库**: MemoryLayout、DynamicLibrary、SystemInfo、Process、File、Path、Date/Timer、sys 模块、MMapRegion
-- **并发库**: ThreadPool、DispatchQueue、Channel、Atomic、Mutex/RWLock/Semaphore
+- **并发库**: ThreadPool、DispatchQueue、TaskGroup/Task、Channel、Atomic、Mutex/RWLock/Semaphore
 - **加密库**: SHA256、MD5、HMAC-SHA256、AES-128 ECB、ChaCha20、RSA、Ed25519
 - **数据编码**: Base64、Hex、GZip、Zlib、XML、CSV、MessagePack
 - **网络库**: URL、JSON、Socket（TCP/UDP）、URLSession HTTP 客户端
