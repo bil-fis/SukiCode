@@ -70,6 +70,8 @@ private:
     std::string currentActor_; // 当前 Actor 名称（如果在 Actor 内部）
     std::string currentTypeName_; // 当前处理的类型名称（用于 self/super 引用）
     std::string currentSuperclassName_; // 当前类的父类名称（用于 super 引用）
+    bool isInAwaitExpr_ = false; // 是否在 await 表达式中
+    const CompilationUnit* currentCu_ = nullptr; // 当前编译单元
 
     // 类方法跟踪（用于 override/final 检查）/ Class method tracking for override/final checks
     // className -> { methodName -> isFinal }

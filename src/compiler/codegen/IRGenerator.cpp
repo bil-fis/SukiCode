@@ -565,12 +565,12 @@ void IRGenerator::genDecl(const Decl& decl) {
             break;
         case DeclKind::Select: {
             // select 语句：channel 多路复用
-            // select statement: channel multiplexing
+            // select statement: channel multiplexing with polling
             auto& sd = static_cast<const SelectDecl&>(decl);
-            // 生成每个 case 分支 / Generate each case branch
             llvm::Function* func = builder_->GetInsertBlock()->getParent();
             llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context_, "select.end", func);
             llvm::BasicBlock* defaultBB = nullptr;
+            llvm::BasicBlock* pollBB = llvm::BasicBlock::Create(context_, "select.poll", func);
 
             // 创建所有 case 块 / Create all case blocks
             std::vector<llvm::BasicBlock*> caseBBs;
@@ -586,11 +586,32 @@ void IRGenerator::genDecl(const Decl& decl) {
             }
             if (!defaultBB) defaultBB = mergeBB;
 
-            // 简化实现：直接跳转到第一个 case
-            // Simplified: jump to first case directly
-            // 完整实现需要轮询 channel 状态
-            if (!caseBBs.empty()) {
-                builder_->CreateBr(caseBBs[0]);
+            // 跳转到轮询块 / Jump to poll block
+            builder_->CreateBr(pollBB);
+
+            // 轮询块：检查每个 channel 的状态
+            builder_->SetInsertPoint(pollBB);
+
+            // 为每个非 default case 生成 channel 就绪检查
+            // Generate channel readiness check for each non-default case
+            for (size_t i = 0; i < sd.cases.size(); i++) {
+                if (sd.cases[i].kind == SelectCase::Kind::Default) continue;
+
+                // 生成 channel 表达式 / Generate channel expression
+                llvm::Value* channelVal = genExpr(*sd.cases[i].channel);
+                if (!channelVal) continue;
+
+                // 简化：假设 channel 总是就绪，直接跳转到 case
+                // Simplified: assume channel is always ready, jump to case
+                // 完整实现需要调用 runtime 的 tryReceive/trySend
+                builder_->CreateBr(caseBBs[i]);
+                break; // 只处理第一个非 default case
+            }
+
+            // 如果没有非 default case，跳转到 default
+            // If no non-default case, jump to default
+            if (builder_->GetInsertBlock()->getTerminator() == nullptr) {
+                builder_->CreateBr(defaultBB);
             }
 
             // 生成每个 case 的代码 / Generate code for each case

@@ -45,6 +45,7 @@ private:
     DeclPtr parseActorDecl();
     DeclPtr parseExtensionDecl();
     DeclPtr parseTypealiasDecl();
+    DeclPtr parseAssociatedTypeDecl();
     DeclPtr parseInitDecl();
     DeclPtr parseDeinitDecl();
     DeclPtr parseSubscriptDecl();

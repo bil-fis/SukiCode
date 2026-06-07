@@ -230,6 +230,7 @@ DeclPtr Parser::parseDeclaration() {
         case TokenKind::KwActor:     decl = parseActorDecl(); break;
         case TokenKind::KwExtension: decl = parseExtensionDecl(); break;
         case TokenKind::KwTypealias: decl = parseTypealiasDecl(); break;
+        case TokenKind::KwAssociatedtype: decl = parseAssociatedTypeDecl(); break;
         case TokenKind::KwInit:      decl = parseInitDecl(); break;
         case TokenKind::KwDeinit:    decl = parseDeinitDecl(); break;
         case TokenKind::KwSubscript: decl = parseSubscriptDecl(); break;
@@ -461,15 +462,23 @@ DeclPtr Parser::parseFunctionDecl() {
         advance(); // skip 'where'
         // 解析约束表达式: T: Protocol, U: Protocol & Protocol2
         do {
-            // 跳过类型参数名 / Skip type parameter name
-            if (check(TokenKind::Identifier)) advance();
+            FunctionDecl::WhereConstraint wc;
+            // 解析类型参数名 / Parse type parameter name
+            if (check(TokenKind::Identifier)) {
+                wc.typeName = std::string(advance().stringValue);
+            }
             // 期望冒号 / Expect colon
             if (match(TokenKind::Colon)) {
-                // 解析约束类型 / Parse constraint types
-                while (!check(TokenKind::Comma) && !check(TokenKind::LBrace) &&
-                       !check(TokenKind::Arrow) && !isAtEnd()) {
-                    advance(); // skip constraint type
-                }
+                // 解析约束类型 / Parse constraint types (T: A & B)
+                do {
+                    TypeReprPtr constraint = parseType();
+                    if (constraint) {
+                        wc.constraints.push_back(std::move(constraint));
+                    }
+                } while (match(TokenKind::Amp));
+            }
+            if (!wc.typeName.empty()) {
+                decl->whereConstraints.push_back(std::move(wc));
             }
         } while (match(TokenKind::Comma));
     }
@@ -724,6 +733,30 @@ DeclPtr Parser::parseTypealiasDecl() {
 
     expect(TokenKind::Assign);
     decl->underlyingType = parseType();
+
+    return decl;
+}
+
+DeclPtr Parser::parseAssociatedTypeDecl() {
+    expect(TokenKind::KwAssociatedtype);
+    auto decl = makeNode<AssociatedTypeDecl>();
+
+    // 关联类型名称 / Associated type name
+    if (check(TokenKind::Identifier)) {
+        decl->name = std::string(advance().stringValue);
+    } else {
+        error("expected associated type name");
+    }
+
+    // 可选的约束 / Optional constraint
+    if (match(TokenKind::Colon)) {
+        decl->constraint = parseType();
+    }
+
+    // 可选的默认类型 / Optional default type
+    if (match(TokenKind::Assign)) {
+        decl->defaultType = parseType();
+    }
 
     return decl;
 }

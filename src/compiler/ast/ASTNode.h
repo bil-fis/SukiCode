@@ -612,6 +612,12 @@ struct GenericParam {
 struct FunctionDecl : Decl {
     std::string name;
     std::vector<GenericParam> genericParams; // <T: Hashable, U>
+    // where 子句约束 / where clause constraints
+    struct WhereConstraint {
+        std::string typeName; // T
+        std::vector<TypeReprPtr> constraints; // Protocol1, Protocol2
+    };
+    std::vector<WhereConstraint> whereConstraints;
     std::vector<FunctionParam> params;
     TypeReprPtr returnType; // optional, defaults to Void
     bool isAsync = false;

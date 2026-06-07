@@ -11,6 +11,8 @@ Sema::Sema(DiagnosticEngine& diag) : diag_(diag), typeChecker_(diag, symbols_) {
 Sema::~Sema() = default;
 
 bool Sema::analyze(CompilationUnit& cu) {
+    currentCu_ = &cu;
+
     // Register built-in types
     auto regType = [&](const char* name) {
         Symbol sym;
@@ -277,7 +279,12 @@ void Sema::processDecl(Decl& decl) {
         case DeclKind::While: {
             auto& w = static_cast<WhileDecl&>(decl);
             typeChecker_.enterLoop();
-            if (w.condition) inferExprType(*w.condition);
+            if (w.condition) {
+                TypePtr condType = inferExprType(*w.condition);
+                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
+                    error(w.condition->loc, "while condition must be of type 'Bool'");
+                }
+            }
             symbols_.enterScope();
             for (auto& s : w.body) { if (s) processStmt(*s); }
             symbols_.leaveScope();
@@ -364,7 +371,12 @@ void Sema::processDecl(Decl& decl) {
         }
         case DeclKind::If: {
             auto& ifDecl = static_cast<IfDecl&>(decl);
-            if (ifDecl.condition) inferExprType(*ifDecl.condition);
+            if (ifDecl.condition) {
+                TypePtr condType = inferExprType(*ifDecl.condition);
+                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
+                    error(ifDecl.condition->loc, "if condition must be of type 'Bool'");
+                }
+            }
             symbols_.enterScope();
             for (auto& s : ifDecl.thenBody) { if (s) processStmt(*s); }
             symbols_.leaveScope();
@@ -375,7 +387,12 @@ void Sema::processDecl(Decl& decl) {
         }
         case DeclKind::Guard: {
             auto& g = static_cast<GuardDecl&>(decl);
-            if (g.condition) inferExprType(*g.condition);
+            if (g.condition) {
+                TypePtr condType = inferExprType(*g.condition);
+                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
+                    error(g.condition->loc, "guard condition must be of type 'Bool'");
+                }
+            }
             symbols_.enterScope();
             for (auto& s : g.elseBody) { if (s) processStmt(*s); }
             symbols_.leaveScope();
@@ -403,6 +420,16 @@ void Sema::processDecl(Decl& decl) {
             for (auto& d : eb.declarations) {
                 if (d) processDecl(*d);
             }
+            break;
+        }
+        case DeclKind::AssociatedType: {
+            // 关联类型声明：注册到符号表
+            auto& at = static_cast<AssociatedTypeDecl&>(decl);
+            Symbol sym;
+            sym.kind = SymbolKind::Type;
+            sym.name = at.name;
+            sym.isPublic = true;
+            symbols_.define(sym);
             break;
         }
         case DeclKind::Macro: {
@@ -607,11 +634,47 @@ void Sema::processStructDecl(StructDecl& decl) {
 
         // 查找协议定义 / Find protocol definition
         Symbol* protoSym = symbols_.lookup(protoName);
-        if (!protoSym || protoSym->kind != SymbolKind::Type) continue;
+        if (!protoSym || protoSym->kind != SymbolKind::Type) {
+            warning(decl.loc, "protocol '" + protoName + "' not found");
+            continue;
+        }
 
-        // 收集协议要求的方法 / Collect required methods
-        // 通过查找协议成员来验证
-        // 简化实现：只检查协议名称是否存在于符号表中
+        // 收集协议要求的方法名 / Collect required method names from protocol
+        // 遍历编译单元找到协议声明
+        std::set<std::string> requiredMethods;
+        if (currentCu_) {
+            for (const auto& d : currentCu_->declarations) {
+                if (d && d->declKind == DeclKind::Protocol) {
+                    auto& pd = static_cast<const ProtocolDecl&>(*d);
+                    if (pd.name == protoName) {
+                        for (const auto& member : pd.members) {
+                            if (member && member->declKind == DeclKind::Function) {
+                                auto& fd = static_cast<const FunctionDecl&>(*member);
+                                requiredMethods.insert(fd.name);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 检查当前类型是否实现了所有要求的方法 / Check if type implements all required methods
+        for (const auto& methodName : requiredMethods) {
+            bool found = false;
+            for (const auto& member : decl.members) {
+                if (member && member->declKind == DeclKind::Function) {
+                    auto& fd = static_cast<const FunctionDecl&>(*member);
+                    if (fd.name == methodName) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                error(decl.loc, "type '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
+            }
+        }
     }
 
     currentTypeName_ = prevTypeName;
@@ -688,26 +751,35 @@ void Sema::processClassDecl(ClassDecl& decl) {
             auto& id = static_cast<InitDecl&>(*m);
             // required init 检查 / required init checking
             if (id.isRequired) {
-                classMethods_[decl.name]["init"] = false;
+                classMethods_[decl.name]["init.required"] = false;
             }
             // convenience init 检查 / convenience init checking
             if (id.isConvenience) {
-                // convenience init 必须调用 self.init
+                // convenience init 必须调用 self.init 或 super.init
                 bool callsSelfInit = false;
-                // 检查 body 中是否有 self.init 或 super.init 调用
                 for (const auto& stmt : id.body) {
                     if (!stmt) continue;
-                    // 递归检查表达式中是否有 init 调用
-                    // 简化：检查是否有任何函数调用
+                    // 检查表达式语句
                     if (stmt->stmtKind == StmtKind::Expression) {
                         auto& es = static_cast<const ExpressionStmt&>(*stmt);
-                        if (es.expression && es.expression->exprKind == ExprKind::Call) {
-                            callsSelfInit = true;
+                        if (es.expression) {
+                            // 检查是否是 self.init(...) 或 super.init(...) 调用
+                            if (es.expression->exprKind == ExprKind::Call) {
+                                auto& call = static_cast<const CallExpr&>(*es.expression);
+                                if (call.callee->exprKind == ExprKind::MemberAccess) {
+                                    auto& ma = static_cast<const MemberAccessExpr&>(*call.callee);
+                                    if (ma.member == "init" &&
+                                        (ma.base->exprKind == ExprKind::SelfRef ||
+                                         ma.base->exprKind == ExprKind::SuperRef)) {
+                                        callsSelfInit = true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
                 if (!callsSelfInit && !id.body.empty()) {
-                    warning(id.loc, "convenience init should delegate to another init via self.init()");
+                    error(id.loc, "convenience init must delegate to another init via self.init() or super.init()");
                 }
             }
         }
@@ -722,9 +794,8 @@ void Sema::processClassDecl(ClassDecl& decl) {
         while (!parentName.empty()) {
             auto parentIt = classMethods_.find(parentName);
             if (parentIt != classMethods_.end()) {
-                // 检查父类是否有 required init
                 if (parentIt->second.count("init.required")) {
-                    // 检查当前类是否实现了 init
+                    // 检查当前类是否有任何 init
                     bool hasInit = false;
                     for (const auto& m : decl.members) {
                         if (m && m->declKind == DeclKind::Init) {
@@ -742,16 +813,6 @@ void Sema::processClassDecl(ClassDecl& decl) {
                 parentName = ppIt->second;
             } else {
                 break;
-            }
-        }
-    }
-
-    // 记录 required init / Record required init
-    for (const auto& m : decl.members) {
-        if (m && m->declKind == DeclKind::Init) {
-            auto& id = static_cast<InitDecl&>(*m);
-            if (id.isRequired) {
-                classMethods_[decl.name]["init.required"] = false;
             }
         }
     }
@@ -798,11 +859,24 @@ void Sema::processStmt(Stmt& stmt) {
                 error(stmt.loc, "'fallthrough' must be inside a switch case");
             }
             break;
-        case StmtKind::Throw:
+        case StmtKind::Throw: {
             if (!typeChecker_.isInThrowsFunction()) {
                 error(stmt.loc, "'throw' must be inside a function marked 'throws'");
             }
+            // 检查 thrown 类型是否符合 Error 协议
+            auto& throwStmt = static_cast<const ThrowStmt&>(stmt);
+            if (throwStmt.value) {
+                TypePtr thrownType = inferExprType(*throwStmt.value);
+                // Error 协议检查：thrown 类型应该是 Error 或其子类
+                // 简化：检查是否是 Error 类型或包含 error 字符串的类型
+                if (thrownType && thrownType->kind() != TypeKind::Error &&
+                    thrownType->kind() != TypeKind::Any) {
+                    // 允许所有类型被 throw（放宽检查，因为 Error 协议检查需要完整的协议系统）
+                    // 实际实现中应该检查 thrownType 是否符合 Error 协议
+                }
+            }
             break;
+        }
         case StmtKind::VariableDecl: {
             auto& vs = static_cast<VariableDeclStmt&>(stmt);
             if (vs.varDecl) processVariableDecl(static_cast<VariableDecl&>(*vs.varDecl));
@@ -895,9 +969,9 @@ TypePtr Sema::inferExprType(Expr& expr) {
                 auto& ma = static_cast<MemberAccessExpr&>(*call.callee);
                 TypePtr baseType = inferExprType(*ma.base);
                 if (baseType && baseType->kind() == TypeKind::Actor) {
-                    // 检查是否在 async 上下文中
-                    if (!typeChecker_.isInAsyncFunction()) {
-                        error(expr.loc, "calling actor method '" + ma.member + "' requires 'await' in async context");
+                    // 检查调用是否被 await 包裹
+                    if (!isInAwaitExpr_) {
+                        error(expr.loc, "calling actor method '" + ma.member + "' requires 'await'");
                     }
                 }
             }
@@ -1033,7 +1107,11 @@ TypePtr Sema::inferExprType(Expr& expr) {
         }
         case ExprKind::Await: {
             auto& ae = static_cast<AwaitExpr&>(expr);
-            return inferExprType(*ae.subExpr);
+            bool prevAwait = isInAwaitExpr_;
+            isInAwaitExpr_ = true;
+            TypePtr result = inferExprType(*ae.subExpr);
+            isInAwaitExpr_ = prevAwait;
+            return result;
         }
         case ExprKind::Move: {
             auto& me = static_cast<MoveExpr&>(expr);
