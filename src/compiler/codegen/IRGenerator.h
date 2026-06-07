@@ -160,6 +160,16 @@ private:
     };
     std::unordered_map<std::string, VTableInfo> vtables_;
 
+    // 协议见证表 / Protocol witness table
+    struct WitnessTable {
+        llvm::StructType* tableType = nullptr;
+        std::unordered_map<std::string, size_t> methodIndices; // 方法名 -> 见证表索引
+        std::vector<llvm::Function*> methods; // 方法函数指针
+    };
+    std::unordered_map<std::string, WitnessTable> witnessTables_; // 协议名 -> 见证表
+    // 类型到协议见证表的映射 / Type to protocol witness table mapping
+    std::unordered_map<std::string, std::unordered_map<std::string, llvm::GlobalVariable*>> typeWitnessTables_;
+
     // Actor executor 注册 / Actor executor registry
     struct ActorInfo {
         llvm::StructType* type = nullptr;

@@ -485,6 +485,46 @@ void IRGenerator::genDecl(const Decl& decl) {
                 meta.fieldToParam = fieldToParam;
                 genericTypeMeta_[sd.name] = meta;
             }
+
+            // 为协议符合性生成见证表 / Generate witness tables for protocol conformances
+            for (const auto& proto : sd.conformsTo) {
+                if (!proto || proto->typeReprKind != TypeReprKind::Named) continue;
+                auto& protoName = static_cast<const NamedTypeRepr&>(*proto).name;
+                auto wtableIt = witnessTables_.find(protoName);
+                if (wtableIt == witnessTables_.end()) continue;
+
+                // 创建见证表实例 / Create witness table instance
+                std::vector<llvm::Constant*> wtableEntries;
+                for (size_t i = 0; i < wtableIt->second.methods.size(); i++) {
+                    // 查找类型中对应的方法 / Find corresponding method in type
+                    std::string methodName; // 协议方法名
+                    for (const auto& [name, idx] : wtableIt->second.methodIndices) {
+                        if (idx == i) { methodName = name; break; }
+                    }
+                    // 在类型中查找方法实现 / Find method implementation in type
+                    std::string implName = sd.name + "." + methodName;
+                    llvm::Function* implFunc = module_->getFunction(implName);
+                    if (!implFunc) {
+                        // 创建空函数作为占位 / Create empty function as placeholder
+                        llvm::FunctionType* funcTy = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(context_), {llvm::PointerType::get(context_, 0)}, false);
+                        implFunc = llvm::Function::Create(funcTy,
+                            llvm::Function::ExternalLinkage, implName, module_.get());
+                    }
+                    wtableEntries.push_back(llvm::ConstantExpr::getBitCast(implFunc,
+                        llvm::PointerType::get(context_, 0)));
+                }
+
+                if (!wtableEntries.empty() && wtableIt->second.tableType) {
+                    llvm::Constant* wtableInit = llvm::ConstantStruct::get(
+                        llvm::cast<llvm::StructType>(wtableIt->second.tableType), wtableEntries);
+                    llvm::GlobalVariable* wtableGlobal = new llvm::GlobalVariable(
+                        *module_, wtableIt->second.tableType, true,
+                        llvm::GlobalValue::InternalLinkage, wtableInit,
+                        sd.name + "." + protoName + ".witness");
+                    typeWitnessTables_[sd.name][protoName] = wtableGlobal;
+                }
+            }
             break;
         }
         case DeclKind::Class: {
@@ -607,6 +647,40 @@ void IRGenerator::genDecl(const Decl& decl) {
                 }
             }
             actors_[ad.name] = actorInfo;
+            break;
+        }
+        case DeclKind::Protocol: {
+            // 协议生成见证表类型 / Protocol generates witness table type
+            auto& pd = static_cast<const ProtocolDecl&>(decl);
+            WitnessTable wtable;
+            std::vector<llvm::Type*> wtableFieldTypes;
+
+            // 收集协议要求的方法 / Collect required methods
+            for (const auto& member : pd.members) {
+                if (member && member->declKind == DeclKind::Function) {
+                    auto& fd = static_cast<const FunctionDecl&>(*member);
+                    // 生成函数类型（添加 self 参数）
+                    std::vector<llvm::Type*> paramTypes;
+                    paramTypes.push_back(llvm::PointerType::get(context_, 0)); // self
+                    for (const auto& p : fd.params) {
+                        paramTypes.push_back(resolveType(p.type.get()));
+                    }
+                    llvm::Type* retType = fd.returnType ?
+                        resolveType(fd.returnType.get()) :
+                        llvm::Type::getVoidTy(context_);
+                    llvm::FunctionType* methodTy = llvm::FunctionType::get(retType, paramTypes, false);
+                    wtableFieldTypes.push_back(llvm::PointerType::get(context_, 0));
+                    wtable.methodIndices[fd.name] = wtable.methods.size();
+                    wtable.methods.push_back(nullptr); // 占位，具体类型实现时填充
+                }
+            }
+
+            // 创建见证表类型 / Create witness table type
+            if (!wtableFieldTypes.empty()) {
+                wtable.tableType = llvm::StructType::create(context_, pd.name + ".WitnessTable");
+                wtable.tableType->setBody(wtableFieldTypes);
+            }
+            witnessTables_[pd.name] = wtable;
             break;
         }
         case DeclKind::Enum: {
