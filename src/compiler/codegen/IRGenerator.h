@@ -164,7 +164,8 @@ private:
     struct WitnessTable {
         llvm::StructType* tableType = nullptr;
         std::unordered_map<std::string, size_t> methodIndices; // 方法名 -> 见证表索引
-        std::vector<llvm::Function*> methods; // 方法函数指针
+        std::vector<llvm::Function*> methods; // 方法函数指针（具体类型实现时填充）
+        std::vector<llvm::FunctionType*> methodTypes; // 方法函数类型
     };
     std::unordered_map<std::string, WitnessTable> witnessTables_; // 协议名 -> 见证表
     // 类型到协议见证表的映射 / Type to protocol witness table mapping

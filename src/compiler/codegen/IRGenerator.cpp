@@ -672,6 +672,7 @@ void IRGenerator::genDecl(const Decl& decl) {
                     wtableFieldTypes.push_back(llvm::PointerType::get(context_, 0));
                     wtable.methodIndices[fd.name] = wtable.methods.size();
                     wtable.methods.push_back(nullptr); // 占位，具体类型实现时填充
+                    wtable.methodTypes.push_back(methodTy);
                 }
             }
 
