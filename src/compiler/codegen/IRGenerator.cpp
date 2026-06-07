@@ -1083,37 +1083,58 @@ llvm::Function* IRGenerator::genFunctionDecl(const FunctionDecl& decl) {
     namedValues_.clear();
     namedTypes_.clear();
 
-    // async 函数：生成协程状态机 / async function: generate coroutine state machine
+    // async 函数：使用 LLVM 协程 intrinsics 生成状态机
+    // async function: generate state machine using LLVM coroutine intrinsics
     if (decl.isAsync) {
-        // 创建协程状态变量 / Create coroutine state variable
-        llvm::AllocaInst* stateVar = createEntryBlockAlloca(func,
-            llvm::Type::getInt32Ty(context_), "__coro_state");
-        builder_->CreateStore(llvm::ConstantInt::get(
-            llvm::Type::getInt32Ty(context_), 0), stateVar);
-        namedValues_["__coro_state"] = stateVar;
-        namedTypes_["__coro_state"] = llvm::Type::getInt32Ty(context_);
+        // 获取协程 intrinsics / Get coroutine intrinsics
+        llvm::Function* coroIdFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_id);
+        llvm::Function* coroAllocFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_alloc);
+        llvm::Function* coroBeginFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_begin);
+        llvm::Function* coroSuspendFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_suspend);
+        llvm::Function* coroEndFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_end);
+        llvm::Function* coroFreeFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_free);
+        llvm::Function* coroSizeFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_size);
+        llvm::Function* coroSaveFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_save);
+        llvm::Function* coroResumeFunc = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::coro_resume);
 
-        // 创建恢复入口块 / Create resume entry block
-        llvm::BasicBlock* resumeBB = llvm::BasicBlock::Create(context_, "coro.resume", func);
-        coroResumeBB_ = resumeBB;
+        // coro.id 标识协程 / coro.id identifies the coroutine
+        llvm::Value* nullPtr = llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0));
+        llvm::Value* coroId = builder_->CreateCall(coroIdFunc, {nullPtr, nullPtr, nullPtr, nullPtr}, "coro.id");
 
-        // 创建状态分发 switch / Create state dispatch switch
-        llvm::Value* curState = builder_->CreateLoad(
-            llvm::Type::getInt32Ty(context_), stateVar, "coro.curstate");
+        // coro.alloc 分配协程帧 / coro.alloc allocates coroutine frame
+        llvm::Value* needAlloc = builder_->CreateCall(coroAllocFunc, {coroId}, "coro.needalloc");
 
-        // 跳转到状态分发 / Jump to state dispatch
-        llvm::BasicBlock* dispatchBB = llvm::BasicBlock::Create(context_, "coro.dispatch", func);
-        builder_->CreateBr(dispatchBB);
-        builder_->SetInsertPoint(dispatchBB);
+        // 创建分配和跳过分配的基本块
+        llvm::BasicBlock* allocBB = llvm::BasicBlock::Create(context_, "coro.alloc", func);
+        llvm::BasicBlock* skipAllocBB = llvm::BasicBlock::Create(context_, "coro.noalloc", func);
+        builder_->CreateCondBr(needAlloc, allocBB, skipAllocBB);
 
-        // 创建状态 switch / Create state switch
-        // 初始状态 0 跳转到函数体 / Initial state 0 jumps to function body
-        llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(context_, "coro.body", func);
-        llvm::SwitchInst* stateSwitch = builder_->CreateSwitch(curState, bodyBB, 2);
-        stateSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0), bodyBB);
+        // 分配块 / Allocation block
+        builder_->SetInsertPoint(allocBB);
+        llvm::Value* frameSize = builder_->CreateCall(coroSizeFunc, {}, "coro.size");
+        // 使用 malloc 分配 / Use malloc for allocation
+        llvm::Function* mallocFunc = module_->getFunction("malloc");
+        if (!mallocFunc) {
+            llvm::FunctionType* mallocTy = llvm::FunctionType::get(
+                llvm::PointerType::get(context_, 0), {llvm::Type::getInt64Ty(context_)}, false);
+            mallocFunc = llvm::Function::Create(mallocTy, llvm::Function::ExternalLinkage,
+                                                "malloc", module_.get());
+        }
+        llvm::Value* framePtr = builder_->CreateCall(mallocFunc, {frameSize}, "coro.frame");
+        builder_->CreateBr(skipAllocBB);
 
-        // 生成函数体 / Generate function body
-        builder_->SetInsertPoint(bodyBB);
+        // 跳过分配块 / Skip allocation block
+        builder_->SetInsertPoint(skipAllocBB);
+        llvm::PHINode* framePhi = builder_->CreatePHI(llvm::PointerType::get(context_, 0), 2, "coro.frame.phi");
+        framePhi->addIncoming(framePtr, allocBB);
+        framePhi->addIncoming(nullPtr, entry);
+
+        // coro.begin 开始协程 / coro.begin starts the coroutine
+        llvm::Value* coroHdl = builder_->CreateCall(coroBeginFunc, {coroId, framePhi}, "coro.hdl");
+
+        // 保存协程句柄供 suspend 使用 / Save coroutine handle for suspend
+        coroHandle_ = coroHdl;
+        coroId_ = coroId;
     }
 
     // 为参数创建 alloca / Create allocas for parameters
@@ -1988,42 +2009,35 @@ llvm::Value* IRGenerator::genExpr(const Expr& expr) {
             llvm::Value* val = genExpr(*ae.subExpr);
             if (!val) return nullptr;
 
-            // async 上下文中：创建挂起点 / In async context: create suspension point
-            if (isInAsyncFunc_ && coroResumeBB_) {
-                llvm::Value* stateVar = namedValues_["__coro_state"];
-                if (stateVar) {
-                    int curState = awaitPointCount_++;
-                    int nextState = curState + 1;
+            // async 上下文中：使用 coro.suspend 创建挂起点
+            // In async context: use coro.suspend to create suspension point
+            if (isInAsyncFunc_ && coroHandle_) {
+                // coro.save 保存当前状态 / coro.save saves current state
+                llvm::Function* coroSaveFunc = llvm::Intrinsic::getOrInsertDeclaration(
+                    module_.get(), llvm::Intrinsic::coro_save);
+                llvm::Value* saveToken = builder_->CreateCall(coroSaveFunc, {coroId_}, "coro.save");
 
-                    // 保存当前状态值（用于恢复时的 switch）
-                    // 状态 curState 的代码执行到这里
-                    // 更新状态为 nextState
-                    builder_->CreateStore(
-                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), nextState),
-                        stateVar);
+                // coro.suspend 挂起点 / coro.suspend suspension point
+                llvm::Function* coroSuspendFunc = llvm::Intrinsic::getOrInsertDeclaration(
+                    module_.get(), llvm::Intrinsic::coro_suspend);
 
-                    // 创建恢复时的目标块 / Create resume target block
-                    llvm::BasicBlock* resumeTarget = llvm::BasicBlock::Create(
-                        context_, "coro.await." + std::to_string(nextState),
-                        builder_->GetInsertBlock()->getParent());
+                // 创建挂起后的继续块 / Create resume block after suspend
+                llvm::BasicBlock* suspendBB = llvm::BasicBlock::Create(
+                    context_, "coro.suspend", builder_->GetInsertBlock()->getParent());
+                llvm::BasicBlock* resumeBB = llvm::BasicBlock::Create(
+                    context_, "coro.resume." + std::to_string(awaitPointCount_++),
+                    builder_->GetInsertBlock()->getParent());
 
-                    // 添加 case 到状态 switch（在 dispatch 块中）
-                    // 恢复时从 dispatch 块跳转到 resumeTarget
-                    // 这里简化：创建一个条件检查块
-                    llvm::BasicBlock* afterAwait = llvm::BasicBlock::Create(
-                        context_, "coro.after.await", builder_->GetInsertBlock()->getParent());
+                // coro.suspend 返回: 0=resume, 1=destroy, 2=suspend
+                llvm::Value* suspendResult = builder_->CreateCall(
+                    coroSuspendFunc, {saveToken, llvm::ConstantInt::getFalse(context_)}, "coro.suspend.result");
 
-                    // 跳转到 afterAwait（正常执行流）
-                    builder_->CreateBr(afterAwait);
+                // 根据结果跳转 / Branch based on result
+                llvm::SwitchInst* suspendSwitch = builder_->CreateSwitch(suspendResult, suspendBB, 3);
+                suspendSwitch->addCase(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context_), 0), resumeBB);
 
-                    // 设置 resumeTarget 块（恢复时执行）
-                    builder_->SetInsertPoint(resumeTarget);
-                    // 恢复时直接跳转到 afterAwait
-                    builder_->CreateBr(afterAwait);
-
-                    // 设置 afterAwait 块继续执行
-                    builder_->SetInsertPoint(afterAwait);
-                }
+                // 恢复块 / Resume block
+                builder_->SetInsertPoint(resumeBB);
             }
             return val;
         }

@@ -197,6 +197,8 @@ private:
     int awaitPointCount_ = 0;
     llvm::Value* coroutineState_ = nullptr;
     llvm::BasicBlock* coroResumeBB_ = nullptr; // 协程恢复入口块
+    llvm::Value* coroHandle_ = nullptr; // 协程句柄
+    llvm::Value* coroId_ = nullptr; // 协程标识
 
     // 闭包计数器 / Closure counter
     int nextClosureId_ = 0;
