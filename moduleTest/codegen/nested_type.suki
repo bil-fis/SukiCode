@@ -1,0 +1,19 @@
+struct Outer {
+    struct Inner {
+        var x: Int = 0
+    }
+    var outerVal: Int = 0
+}
+func makeInner() -> Outer.Inner {
+    let i = Outer.Inner()
+    i.x = 9
+    return i
+}
+func main() -> Int {
+    var i: Outer.Inner = makeInner()
+    if i.x != 9 { return 1 }
+    let o = Outer()
+    o.outerVal = 3
+    if o.outerVal != 3 { return 2 }
+    return 0
+}

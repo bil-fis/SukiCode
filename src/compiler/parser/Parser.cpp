@@ -546,8 +546,11 @@ NodePtr Parser::parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers)
             NodePtr inner = parseTypeDecl(nested, mmods);
             if (inner) {
                 inner->attributes = memberAttrs;
-                // 记录宿主类型，供 Sema 建立 Outer.Inner 的成员查找路径。
-                static_cast<TypeDecl*>(inner.get())->enclosingType = td->name;
+                // 记录宿主类型并改名为全称（Outer.Inner），供 Sema 建立
+                // 嵌套类型的成员查找与 codegen 唯一符号名（规范 4.6）。
+                auto* innerTd = static_cast<TypeDecl*>(inner.get());
+                innerTd->enclosingType = td->name;
+                innerTd->name = td->name + "." + innerTd->name;
                 td->members.push_back(std::move(inner));
             }
         } else {
@@ -2144,6 +2147,14 @@ NodePtr Parser::parseTypePostfix(NodePtr base) {
             }
             pos_ = save; // 不是泛型实参，交还外层
             break;
+        } else if (checkPunct(PunctuatorID::Dot) &&
+                   base->kind == NodeKind::NamedType &&
+                   peek(1).kind == TokenKind::TK_Identifier) {
+            // 限定类型名 `Outer.Inner` / `A.B.C`（规范 4.6 嵌套类型）。
+            advance(); // .
+            static_cast<NamedType*>(base.get())->name += "." + cur().text;
+            advance();
+            continue;
         } else if (checkPunct(PunctuatorID::Amp)) {
             advance();
             auto r = std::make_unique<RefType>();
