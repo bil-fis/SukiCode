@@ -305,6 +305,9 @@ NodePtr Parser::parseFunctionDecl(std::vector<std::string> modifiers) {
             break;
         }
     }
+    // 泛型 `where` 子句（规范 2.1）：`func f<T>(x: T) where T: Equatable`。
+    if (matchKw(KeywordID::Where)) parseWhereConstraints();
+    fn->genericConstraints = std::move(pendingGenericConstraints_);
     if (std::find(modifiers.begin(), modifiers.end(), "async") != modifiers.end()) fn->isAsync = true;
     if (std::find(modifiers.begin(), modifiers.end(), "mutating") != modifiers.end()) fn->isMutating = true;
     if (std::find(modifiers.begin(), modifiers.end(), "foreign") != modifiers.end() ||
@@ -325,16 +328,41 @@ NodePtr Parser::parseFunctionDecl(std::vector<std::string> modifiers) {
 }
 
 std::vector<std::string> Parser::parseGenericParamNames() {
+    pendingGenericConstraints_.clear();
     std::vector<std::string> names;
     expectPunct(PunctuatorID::Less, "expected '<'");
     while (!atEnd() && !checkPunct(PunctuatorID::Greater)) {
         if (check(TokenKind::TK_Identifier)) { names.push_back(cur().text); advance(); }
         else break;
-        if (matchPunct(PunctuatorID::Colon)) { parseType(); } // discard constraint
+        if (matchPunct(PunctuatorID::Colon)) {
+            // 内联约束 `T: Proto`（规范 2.1）：左端为类型形参名，右端为协议。
+            NodePtr proto = parseType();
+            auto lhs = std::make_unique<NamedType>();
+            lhs->name = names.back();
+            pendingGenericConstraints_.push_back(GenericConstraint(std::move(lhs), std::move(proto), false));
+        }
         if (!matchPunct(PunctuatorID::Comma)) break;
     }
     expectPunct(PunctuatorID::Greater, "expected '>'");
     return names;
+}
+
+void Parser::parseWhereConstraints() {
+    // 调用方已消费 `where` 关键字。解析 `T: Proto, U == V` 约束列表（规范 2.1）。
+    while (true) {
+        NodePtr lhs = parseType();
+        if (matchPunct(PunctuatorID::EqualEqual)) {
+            NodePtr rhs = parseType();
+            pendingGenericConstraints_.push_back(GenericConstraint(std::move(lhs), std::move(rhs), true));
+        } else if (matchPunct(PunctuatorID::Colon)) {
+            NodePtr rhs = parseType();
+            pendingGenericConstraints_.push_back(GenericConstraint(std::move(lhs), std::move(rhs), false));
+        } else {
+            errorAt(cur(), "expected ':' or '==' in where clause");
+            break;
+        }
+        if (!matchPunct(PunctuatorID::Comma)) break;
+    }
 }
 
 std::vector<Param> Parser::parseParameterList() {
@@ -431,6 +459,8 @@ NodePtr Parser::parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers)
     if (check(TokenKind::TK_Identifier)) { td->name = cur().text; advance(); }
     if (checkPunct(PunctuatorID::Less)) td->genericParams = parseGenericParamNames();
     if (matchPunct(PunctuatorID::Colon)) td->inherited = parseInheritedTypes();
+    if (matchKw(KeywordID::Where)) parseWhereConstraints();
+    td->genericConstraints = std::move(pendingGenericConstraints_);
     expectPunct(PunctuatorID::LBrace, "expected '{'");
     while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
         // member declarations
@@ -525,6 +555,8 @@ NodePtr Parser::parseTypealiasDecl() {
     advance(); // typealias
     if (check(TokenKind::TK_Identifier)) { t->name = cur().text; advance(); }
     if (checkPunct(PunctuatorID::Less)) t->genericParams = parseGenericParamNames();
+    if (matchKw(KeywordID::Where)) parseWhereConstraints();
+    t->genericConstraints = std::move(pendingGenericConstraints_);
     expectPunct(PunctuatorID::Equal, "expected '='");
     t->underlying = parseType();
     if (checkPunct(PunctuatorID::Semicolon)) advance();

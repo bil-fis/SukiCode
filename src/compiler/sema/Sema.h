@@ -35,6 +35,7 @@ struct TypeRecord {
     TypeDeclKind kind = TypeDeclKind::Struct;
     Node* decl = nullptr;                        // AST TypeDecl node
     std::vector<std::string> genericParams;      // T, U, ...
+    std::vector<GenericConstraint> genericConstraints; // 泛型约束（规范 2.1）
     const TypeRecord* superclass = nullptr;      // class single inheritance
     std::vector<const TypeRecord*> protocols;    // declared conformances
     // Members are keyed by name; a property and a method may share a name only
@@ -135,6 +136,11 @@ private:
     void checkInitRules();
     // 成员访问的访问控制检查（规范 10.1）：`private` 成员仅在本类型内可见。
     void checkMemberAccess(const TypeRecord* owner, const TypeRecord::Member* m, Node* at);
+    // 泛型约束检查（规范 2.1）：依据 bindings(类型形参→实参) 校验约束列表。
+    bool typeConformsTo(const Type* t, const std::string& protoName) const;
+    void checkGenericConstraints(const std::vector<GenericConstraint>& cs,
+                                 const std::unordered_map<std::string, const Type*>& bindings,
+                                 Node* at);
 
     // ── type resolution (TypeRepr → semantic Type) ──────────────────────────
     const Type* resolveTypeRepr(Node* repr, const TypeRecord* context);

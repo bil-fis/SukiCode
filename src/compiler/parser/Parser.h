@@ -64,6 +64,7 @@ private:
     NodePtr parseEnumCase();
     std::vector<Param> parseParameterList();
     std::vector<std::string> parseGenericParamNames(); // <T, U: Bound>
+    void parseWhereConstraints();          // where T: Proto, U == V
     NodeList parseInheritedTypes();        // : A, B, C
 
     // ── statements ────────────────────────────────────────────────────────────
@@ -132,6 +133,9 @@ private:
     // >0 while parsing a case pattern, where `(` starts a payload binding list
     // rather than a call argument list.
     int suppressCall_ = 0;
+    // 泛型约束累积区：parseGenericParamNames / parseWhereConstraints 解析到的
+    // 约束暂存于此，调用方随后取走填入 decl->genericConstraints（规范 2.1）。
+    std::vector<GenericConstraint> pendingGenericConstraints_;
 };
 
 } // namespace suki

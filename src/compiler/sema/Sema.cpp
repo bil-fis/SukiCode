@@ -59,6 +59,8 @@ void Sema::monomorphise(const NodeList& decls) {
         std::unordered_map<std::string, const Type*> saved = genericBindings_;
         for (size_t i = 0; i < gi.typeArgs.size(); ++i)
             genericBindings_[fn->genericParams[i]] = typeByName(gi.typeArgs[i]);
+        // 泛型约束（规范 2.1）：校验本次实例化的类型实参满足声明处约束。
+        checkGenericConstraints(fn->genericConstraints, genericBindings_, fn);
         // Re-check the body with the parameters bound, so each instantiation is
         // verified against the types it will actually be used with.
         checkFunctionBody(fn, nullptr);
@@ -88,6 +90,8 @@ void Sema::bindInstance(size_t index, FunctionDecl* fn) {
     if (gi.typeArgs.size() != fn->genericParams.size()) return;
     for (size_t i = 0; i < gi.typeArgs.size(); ++i)
         genericBindings_[fn->genericParams[i]] = typeByName(gi.typeArgs[i]);
+    // 泛型约束（规范 2.1）：校验实例化的类型实参满足声明处约束。
+    checkGenericConstraints(fn->genericConstraints, genericBindings_, fn);
     // Parameter types were fixed during collection, when the parameters were
     // still opaque. Re-resolve them now so the signature matches this instance.
     for (Param& prm : fn->params) {
@@ -437,6 +441,45 @@ void Sema::checkMemberAccess(const TypeRecord* owner, const TypeRecord::Member* 
     }
 }
 
+bool Sema::typeConformsTo(const Type* t, const std::string& protoName) const {
+    if (!t || t->kind != TypeKind::Named || !t->record) return false;
+    for (const TypeRecord* r = t->record; r; r = r->superclass)
+        for (const TypeRecord* p : r->protocols)
+            if (p && p->name == protoName) return true;
+    return false;
+}
+
+void Sema::checkGenericConstraints(const std::vector<GenericConstraint>& cs,
+                                   const std::unordered_map<std::string, const Type*>& bindings,
+                                   Node* at) {
+    for (const auto& c : cs) {
+        // 左端应为类型形参名（NamedType）。
+        std::string lhsName = (c.lhs && c.lhs->kind == NodeKind::NamedType)
+            ? static_cast<NamedType*>(c.lhs.get())->name : std::string();
+        auto it = bindings.find(lhsName);
+        if (it == bindings.end()) continue; // 形参未在本实参列表中绑定，跳过
+        const Type* lt = it->second;
+        if (c.sameType) {
+            const Type* rt = c.rhs ? resolveTypeRepr(c.rhs.get(), nullptr) : nullptr;
+            if (rt && typeToString(lt) != typeToString(rt)) {
+                hadError_ = true;
+                diags_.reportError("generic requirement '" + lhsName + " == " +
+                    typeToString(rt) + "' not satisfied by '" + typeToString(lt) + "'",
+                    rangeOf(at));
+            }
+        } else {
+            std::string protoName = (c.rhs && c.rhs->kind == NodeKind::NamedType)
+                ? static_cast<NamedType*>(c.rhs.get())->name : std::string();
+            if (!protoName.empty() && !typeConformsTo(lt, protoName)) {
+                hadError_ = true;
+                diags_.reportError("type '" + typeToString(lt) +
+                    "' does not conform to required protocol '" + protoName + "'",
+                    rangeOf(at));
+            }
+        }
+    }
+}
+
 void Sema::checkInitRules() {
     // 规范 4.4：required / convenience 构造器的语义校验。
     struct InitInfo { std::string sig; bool required; bool convenience; Node* decl; };
@@ -545,6 +588,7 @@ void Sema::collectTypeDecl(Node* decl) {
         default: rec->kind = TypeDeclKind::Struct; break;
     }
     rec->genericParams = td->genericParams;
+    rec->genericConstraints = std::move(td->genericConstraints);
 
     TypeRecord* raw = rec.get();
     typeIndex_[td->name] = raw;
@@ -972,6 +1016,12 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
             if (rec) {
                 std::vector<const Type*> args;
                 for (auto& a : nt->genericArgs) args.push_back(resolveTypeRepr(a.get(), context));
+                // 泛型约束（规范 2.1）：校验类型实参满足声明处的约束。
+                if (!rec->genericConstraints.empty() && args.size() == rec->genericParams.size()) {
+                    std::unordered_map<std::string, const Type*> binds;
+                    for (size_t i = 0; i < args.size(); ++i) binds[rec->genericParams[i]] = args[i];
+                    checkGenericConstraints(rec->genericConstraints, binds, repr);
+                }
                 return types_.named(rec, name, std::move(args));
             }
             return types_.unknownType();

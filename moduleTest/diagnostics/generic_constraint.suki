@@ -1,0 +1,7 @@
+protocol Equatable {}
+struct S {}
+func id<T: Equatable>(x: T) -> T { return x }
+func main() {
+    let s = S()
+    let r = id(s)   // 期望 error: S 不遵循 Equatable
+}

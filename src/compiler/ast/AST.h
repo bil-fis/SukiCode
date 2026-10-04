@@ -90,6 +90,18 @@ struct Param {
 };
 
 // ─── Declarations ──────────────────────────────────────────────────────────
+// 泛型约束（规范 2.1）：`func f<T: Equatable>(...)` 或 `where T: Equatable, U == V`。
+// lhs 为类型形参（或类型），rhs 为协议名（约束）或类型（same-type）；sameType
+// 区分 `T: Proto`（遵循协议）与 `T == U`（同类型约束）。
+struct GenericConstraint {
+    GenericConstraint() {}
+    GenericConstraint(NodePtr l, NodePtr r, bool st)
+        : lhs(std::move(l)), rhs(std::move(r)), sameType(st) {}
+    NodePtr lhs;
+    NodePtr rhs;
+    bool sameType = false;
+};
+
 struct TypeDecl : Node {
     TypeDecl(NodeKind k) : Node(k) {}
     std::string name;
@@ -98,6 +110,7 @@ struct TypeDecl : Node {
     NodeList inherited;                     // base types / protocols
     NodeList members;
     NodePtr whereClause;                    // optional `where` clause (Expr)
+    std::vector<GenericConstraint> genericConstraints; // 泛型约束（规范 2.1）
     // 宿主类型名（类型嵌套，规范 4.6）。`Outer.Inner` 的成员查找靠它把
     // 子类型登记到外层类型上；顶层类型为空。
     std::string enclosingType;
@@ -152,6 +165,7 @@ struct FunctionDecl : Node {
     bool isDefaultImpl = false;
     std::vector<std::string> genericParams;
     NodePtr whereClause;
+    std::vector<GenericConstraint> genericConstraints; // 泛型约束（规范 2.1）
 };
 
 struct InitDecl : Node {
@@ -183,6 +197,7 @@ struct TypealiasDecl : Node {
     std::string name;
     std::vector<std::string> genericParams;
     NodePtr underlying; // TypeRepr
+    std::vector<GenericConstraint> genericConstraints; // 泛型约束（规范 2.1）
 };
 
 struct EnumCaseDecl : Node {
