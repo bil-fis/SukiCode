@@ -181,6 +181,7 @@ bool builtinTypeFromName(const std::string& name, TypeKind& out) {
         {"Int32", TypeKind::Int32}, {"Int64", TypeKind::Int64},
         {"UInt8", TypeKind::UInt8}, {"UInt16", TypeKind::UInt16},
         {"UInt32", TypeKind::UInt32}, {"UInt64", TypeKind::UInt64},
+        {"OpaquePointer", TypeKind::OpaquePointer},
         {"Float", TypeKind::Float32}, {"Float16", TypeKind::Float16},
         {"Float32", TypeKind::Float32}, {"Float64", TypeKind::Float64},
         {"Double", TypeKind::Float64}, {"Float128", TypeKind::Float128},
@@ -276,6 +277,8 @@ std::string typeToString(const Type* t) {
                    (t->refKind == RefKind::Unowned ? ".Protocol" : ".Type");
         case TypeKind::Future:
             return "Future<" + (t->element ? typeToString(t->element) : "?") + ">";
+        case TypeKind::OpaquePointer:
+            return "OpaquePointer";
     }
     return "<type>";
 }

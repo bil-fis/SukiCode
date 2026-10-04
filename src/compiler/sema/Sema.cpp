@@ -732,6 +732,188 @@ void Sema::registerBuiltins() {
     // `await sleep(ms)` suspends; sleep is an async foreign builtin.
     addBuiltinFn("sleep", { types_.intType() }, types_.voidType(),
                  true, "suki_sleep");
+
+    // ─── Channel<T> ─────────────────────────────────────────────────────────
+    // A bounded, blocking FIFO backed by the C runtime. An instance stores only
+    // the runtime handle; `send` / `receive` block the calling thread, which is
+    // the right behaviour inside an async function (it runs on its own thread).
+    // The bodies are emitted by the code generator against the runtime, so the
+    // declarations carry no SukiCode body.
+    {
+        auto rec = std::make_unique<TypeRecord>();
+        rec->name = "Channel";
+        rec->kind = TypeDeclKind::Struct;
+        rec->genericParams = { "T" };
+
+        auto typeRepr = [](const char* n) {
+            auto* nt = new NamedType();
+            nt->name = n;
+            return nt;
+        };
+
+        auto* handleDecl = new VarDecl();
+        handleDecl->name = "handle";
+        handleDecl->type.reset(typeRepr("OpaquePointer"));
+        TypeRecord::Member handleMem;
+        handleMem.isFunction = false;
+        handleMem.name = "handle";
+        handleMem.type = types_.primitive(TypeKind::OpaquePointer);
+        handleMem.decl = handleDecl;
+        rec->members.push_back(handleMem);
+
+        // func send(_ value: T)
+        {
+            auto* fd = new FunctionDecl();
+            fd->name = "send";
+            fd->params.emplace_back();
+            Param& p = fd->params.back();
+            p.externalName = "_";
+            p.internalName = "value";
+            p.type.reset(typeRepr("T"));
+            fd->returnType.reset(typeRepr("Void"));
+            TypeRecord::Member m;
+            m.isFunction = true; m.name = "send";
+            m.type = types_.function({ types_.unknownType() }, types_.voidType());
+            m.decl = fd;
+            rec->members.push_back(m);
+        }
+        // func receive() -> T
+        {
+            auto* fd = new FunctionDecl();
+            fd->name = "receive";
+            fd->returnType.reset(typeRepr("T"));
+            TypeRecord::Member m;
+            m.isFunction = true; m.name = "receive";
+            m.type = types_.function({}, types_.unknownType());
+            m.decl = fd;
+            rec->members.push_back(m);
+        }
+        // func close()
+        {
+            auto* fd = new FunctionDecl();
+            fd->name = "close";
+            fd->returnType.reset(typeRepr("Void"));
+            TypeRecord::Member m;
+            m.isFunction = true; m.name = "close";
+            m.type = types_.function({}, types_.voidType());
+            m.decl = fd;
+            rec->members.push_back(m);
+        }
+
+        TypeRecord* raw = rec.get();
+        typeIndex_["Channel"] = raw;
+        ownedRecords_.push_back(std::move(rec));
+        Symbol s; s.kind = Symbol::Kind::Type; s.record = raw;
+        globals_.declare("Channel", s);
+    }
+
+    // ─── Task / TaskGroup (structured concurrency) ──────────────────────────
+    // Both are single-field wrappers around a runtime handle. `Task { ... }` runs
+    // a closure on its own thread; a TaskGroup records each child's Future so
+    // `waitForAll` can join them — the guarantee behind structured concurrency
+    // that no child outlives the group that spawned it.
+    auto voidRepr = []() { auto* n = new NamedType(); n->name = "Void"; return n; };
+
+    auto addHandleStruct = [&](const char* name,
+                               std::vector<TypeRecord::Member> extras) {
+        auto rec = std::make_unique<TypeRecord>();
+        rec->name = name;
+        rec->kind = TypeDeclKind::Struct;
+        auto* hd = new VarDecl();
+        hd->name = "handle";
+        auto* hr = new NamedType(); hr->name = "OpaquePointer";
+        hd->type.reset(hr);
+        TypeRecord::Member hm;
+        hm.isFunction = false; hm.name = "handle";
+        hm.type = types_.primitive(TypeKind::OpaquePointer);
+        hm.decl = hd;
+        rec->members.push_back(hm);
+        for (auto& m : extras) rec->members.push_back(m);
+        TypeRecord* raw = rec.get();
+        typeIndex_[name] = raw;
+        ownedRecords_.push_back(std::move(rec));
+        Symbol s; s.kind = Symbol::Kind::Type; s.record = raw;
+        globals_.declare(name, s);
+        return raw;
+    };
+
+    // Task { ... } — fire-and-forget; `wait()` blocks until it completes.
+    {
+        std::vector<TypeRecord::Member> ms;
+        auto* fd = new FunctionDecl();
+        fd->name = "wait";
+        fd->returnType.reset(voidRepr());
+        TypeRecord::Member m;
+        m.isFunction = true; m.name = "wait";
+        m.type = types_.function({}, types_.voidType());
+        m.decl = fd;
+        ms.push_back(m);
+        addHandleStruct("Task", ms);
+    }
+
+    // TaskGroup — `addTask { ... }` spawns a child, `waitForAll` joins them.
+    {
+        std::vector<TypeRecord::Member> ms;
+        {
+            auto* fd = new FunctionDecl();
+            fd->name = "addTask";
+            fd->params.emplace_back();
+            Param& p = fd->params.back();
+            p.externalName = "_";
+            p.internalName = "body";
+            auto* ft = new FuncType();
+            ft->ret.reset(voidRepr());
+            p.type.reset(ft);
+            fd->returnType.reset(voidRepr());
+            TypeRecord::Member m;
+            m.isFunction = true; m.name = "addTask";
+            m.type = types_.function({ types_.function({}, types_.voidType()) },
+                                     types_.voidType());
+            m.decl = fd;
+            ms.push_back(m);
+        }
+        {
+            auto* fd = new FunctionDecl();
+            fd->name = "waitForAll";
+            fd->returnType.reset(voidRepr());
+            TypeRecord::Member m;
+            m.isFunction = true; m.name = "waitForAll";
+            m.type = types_.function({}, types_.voidType());
+            m.decl = fd;
+            ms.push_back(m);
+        }
+        addHandleStruct("TaskGroup", ms);
+    }
+
+    // `withTaskGroup { group in ... }` — runs the body with a fresh group and
+    // waits for every child before returning. It is async so callers `await` it.
+    {
+        auto* fd = new FunctionDecl();
+        fd->name = "withTaskGroup";
+        fd->isAsync = true;
+        fd->params.emplace_back();
+        Param& p = fd->params.back();
+        p.externalName = "_";
+        p.internalName = "body";
+        auto* ft = new FuncType();
+        auto* tgRepr = new NamedType(); tgRepr->name = "TaskGroup";
+        ft->params.emplace_back(tgRepr);
+        ft->ret.reset(voidRepr());
+        p.type.reset(ft);
+        fd->returnType.reset(voidRepr());
+        fd->params[0].semaType =
+            types_.function({ types_.named(findType("TaskGroup"), "TaskGroup") },
+                            types_.voidType());
+
+        Symbol s;
+        s.kind = Symbol::Kind::Function;
+        s.function = fd;
+        s.type = types_.function(
+            { types_.function({ types_.named(findType("TaskGroup"), "TaskGroup") },
+                              types_.voidType()) },
+            types_.voidType());
+        globals_.declare("withTaskGroup", s);
+    }
 }
 
 void Sema::collectTypeDecl(Node* decl) {
@@ -1364,6 +1546,14 @@ static bool isFloatType(const Type* t) {
 void Sema::requireAssignable(const Type* to, const Type* from, Node* at,
                              const std::string& contextDesc) {
     if (isAssignable(to, from)) return;
+    // A closure whose result is discarded adapts to a Void-returning function
+    // type with the same parameters: `Task { f() }` is the natural spelling even
+    // when `f()` produces a value the task does not use.
+    if (to && from && to->kind == TypeKind::Function && to->ret &&
+        to->ret->kind == TypeKind::Void &&
+        (from->kind == TypeKind::Function || from->kind == TypeKind::Closure) &&
+        from->elements.size() == to->elements.size())
+        return;
     // Numeric literals adapt to the contextual type: an integer literal may
     // become any integer/float type, a float literal any float type.
     if (at && to) {

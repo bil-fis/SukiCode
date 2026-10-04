@@ -1,0 +1,32 @@
+// 通道（规范 7.5）：有界阻塞 FIFO，跨线程传递值。
+// Spec 7.5: a bounded blocking channel used across threads.
+//
+// 期望行为：生产者线程发送 0..9，主线程接收求和得 45，退出码 0。
+// 采用"默认失败"的返回值设计：结果不符时返回非零，避免假通过。
+
+async func producer(ch: Channel<Int>) -> Int {
+    var i = 0
+    while i < 10 {
+        ch.send(i)
+        i = i + 1
+    }
+    ch.close()
+    return 0
+}
+
+@main
+func main() -> Int {
+    let ch = Channel<Int>(capacity: 16)
+    let p = producer(ch)
+    var total = 0
+    var n = 0
+    while n < 10 {
+        total = total + ch.receive()
+        n = n + 1
+    }
+    let r = await p
+    if total == 45 {
+        return 0
+    }
+    return 1
+}

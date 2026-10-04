@@ -58,9 +58,11 @@ CASE_TIMEOUT="${CASE_TIMEOUT:-60}"
 #   kind = negative:          the case must be *rejected* by `sukic check`.
 KNOWN_PENDING=(
     "examples/memory.suki|owned-pool: Owned / MemoryPool / Collection / pool protocol family"
-    "examples/concurrency.suki|concurrency: Channel / Task / TaskGroup / withTaskGroup"
+    # Channel / Task / TaskGroup / withTaskGroup are implemented and covered by
+    # the codegen tests; what this showcase still needs is actor isolation, the
+    # `select` statement, `for await` iteration and ranges (`0..<100`).
+    "examples/concurrency.suki|concurrency: actor 隔离 / select 语句 / for await / 区间"
 
-    "moduleTest/pending/generic_type.suki|generics: 泛型类型的实例化与约束求解"
 )
 
 # pending_reason <relative-path> -> prints the owning task, or nothing if known.

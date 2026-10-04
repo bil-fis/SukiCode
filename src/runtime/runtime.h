@@ -140,17 +140,76 @@ int64_t suki_atomic_load_i64(const int64_t* p);
 void    suki_atomic_store_i64(int64_t* p, int64_t v);
 int64_t suki_atomic_add_i64(int64_t* p, int64_t delta);
 
-// ─── async / concurrency support ───────────────────────────────────────────
-// `await` on an `async` call produces a Future handle: the callee's value is
-// heap-boxed (suki_alloc) and the pointer is the handle. `suki_sleep` gives the
-// real-time suspension that makes `await sleep(ms)` observable, while the spin
-// locks let a plain `Int` act as a mutex for the concurrency stress test.
+// ─── portable threading ────────────────────────────────────────────────────
+// One runtime source targets Windows (Win32 threads + critical sections +
+// condition variables), Linux and macOS (pthreads). Threads are started
+// *detached*: a Future signals completion through its own condition variable, so
+// no join is ever needed and the API stays identical on every platform.
+//
+// A thread entry point returns `void*` to match `pthread_create` on POSIX; the
+// Win32 port adapts it through a small wrapper.
+typedef void* (*SukiThreadFn)(void* arg);
+// Returns 0 on success, non-zero if the thread could not be started. On failure
+// the caller runs the work inline so progress is always guaranteed.
+int suki_thread_start(SukiThreadFn fn, void* arg);
+
+// Suspend the calling thread for `ms` milliseconds of real time.
 void suki_sleep(int64_t ms);
 
 // Spin locks operating directly on an `Int` (int64), so a plain `Int` can act as
 // a mutex — matching how the language binding threads the `mu` variable.
 void suki_spin_lock(int64_t* lock);
 void suki_spin_unlock(int64_t* lock);
+
+// ─── Future (async result) ─────────────────────────────────────────────────
+// An `async` call spawns a real thread and returns an opaque Future handle. The
+// worker stores its result and signals completion; `await` blocks until then,
+// copies the value out and releases the handle. The layout is private to
+// runtime.c so it can hold platform-sized synchronisation objects.
+typedef struct SukiFuture SukiFuture;
+
+SukiFuture* suki_future_create(int64_t resultSize);
+// Copy `resultSize` bytes from `src` into the Future's result buffer. Called by
+// the worker before signalling, so the buffer layout stays private.
+void        suki_future_store(SukiFuture* f, const void* src);
+// Mark the Future complete and wake anyone awaiting it.
+void        suki_future_finish(SukiFuture* f);
+// Block until complete, then copy the result into `out`.
+void        suki_future_await(SukiFuture* f, void* out);
+void        suki_future_free(SukiFuture* f);
+
+// ─── Channel (bounded, blocking) ───────────────────────────────────────────
+// A bounded FIFO of fixed-size elements. `send` blocks while full and `receive`
+// blocks while empty; `receive` returns -1 once the channel is closed and
+// drained. Element sizing is byte-based so one implementation serves every
+// element type the code generator produces.
+typedef struct SukiChannel SukiChannel;
+
+SukiChannel* suki_channel_create(int64_t capacity, int64_t elemSize);
+void         suki_channel_send(SukiChannel* c, const void* elem);
+int32_t      suki_channel_receive(SukiChannel* c, void* out_elem);
+void         suki_channel_close(SukiChannel* c);
+void         suki_channel_free(SukiChannel* c);
+
+// ─── Task / TaskGroup ──────────────────────────────────────────────────────
+// A Task runs a closure on its own thread and publishes completion through a
+// Future, which the Task handle wraps. A TaskGroup records the Futures of its
+// children so it can wait for all of them — the basis of structured
+// concurrency: no child outlives the group that spawned it.
+
+// A closure body: the capture context is the single argument.
+typedef void (*SukiClosureFn)(void* ctx);
+// Runs `fn(ctx)` on a new thread and completes `fut` when it returns. Returns 0
+// on success; on failure the caller runs the body inline.
+int suki_closure_thread_start(SukiClosureFn fn, void* ctx, SukiFuture* fut);
+
+typedef struct SukiTaskGroup SukiTaskGroup;
+
+SukiTaskGroup* suki_taskgroup_create(void);
+void           suki_taskgroup_add(SukiTaskGroup* g, SukiFuture* f);
+// Block until every recorded child has completed.
+void           suki_taskgroup_wait_all(SukiTaskGroup* g);
+void           suki_taskgroup_free(SukiTaskGroup* g);
 
 #ifdef __cplusplus
 }

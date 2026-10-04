@@ -42,6 +42,9 @@ enum class TypeKind {
     Closure,      // closure literal type (params, ret, captures)
     Ref,          // &T (shared), inout T, weak/unowned/owned wrappers
     Future,       // Future<R> — handle returned by an `async` call, awaited later
+    // An untyped pointer to runtime-owned memory (a Channel, Task or Future
+    // handle). It carries no pointee type, so it lowers to a raw `i8*`.
+    OpaquePointer,
     Metatype,     // T.Type / T.Protocol
 };
 

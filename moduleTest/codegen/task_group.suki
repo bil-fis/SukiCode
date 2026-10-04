@@ -1,0 +1,23 @@
+// 结构化并发（规范 7.3）：TaskGroup 派发子任务并等待全部完成。
+// Spec 7.3: structured concurrency — a TaskGroup spawns children and joins them.
+//
+// 期望行为：4 个子任务各自增一次共享计数器，结果 4，退出码 0。
+
+var counter: Int = 0
+
+@main
+func main() -> Int {
+    let g = TaskGroup()
+    var i = 0
+    while i < 4 {
+        g.addTask {
+            atomicAdd(&counter, 1)
+        }
+        i = i + 1
+    }
+    g.waitForAll()
+    if counter == 4 {
+        return 0
+    }
+    return 1
+}

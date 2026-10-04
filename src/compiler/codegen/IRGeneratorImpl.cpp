@@ -1710,15 +1710,30 @@ private:
                 if (u->isTry) return v;
                 if (u->isAwait) {
                     if (!v) return nullptr;
+                    llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+                    llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+                    llvm::Function* awaitFn = declareExternalSig(
+                        "suki_future_await", { i8p, i8p }, voidTy);
+                    llvm::Function* freeFn = declareExternalSig(
+                        "suki_future_free", { i8p }, voidTy);
                     const Type* rt = u->semaType;
-                    if (!rt || rt->kind == TypeKind::Void || rt->kind == TypeKind::Unknown)
+                    if (!rt || rt->kind == TypeKind::Void ||
+                        rt->kind == TypeKind::Unknown) {
+                        // Awaiting a `Void` async call still waits for completion,
+                        // then releases the handle; no value is produced.
+                        llvm::Value* tmp = b_->CreateAlloca(
+                            llvm::Type::getInt64Ty(*ctx_), nullptr, "await.void");
+                        b_->CreateCall(awaitFn, { v, b_->CreateBitCast(tmp, i8p) });
+                        b_->CreateCall(freeFn, { v });
                         return llvm::Constant::getNullValue(
                             llvm::Type::getInt32Ty(*ctx_));
+                    }
                     llvm::Type* rty = layout_->lower(rt);
                     if (!rty) return nullptr;
-                    llvm::Value* p = b_->CreateBitCast(v,
-                        llvm::PointerType::getUnqual(rty));
-                    return b_->CreateLoad(rty, p);
+                    llvm::Value* out = b_->CreateAlloca(rty, nullptr, "awaited");
+                    b_->CreateCall(awaitFn, { v, b_->CreateBitCast(out, i8p) });
+                    b_->CreateCall(freeFn, { v });
+                    return b_->CreateLoad(rty, out);
                 }
                 switch (u->op) {
                     case PunctuatorID::Minus:
@@ -3444,11 +3459,14 @@ private:
         return b_->CreateCall(fty, fp, callArgs);
     }
 
-    // ─── async / Future lowering (synchronous model) ────────────────────────────
-    // An async call runs immediately and its result is heap-boxed; the returned
-    // pointer is the Future handle. `await` later unboxes it. This yields correct
-    // single-threaded semantics for the language binding's async tests; real
-    // scheduling is a separate concern layered on top of this handle.
+    // ─── async / Future lowering (real threads) ────────────────────────────────
+    // An async call spawns a genuine OS thread: the arguments together with the
+    // Future handle are copied into one heap context block, the worker runs the
+    // function body on that thread, stores its result into the Future and signals
+    // completion. `await` blocks on the Future's condition variable, copies the
+    // value out and releases the handle. Threading lives entirely in the C runtime
+    // (pthreads / Win32), so this lowering is platform-neutral. If a thread cannot
+    // be started the work runs inline, so a program always makes progress.
 
     // Synchronous runtime builtins with fixed C prototypes, intercepted by name so
     // the exact signature (pointer first argument, etc.) is emitted.
@@ -3475,71 +3493,508 @@ private:
         return b_->CreateCall(fn, args);
     }
 
-    // Emit `<sym>_spawn` for an async function: run the synchronous body, box the
-    // result, return the Future handle (i8*). A foreign async builtin (e.g. sleep)
-    // calls its C implementation directly instead of a SukiCode body.
+    // Runtime entry points used by async lowering, declared with exact prototypes.
+    llvm::Function* asyncAllocFn() {
+        return declareExternalSig("suki_alloc", { llvm::Type::getInt64Ty(*ctx_) },
+                                  llvm::PointerType::get(*ctx_, 0));
+    }
+    llvm::Function* asyncFreeFn() {
+        return declareExternalSig("suki_free", { llvm::PointerType::get(*ctx_, 0) },
+                                  llvm::Type::getVoidTy(*ctx_));
+    }
+    llvm::Function* asyncFutureCreateFn() {
+        return declareExternalSig("suki_future_create",
+                                  { llvm::Type::getInt64Ty(*ctx_) },
+                                  llvm::PointerType::get(*ctx_, 0));
+    }
+
+    // Emit `<sym>_spawn` for an async function. The worker `sym_tramp` runs the
+    // synchronous body on a fresh thread and publishes its result through the
+    // Future; the spawn builds the context block and starts the worker.
     void genAsyncSpawn(FunctionDecl* fn, const std::string& sym) {
-        std::string spawnSym = sym + "_spawn";
+        const std::string spawnSym = sym + "_spawn";
         if (fns_.count(spawnSym)) return;
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
         llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+
         std::vector<llvm::Type*> ptys;
         for (auto& p : fn->params)
-            ptys.push_back(p.semaType ? layout_->lower(p.semaType)
-                                      : llvm::Type::getInt64Ty(*ctx_));
-        llvm::FunctionType* ft = llvm::FunctionType::get(i8p, ptys, false);
-        llvm::Function* spawnFn = llvm::Function::Create(
-            ft, llvm::GlobalValue::ExternalLinkage, spawnSym, module_.get());
-        llvm::BasicBlock* bb = llvm::BasicBlock::Create(*ctx_, "entry", spawnFn);
-        b_->SetInsertPoint(bb);
-        std::vector<llvm::Value*> args;
-        for (unsigned i = 0; i < spawnFn->arg_size(); ++i)
-            args.push_back(spawnFn->getArg(i));
+            ptys.push_back(p.semaType ? layout_->lower(p.semaType) : i64);
+
+        const Type* rt = fn->returnType ? fn->returnType->semaType : nullptr;
+        const bool isVoid = !rt || rt->kind == TypeKind::Void ||
+                            rt->kind == TypeKind::Unknown;
+        llvm::Type* rty = isVoid ? nullptr : layout_->lower(rt);
+        const int64_t rsize = isVoid ? 0 : (int64_t)sizeOf(rty);
+
+        // One heap block carries the arguments followed by the Future handle, laid
+        // out as a struct so the worker reads them back by the same indices.
+        std::vector<llvm::Type*> ctys = ptys;
+        ctys.push_back(i8p);
+        llvm::StructType* ctxTy = llvm::StructType::get(*ctx_, ctys, false);
+        const unsigned futIdx = (unsigned)ptys.size();
+
+        // The synchronous body the worker calls.
         llvm::Function* bodyFn = fns_[fn->name];
         if (!bodyFn) bodyFn = declareAs(fn, fn->name);
-        const Type* rt = fn->returnType ? fn->returnType->semaType : nullptr;
-        bool isVoid = !rt || rt->kind == TypeKind::Void || rt->kind == TypeKind::Unknown;
-        llvm::Value* result = isVoid ? nullptr : b_->CreateCall(bodyFn, args);
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        int64_t sz = isVoid ? 1 : (int64_t)sizeOf(layout_->lower(rt));
-        llvm::Value* box = b_->CreateCall(
-            declareExternalSig("suki_alloc", {i64}, i8p),
-            { llvm::ConstantInt::get(i64, sz) });
-        if (!isVoid) {
-            llvm::Type* rty = layout_->lower(rt);
-            llvm::Value* rp = b_->CreateAlloca(rty);
-            b_->CreateStore(result, rp);
-            llvm::Value* src = b_->CreateBitCast(rp, i8p);
-            llvm::Function* memcpyF = llvm::Intrinsic::getDeclaration(
-                module_.get(), llvm::Intrinsic::memcpy, { i8p, i8p, i64 });
-            b_->CreateCall(memcpyF, { box, src,
-                llvm::ConstantInt::get(i64, sz), llvm::ConstantInt::getFalse(*ctx_) });
+
+        llvm::Function* storeFn = declareExternalSig("suki_future_store",
+                                                    { i8p, i8p }, voidTy);
+        llvm::Function* finishFn = declareExternalSig("suki_future_finish",
+                                                     { i8p }, voidTy);
+
+        // ── worker: i8* <sym>_tramp(i8* ctx) ──
+        llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
+        llvm::Function* tramp = llvm::Function::Create(
+            trampTy, llvm::GlobalValue::ExternalLinkage, sym + "_tramp",
+            module_.get());
+        {
+            llvm::BasicBlock* tb = llvm::BasicBlock::Create(*ctx_, "entry", tramp);
+            b_->SetInsertPoint(tb);
+            llvm::Value* rawCtx = tramp->getArg(0);
+            llvm::Value* cp = b_->CreateBitCast(rawCtx,
+                llvm::PointerType::getUnqual(ctxTy), "ctx");
+            std::vector<llvm::Value*> callArgs;
+            for (size_t i = 0; i < ptys.size(); ++i) {
+                llvm::Value* fp = b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
+                                                      "arg.addr");
+                callArgs.push_back(b_->CreateLoad(ptys[i], fp));
+            }
+            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
+            llvm::Value* fut = b_->CreateLoad(i8p, futAddr, "fut");
+            if (!isVoid) {
+                llvm::Value* v = b_->CreateCall(bodyFn, callArgs);
+                llvm::Value* slot = b_->CreateAlloca(rty, nullptr, "result");
+                b_->CreateStore(v, slot);
+                b_->CreateCall(storeFn, { fut, b_->CreateBitCast(slot, i8p) });
+            } else {
+                b_->CreateCall(bodyFn, callArgs);
+            }
+            b_->CreateCall(finishFn, { fut });
+            b_->CreateCall(asyncFreeFn(), { rawCtx });
+            b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
         }
-        b_->CreateRet(box);
+
+        // ── i8* <sym>_spawn(params...) ──
+        llvm::FunctionType* sft = llvm::FunctionType::get(i8p, ptys, false);
+        llvm::Function* spawnFn = llvm::Function::Create(
+            sft, llvm::GlobalValue::ExternalLinkage, spawnSym, module_.get());
+        {
+            llvm::BasicBlock* sb = llvm::BasicBlock::Create(*ctx_, "entry", spawnFn);
+            b_->SetInsertPoint(sb);
+            llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
+                                              { llvm::ConstantInt::get(i64, rsize) });
+            llvm::Value* rawCtx = b_->CreateCall(asyncAllocFn(),
+                { llvm::ConstantInt::get(i64, (int64_t)sizeOf(ctxTy)) });
+            llvm::Value* cp = b_->CreateBitCast(rawCtx,
+                llvm::PointerType::getUnqual(ctxTy), "ctx");
+            for (size_t i = 0; i < ptys.size(); ++i) {
+                llvm::Value* fp = b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
+                                                      "arg.addr");
+                b_->CreateStore(spawnFn->getArg((unsigned)i), fp);
+            }
+            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
+            b_->CreateStore(fut, futAddr);
+
+            llvm::Function* startFn = declareExternalSig("suki_thread_start",
+                { llvm::PointerType::getUnqual(trampTy), i8p },
+                llvm::Type::getInt32Ty(*ctx_));
+            llvm::Value* started = b_->CreateCall(startFn, { tramp, rawCtx },
+                                                  "started");
+            llvm::Value* failed = b_->CreateICmpNE(started,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
+            llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*ctx_, "inline",
+                                                                  spawnFn);
+            llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*ctx_, "spawned",
+                                                                spawnFn);
+            b_->CreateCondBr(failed, inlineBB, doneBB);
+            b_->SetInsertPoint(inlineBB);
+            b_->CreateCall(tramp, { rawCtx });
+            b_->CreateBr(doneBB);
+            b_->SetInsertPoint(doneBB);
+            b_->CreateRet(fut);
+        }
         fns_[spawnSym] = spawnFn;
     }
 
-    // Always-provided spawn for the `sleep` async builtin (calls suki_sleep).
+    // ─── Channel<T> ─────────────────────────────────────────────────────────
+    // `Channel<Int>(capacity: n)` allocates the runtime FIFO with the element size
+    // of `Int`, so one runtime implementation serves every element type.
+    llvm::Value* genChannelInit(const Type* instTy, CallExpr* e) {
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        // A Named type keeps its generic arguments in `elements`.
+        const Type* elemTy = (!instTy->elements.empty())
+                                 ? instTy->elements[0] : nullptr;
+        llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
+        const int64_t esz = (int64_t)sizeOf(elemLLVM);
+
+        llvm::Value* cap = llvm::ConstantInt::get(i64, 1);
+        if (!e->arguments.empty()) {
+            llvm::Value* cv = genExpr(e->arguments[0].get());
+            if (cv) cap = coerce(cv, i64);
+        }
+        llvm::Function* createFn = declareExternalSig("suki_channel_create",
+                                                      { i64, i64 }, i8p);
+        llvm::Value* handle = b_->CreateCall(createFn,
+            { cap, llvm::ConstantInt::get(i64, esz) });
+
+        llvm::Type* sty = layout_->lower(instTy);
+        if (!sty || !sty->isStructTy()) return nullptr;
+        llvm::Value* slot = b_->CreateAlloca(sty, nullptr, "channel.tmp");
+        b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
+        llvm::Value* hp = b_->CreateStructGEP(sty, slot, 0, "handle.addr");
+        b_->CreateStore(handle, hp);
+        return b_->CreateLoad(sty, slot);
+    }
+
+    // Channel methods are runtime-backed, so their bodies call the runtime
+    // directly instead of lowering a SukiCode body (which does not exist).
+    void genChannelMethodBody(const std::string& method, const Type* instTy,
+                              llvm::Function* f) {
+        if (!f || !f->empty()) return;
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        // A Named type keeps its generic arguments in `elements`.
+        const Type* elemTy = (!instTy->elements.empty())
+                                 ? instTy->elements[0] : nullptr;
+        llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
+
+        llvm::Type* selfTy = f->getFunctionType()->getParamType(0);
+        b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+        llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
+        b_->CreateStore(f->getArg(0), selfSlot);
+        llvm::Value* hp = b_->CreateStructGEP(selfTy, selfSlot, 0, "handle.addr");
+        llvm::Value* handle = b_->CreateLoad(i8p, hp, "handle");
+
+        if (method == "send") {
+            llvm::Value* vSlot = b_->CreateAlloca(elemLLVM, nullptr, "value");
+            b_->CreateStore(coerce(f->getArg(1), elemLLVM), vSlot);
+            llvm::Function* sf = declareExternalSig("suki_channel_send",
+                                                    { i8p, i8p }, voidTy);
+            b_->CreateCall(sf, { handle, b_->CreateBitCast(vSlot, i8p) });
+            b_->CreateRetVoid();
+        } else if (method == "receive") {
+            llvm::Value* out = b_->CreateAlloca(elemLLVM, nullptr, "out");
+            llvm::Function* rf = declareExternalSig("suki_channel_receive",
+                                                    { i8p, i8p },
+                                                    llvm::Type::getInt32Ty(*ctx_));
+            b_->CreateCall(rf, { handle, b_->CreateBitCast(out, i8p) });
+            b_->CreateRet(b_->CreateLoad(elemLLVM, out));
+        } else if (method == "close") {
+            llvm::Function* cf = declareExternalSig("suki_channel_close",
+                                                    { i8p }, voidTy);
+            b_->CreateCall(cf, { handle });
+            b_->CreateRetVoid();
+        } else {
+            b_->CreateRetVoid();
+        }
+    }
+
+    // ─── Task / TaskGroup ───────────────────────────────────────────────────
+    // Both are `{ i8* handle }` wrappers around a runtime object. They are
+    // registered by Sema rather than declared in source, so the struct type is
+    // built directly here — keeping the constructors and the runtime-backed method
+    // bodies in agreement.
+    llvm::StructType* handleStructTy(const std::string& name) {
+        if (llvm::StructType* t = llvm::StructType::getTypeByName(
+                module_->getContext(), "suki." + name))
+            return t;
+        return llvm::StructType::create(*ctx_,
+            { llvm::PointerType::get(*ctx_, 0) }, "suki." + name);
+    }
+
+    llvm::Value* makeHandleValue(llvm::StructType* sty, llvm::Value* handle) {
+        llvm::Value* slot = b_->CreateAlloca(sty, nullptr, "handle.tmp");
+        b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
+        llvm::Value* hp = b_->CreateStructGEP(sty, slot, 0, "handle.addr");
+        b_->CreateStore(handle, hp);
+        return b_->CreateLoad(sty, slot);
+    }
+
+    llvm::Value* loadHandle(llvm::Value* selfVal, llvm::Type* selfTy) {
+        llvm::Value* slot = b_->CreateAlloca(selfTy, nullptr, "self.tmp");
+        b_->CreateStore(selfVal, slot);
+        llvm::Value* hp = b_->CreateStructGEP(selfTy, slot, 0, "handle.addr");
+        return b_->CreateLoad(llvm::PointerType::get(*ctx_, 0), hp, "handle");
+    }
+
+    // Start a closure body on its own thread, returning the Future that completes
+    // when it finishes. Used by `Task { ... }` and `group.addTask { ... }`.
+    llvm::Value* startClosureTask(llvm::Value* cv, llvm::Function* cur) {
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        llvm::Value* ctxv = b_->CreateExtractValue(cv, {0}, "task.ctx");
+        llvm::Value* fnv = b_->CreateExtractValue(cv, {1}, "task.fn");
+        llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
+            { llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0) });
+        llvm::FunctionType* cfty = llvm::FunctionType::get(voidTy, { i8p }, false);
+        llvm::Value* fp = b_->CreatePointerCast(fnv, cfty->getPointerTo());
+        llvm::Function* startFn = declareExternalSig("suki_closure_thread_start",
+            { cfty->getPointerTo(), i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
+        llvm::Value* st = b_->CreateCall(startFn, { fp, ctxv, fut });
+        llvm::Value* failed = b_->CreateICmpNE(st,
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
+        llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*ctx_, "task.inline",
+                                                              cur);
+        llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*ctx_, "task.done", cur);
+        b_->CreateCondBr(failed, inlineBB, doneBB);
+        b_->SetInsertPoint(inlineBB);
+        b_->CreateCall(cfty, fp, { ctxv });
+        b_->CreateCall(declareExternalSig("suki_future_finish", { i8p }, voidTy),
+                       { fut });
+        b_->CreateBr(doneBB);
+        b_->SetInsertPoint(doneBB);
+        return fut;
+    }
+
+    // Task { ... } — run the body on a new thread and wrap its Future.
+    llvm::Value* genTaskInit(CallExpr* e) {
+        Node* clNode = e->arguments.empty() ? nullptr : e->arguments[0].get();
+        if (!clNode || clNode->kind != NodeKind::ClosureExpr) return nullptr;
+        llvm::Function* cur = b_->GetInsertBlock()->getParent();
+        llvm::Value* cv = emitClosure(static_cast<ClosureExpr*>(clNode));
+        if (!cv) return nullptr;
+        llvm::Value* fut = startClosureTask(cv, cur);
+        return makeHandleValue(handleStructTy("Task"), fut);
+    }
+
+    // TaskGroup() — allocate the runtime group.
+    llvm::Value* genTaskGroupInit() {
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Function* cf = declareExternalSig("suki_taskgroup_create", {}, i8p);
+        return makeHandleValue(handleStructTy("TaskGroup"), b_->CreateCall(cf, {}));
+    }
+
+    // Emit the runtime-backed bodies of Task.wait and TaskGroup.addTask /
+    // waitForAll, and register them so member dispatch resolves.
+    void ensureConcurrencyBodies() {
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::StructType* taskSty = handleStructTy("Task");
+        llvm::StructType* grpSty = handleStructTy("TaskGroup");
+
+        // Task.wait() — block until the task's Future completes.
+        if (!methodFns_.count("Task.wait")) {
+            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { taskSty },
+                                                               false);
+            llvm::Function* f = llvm::Function::Create(fty,
+                llvm::GlobalValue::ExternalLinkage, "Task.wait", module_.get());
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+            llvm::Value* fut = loadHandle(f->getArg(0), taskSty);
+            llvm::Value* tmp = b_->CreateAlloca(i64, nullptr, "wait.tmp");
+            b_->CreateCall(declareExternalSig("suki_future_await", { i8p, i8p },
+                                              voidTy),
+                           { fut, b_->CreateBitCast(tmp, i8p) });
+            b_->CreateRetVoid();
+            methodFns_["Task.wait"] = f;
+        }
+
+        // TaskGroup.waitForAll() — block until every child completes.
+        if (!methodFns_.count("TaskGroup.waitForAll")) {
+            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { grpSty },
+                                                               false);
+            llvm::Function* f = llvm::Function::Create(fty,
+                llvm::GlobalValue::ExternalLinkage, "TaskGroup.waitForAll",
+                module_.get());
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+            llvm::Value* g = loadHandle(f->getArg(0), grpSty);
+            b_->CreateCall(declareExternalSig("suki_taskgroup_wait_all", { i8p },
+                                              voidTy), { g });
+            b_->CreateRetVoid();
+            methodFns_["TaskGroup.waitForAll"] = f;
+        }
+
+        // TaskGroup.addTask { ... } — spawn a child and record its Future.
+        if (!methodFns_.count("TaskGroup.addTask")) {
+            llvm::StructType* clTy = llvm::cast<llvm::StructType>(
+                layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
+            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy,
+                                                              { grpSty, clTy },
+                                                              false);
+            llvm::Function* f = llvm::Function::Create(fty,
+                llvm::GlobalValue::ExternalLinkage, "TaskGroup.addTask",
+                module_.get());
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+            llvm::Value* g = loadHandle(f->getArg(0), grpSty);
+            llvm::Value* fut = startClosureTask(f->getArg(1), f);
+            b_->CreateCall(declareExternalSig("suki_taskgroup_add", { i8p, i8p },
+                                              voidTy), { g, fut });
+            b_->CreateRetVoid();
+            methodFns_["TaskGroup.addTask"] = f;
+        }
+    }
+
+    // Always-provided spawn for the `sleep` async builtin. Its body is the runtime
+    // `suki_sleep`, so the worker sleeps on its own thread and then completes.
     void genSleepSpawn() {
         if (fns_.count("sleep_spawn")) return;
         llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
         llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::FunctionType* ft = llvm::FunctionType::get(i8p, {i64}, false);
+
+        llvm::Function* sleepFn = declareExternalSig("suki_sleep", { i64 }, voidTy);
+        llvm::StructType* ctxTy = llvm::StructType::get(*ctx_, { i64, i8p }, false);
+        llvm::Function* finishFn = declareExternalSig("suki_future_finish",
+                                                     { i8p }, voidTy);
+
+        llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
+        llvm::Function* tramp = llvm::Function::Create(
+            trampTy, llvm::GlobalValue::ExternalLinkage, "sleep_tramp",
+            module_.get());
+        {
+            llvm::BasicBlock* tb = llvm::BasicBlock::Create(*ctx_, "entry", tramp);
+            b_->SetInsertPoint(tb);
+            llvm::Value* rawCtx = tramp->getArg(0);
+            llvm::Value* cp = b_->CreateBitCast(rawCtx,
+                llvm::PointerType::getUnqual(ctxTy), "ctx");
+            llvm::Value* msAddr = b_->CreateStructGEP(ctxTy, cp, 0, "ms.addr");
+            llvm::Value* ms = b_->CreateLoad(i64, msAddr, "ms");
+            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+            llvm::Value* fut = b_->CreateLoad(i8p, futAddr, "fut");
+            b_->CreateCall(sleepFn, { ms });
+            b_->CreateCall(finishFn, { fut });
+            b_->CreateCall(asyncFreeFn(), { rawCtx });
+            b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
+        }
+
+        llvm::FunctionType* sft = llvm::FunctionType::get(i8p, { i64 }, false);
         llvm::Function* f = llvm::Function::Create(
-            ft, llvm::GlobalValue::ExternalLinkage, "sleep_spawn", module_.get());
-        llvm::BasicBlock* bb = llvm::BasicBlock::Create(*ctx_, "entry", f);
-        b_->SetInsertPoint(bb);
-        llvm::Function* sleepFn = declareExternalSig(
-            "suki_sleep", {i64}, llvm::Type::getVoidTy(*ctx_));
-        b_->CreateCall(sleepFn, { f->getArg(0) });
-        llvm::Value* box = b_->CreateCall(
-            declareExternalSig("suki_alloc", {i64}, i8p),
-            { llvm::ConstantInt::get(i64, 1) });
-        b_->CreateRet(box);
+            sft, llvm::GlobalValue::ExternalLinkage, "sleep_spawn", module_.get());
+        {
+            llvm::BasicBlock* sb = llvm::BasicBlock::Create(*ctx_, "entry", f);
+            b_->SetInsertPoint(sb);
+            llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
+                                              { llvm::ConstantInt::get(i64, 0) });
+            llvm::Value* rawCtx = b_->CreateCall(asyncAllocFn(),
+                { llvm::ConstantInt::get(i64, (int64_t)sizeOf(ctxTy)) });
+            llvm::Value* cp = b_->CreateBitCast(rawCtx,
+                llvm::PointerType::getUnqual(ctxTy), "ctx");
+            llvm::Value* msAddr = b_->CreateStructGEP(ctxTy, cp, 0, "ms.addr");
+            b_->CreateStore(f->getArg(0), msAddr);
+            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+            b_->CreateStore(fut, futAddr);
+
+            llvm::Function* startFn = declareExternalSig("suki_thread_start",
+                { llvm::PointerType::getUnqual(trampTy), i8p },
+                llvm::Type::getInt32Ty(*ctx_));
+            llvm::Value* started = b_->CreateCall(startFn, { tramp, rawCtx },
+                                                  "started");
+            llvm::Value* failed = b_->CreateICmpNE(started,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
+            llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*ctx_, "inline", f);
+            llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*ctx_, "spawned", f);
+            b_->CreateCondBr(failed, inlineBB, doneBB);
+            b_->SetInsertPoint(inlineBB);
+            b_->CreateCall(tramp, { rawCtx });
+            b_->CreateBr(doneBB);
+            b_->SetInsertPoint(doneBB);
+            b_->CreateRet(fut);
+        }
         fns_["sleep_spawn"] = f;
+    }
+
+    // `withTaskGroup { group in ... }` — the body runs the closure with a fresh
+    // group on its own thread, then waits for every child before completing,
+    // which is what makes the concurrency structured.
+    void genWithTaskGroupSpawn() {
+        if (fns_.count("withTaskGroup_spawn")) return;
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::StructType* grpSty = handleStructTy("TaskGroup");
+        llvm::StructType* clTy = llvm::cast<llvm::StructType>(
+            layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
+
+        // void @withTaskGroup({ i8* ctx, i8* fn } body)
+        llvm::FunctionType* bodyTy = llvm::FunctionType::get(voidTy, { clTy },
+                                                             false);
+        llvm::Function* body = llvm::Function::Create(bodyTy,
+            llvm::GlobalValue::ExternalLinkage, "withTaskGroup", module_.get());
+        {
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", body));
+            llvm::Value* cv = body->getArg(0);
+            llvm::Value* g = b_->CreateCall(
+                declareExternalSig("suki_taskgroup_create", {}, i8p), {});
+            llvm::Value* gv = makeHandleValue(grpSty, g);
+            llvm::Value* ctxv = b_->CreateExtractValue(cv, {0}, "body.ctx");
+            llvm::Value* fnv = b_->CreateExtractValue(cv, {1}, "body.fn");
+            llvm::FunctionType* cfty = llvm::FunctionType::get(voidTy,
+                                                               { i8p, grpSty },
+                                                               false);
+            llvm::Value* fp = b_->CreatePointerCast(fnv, cfty->getPointerTo());
+            b_->CreateCall(cfty, fp, { ctxv, gv });
+            b_->CreateCall(declareExternalSig("suki_taskgroup_wait_all", { i8p },
+                                              voidTy), { g });
+            b_->CreateCall(declareExternalSig("suki_taskgroup_free", { i8p },
+                                              voidTy), { g });
+            b_->CreateRetVoid();
+        }
+        fns_["withTaskGroup"] = body;
+
+        // Worker context: { body closure, Future }.
+        llvm::StructType* ctxTy = llvm::StructType::get(*ctx_, { clTy, i8p },
+                                                        false);
+        llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
+        llvm::Function* tramp = llvm::Function::Create(trampTy,
+            llvm::GlobalValue::ExternalLinkage, "withTaskGroup_tramp",
+            module_.get());
+        {
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", tramp));
+            llvm::Value* raw = tramp->getArg(0);
+            llvm::Value* cp = b_->CreateBitCast(raw,
+                llvm::PointerType::getUnqual(ctxTy), "ctx");
+            llvm::Value* cvAddr = b_->CreateStructGEP(ctxTy, cp, 0, "cl.addr");
+            llvm::Value* cv = b_->CreateLoad(clTy, cvAddr);
+            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+            llvm::Value* fut = b_->CreateLoad(i8p, futAddr, "fut");
+            b_->CreateCall(body, { cv });
+            b_->CreateCall(declareExternalSig("suki_future_finish", { i8p },
+                                              voidTy), { fut });
+            b_->CreateCall(asyncFreeFn(), { raw });
+            b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
+        }
+
+        llvm::FunctionType* sft = llvm::FunctionType::get(i8p, { clTy }, false);
+        llvm::Function* sp = llvm::Function::Create(sft,
+            llvm::GlobalValue::ExternalLinkage, "withTaskGroup_spawn",
+            module_.get());
+        {
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", sp));
+            llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
+                { llvm::ConstantInt::get(i64, 0) });
+            llvm::Value* raw = b_->CreateCall(asyncAllocFn(),
+                { llvm::ConstantInt::get(i64, (int64_t)sizeOf(ctxTy)) });
+            llvm::Value* cp = b_->CreateBitCast(raw,
+                llvm::PointerType::getUnqual(ctxTy), "ctx");
+            llvm::Value* cvAddr = b_->CreateStructGEP(ctxTy, cp, 0, "cl.addr");
+            b_->CreateStore(sp->getArg(0), cvAddr);
+            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+            b_->CreateStore(fut, futAddr);
+            llvm::Function* startFn = declareExternalSig("suki_thread_start",
+                { llvm::PointerType::getUnqual(trampTy), i8p },
+                llvm::Type::getInt32Ty(*ctx_));
+            llvm::Value* st = b_->CreateCall(startFn, { tramp, raw }, "started");
+            llvm::Value* failed = b_->CreateICmpNE(st,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
+            llvm::BasicBlock* ib = llvm::BasicBlock::Create(*ctx_, "inline", sp);
+            llvm::BasicBlock* db = llvm::BasicBlock::Create(*ctx_, "spawned", sp);
+            b_->CreateCondBr(failed, ib, db);
+            b_->SetInsertPoint(ib);
+            b_->CreateCall(tramp, { raw });
+            b_->CreateBr(db);
+            b_->SetInsertPoint(db);
+            b_->CreateRet(fut);
+        }
+        fns_["withTaskGroup_spawn"] = sp;
     }
 
     void ensureAsyncSpawns(const NodeList& decls) {
         genSleepSpawn();
+        genWithTaskGroupSpawn();
         for (auto& d : decls) {
             if (!d || d->kind != NodeKind::FunctionDecl) continue;
             auto* fn = static_cast<FunctionDecl*>(d.get());
@@ -3684,6 +4139,15 @@ private:
             else if (e->callee->kind == NodeKind::NamedType)
                 cname = static_cast<NamedType*>(e->callee.get())->name;
             if (!cname.empty()) {
+                // A Channel is runtime-backed: allocating it creates the FIFO with
+                // the element size of its type argument.
+                if (cname.rfind("Channel<", 0) == 0) {
+                    auto chit = structTypes_.find(cname);
+                    if (chit != structTypes_.end())
+                        return genChannelInit(chit->second, e);
+                    if (ct) return genChannelInit(ct, e);
+                    return nullptr;
+                }
                 auto gsit = structTypes_.find(cname);
                 if (gsit != structTypes_.end()) return genStructInit(gsit->second, e);
                 auto gcit = classTypes_.find(cname);
@@ -3698,6 +4162,10 @@ private:
         // default variadic foreign declaration.
         if (n == "atomicAdd" || n == "mutexLock" || n == "mutexUnlock")
             return genSyncBuiltin(n, e);
+        // `Task { ... }` runs its body on a new thread; `TaskGroup()` allocates the
+        // group that will own its children.
+        if (n == "Task" && !e->arguments.empty()) return genTaskInit(e);
+        if (n == "TaskGroup" && e->arguments.empty()) return genTaskGroupInit();
         // A call naming a struct type is a constructor invocation.
         auto sit = structTypes_.find(n);
         if (sit != structTypes_.end()) return genStructInit(sit->second, e);
@@ -3815,8 +4283,14 @@ private:
         // An async call returns a Future handle (i8*), not the value directly. Route
         // it through the generated `<n>_spawn` (or `sleep_spawn`) wrapper that runs
         // the body and boxes the result; `await` unboxes it.
-        if (calleeIsAsync || n == "sleep") {
-            std::string spawnSym = (n == "sleep") ? "sleep_spawn" : (n + "_spawn");
+        // Async builtins (`sleep`, `withTaskGroup`) are registered by Sema rather
+        // than declared in source, so they are not in fnDecls_; name them here so
+        // the call still resolves to their spawn.
+        if (calleeIsAsync || n == "sleep" || n == "withTaskGroup") {
+            std::string spawnSym;
+            if (n == "sleep") spawnSym = "sleep_spawn";
+            else if (n == "withTaskGroup") spawnSym = "withTaskGroup_spawn";
+            else spawnSym = n + "_spawn";
             auto sit = fns_.find(spawnSym);
             if (sit == fns_.end() || !sit->second) return nullptr;
             std::vector<llvm::Value*> callArgs;
@@ -3988,7 +4462,14 @@ public:
                     const std::string mkey = gi.key + "." + mf->name;
                     declareMethod(mkey, mf, instTy);
                     auto mit = methodFns_.find(mkey);
-                    if (mit != methodFns_.end()) genMethodBody(mf, instTy, mit->second);
+                    if (mit != methodFns_.end()) {
+                        // Channel's operations are implemented by the runtime, so
+                        // they get runtime-backed bodies rather than a lowered one.
+                        if (gi.typeName == "Channel")
+                            genChannelMethodBody(mf->name, instTy, mit->second);
+                        else
+                            genMethodBody(mf, instTy, mit->second);
+                    }
                 }
                 sema_->unbindTypeParams();
             }
@@ -4057,6 +4538,9 @@ public:
         // a missing entry silently emits no call at all, leaving the Future slot
         // uninitialised.
         ensureAsyncSpawns(decls);
+        // Task.wait / TaskGroup.addTask / waitForAll are runtime-backed, so their
+        // bodies are emitted here rather than lowered from SukiCode.
+        ensureConcurrencyBodies();
         for (auto& pb : pendingBodies_) {
             // 外部函数（foreign）只声明符号、不发射函数体，否则会与
             // runtime.c 里的真实定义产生 multiple definition 冲突。

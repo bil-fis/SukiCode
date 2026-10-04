@@ -201,6 +201,9 @@ llvm::Type* TypeLayout::lower(const Type* t) {
         case TypeKind::Future:
             // A Future<R> handle is an opaque pointer to the boxed result.
             return i8Ptr();
+        case TypeKind::OpaquePointer:
+            // An untyped runtime handle (Channel / Task / Future) is a raw pointer.
+            return i8Ptr();
     }
     return i8Ptr();
 }

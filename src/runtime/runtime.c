@@ -14,6 +14,21 @@
 #include <string.h>
 #include <time.h>
 
+// ─── platform threading backend ────────────────────────────────────────────────
+// Windows: Win32 threads, critical sections, condition variables.
+// Linux / macOS / other POSIX: pthreads.
+// Everything below is written against these two typedefs, so the rest of the
+// runtime stays platform-neutral.
+#if defined(_WIN32)
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+  #include <process.h>
+#else
+  #include <pthread.h>
+#endif
+
 // ─── printing ─────────────────────────────────────────────────────────────
 void print(const char* s) {
     if (s) fputs(s, stdout);
@@ -638,13 +653,84 @@ int64_t suki_atomic_add_i64(int64_t* p, int64_t delta) {
     return p ? __atomic_fetch_add(p, delta, __ATOMIC_ACQ_REL) + delta : 0;
 }
 
-// ─── async / concurrency support ────────────────────────────────────────────────
+// ─── portable threading ─────────────────────────────────────────────────────────
+#if defined(_WIN32)
+typedef CRITICAL_SECTION suki_bmtx_t;
+typedef CONDITION_VARIABLE suki_cvar_t;
+#else
+typedef pthread_mutex_t suki_bmtx_t;
+typedef pthread_cond_t  suki_cvar_t;
+#endif
+
+static void suki_bmtx_init(suki_bmtx_t* m) {
+#if defined(_WIN32)
+    InitializeCriticalSection(m);
+#else
+    pthread_mutex_init(m, NULL);
+#endif
+}
+static void suki_bmtx_lock(suki_bmtx_t* m) {
+#if defined(_WIN32)
+    EnterCriticalSection(m);
+#else
+    pthread_mutex_lock(m);
+#endif
+}
+static void suki_bmtx_unlock(suki_bmtx_t* m) {
+#if defined(_WIN32)
+    LeaveCriticalSection(m);
+#else
+    pthread_mutex_unlock(m);
+#endif
+}
+static void suki_bmtx_destroy(suki_bmtx_t* m) {
+#if defined(_WIN32)
+    DeleteCriticalSection(m);
+#else
+    pthread_mutex_destroy(m);
+#endif
+}
+static void suki_cvar_init(suki_cvar_t* c) {
+#if defined(_WIN32)
+    InitializeConditionVariable(c);
+#else
+    pthread_cond_init(c, NULL);
+#endif
+}
+// Must be called with `m` held. Releases `m` while waiting and re-acquires it
+// before returning, exactly like pthread_cond_wait.
+static void suki_cvar_wait(suki_cvar_t* c, suki_bmtx_t* m) {
+#if defined(_WIN32)
+    SleepConditionVariableCS(c, m, INFINITE);
+#else
+    pthread_cond_wait(c, m);
+#endif
+}
+static void suki_cvar_broadcast(suki_cvar_t* c) {
+#if defined(_WIN32)
+    WakeAllConditionVariable(c);
+#else
+    pthread_cond_broadcast(c);
+#endif
+}
+static void suki_cvar_destroy(suki_cvar_t* c) {
+#if defined(_WIN32)
+    (void)c; // Win32 condition variables need no teardown
+#else
+    pthread_cond_destroy(c);
+#endif
+}
+
 void suki_sleep(int64_t ms) {
     if (ms <= 0) return;
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
     struct timespec req;
     req.tv_sec = (time_t)(ms / 1000);
     req.tv_nsec = (long)((ms % 1000) * 1000000L);
     nanosleep(&req, NULL);
+#endif
 }
 
 // A CAS loop on the first word of an `Int` makes a usable spin lock for the
@@ -659,4 +745,270 @@ void suki_spin_lock(int64_t* lock) {
 
 void suki_spin_unlock(int64_t* lock) {
     __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+}
+
+// Threads are created detached. A Future (not a join) is how completion is
+// observed, which keeps the code identical on every platform and avoids leaking
+// joinable threads when a result is never awaited.
+#if defined(_WIN32)
+typedef struct { SukiThreadFn fn; void* arg; } SukiThreadStart;
+
+static unsigned __stdcall suki_win_thread_proc(void* p) {
+    SukiThreadStart* ts = (SukiThreadStart*)p;
+    ts->fn(ts->arg);
+    suki_free(ts);
+    return 0;
+}
+#endif
+
+int suki_thread_start(SukiThreadFn fn, void* arg) {
+#if defined(_WIN32)
+    SukiThreadStart* ts = (SukiThreadStart*)suki_alloc(sizeof(SukiThreadStart));
+    if (!ts) return -1;
+    ts->fn = fn;
+    ts->arg = arg;
+    uintptr_t h = _beginthreadex(NULL, 0, suki_win_thread_proc, ts, 0, NULL);
+    if (!h) { suki_free(ts); return -1; }
+    // Closing the handle detaches the thread; it cleans up when it returns.
+    CloseHandle((HANDLE)h);
+    return 0;
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, fn, arg) != 0) return -1;
+    pthread_detach(t);
+    return 0;
+#endif
+}
+
+// ─── Future ─────────────────────────────────────────────────────────────────────
+struct SukiFuture {
+    int64_t      done;
+    void*        result;      // resultSize bytes, owned by the Future
+    int64_t      resultSize;
+    suki_bmtx_t  mtx;
+    suki_cvar_t  cvar;
+};
+
+SukiFuture* suki_future_create(int64_t resultSize) {
+    SukiFuture* f = (SukiFuture*)suki_alloc(sizeof(SukiFuture));
+    f->done = 0;
+    f->resultSize = resultSize > 0 ? resultSize : 0;
+    f->result = f->resultSize > 0 ? suki_alloc((size_t)f->resultSize) : NULL;
+    suki_bmtx_init(&f->mtx);
+    suki_cvar_init(&f->cvar);
+    return f;
+}
+
+void suki_future_store(SukiFuture* f, const void* src) {
+    if (!f || !f->result || !src || f->resultSize <= 0) return;
+    memcpy(f->result, src, (size_t)f->resultSize);
+}
+
+void suki_future_finish(SukiFuture* f) {
+    if (!f) return;
+    suki_bmtx_lock(&f->mtx);
+    f->done = 1;
+    suki_cvar_broadcast(&f->cvar);
+    suki_bmtx_unlock(&f->mtx);
+}
+
+void suki_future_await(SukiFuture* f, void* out) {
+    if (!f || !out) return;
+    suki_bmtx_lock(&f->mtx);
+    while (!f->done) suki_cvar_wait(&f->cvar, &f->mtx);
+    if (f->result && f->resultSize > 0)
+        memcpy(out, f->result, (size_t)f->resultSize);
+    suki_bmtx_unlock(&f->mtx);
+}
+
+void suki_future_free(SukiFuture* f) {
+    if (!f) return;
+    if (f->result) suki_free(f->result);
+    suki_cvar_destroy(&f->cvar);
+    suki_bmtx_destroy(&f->mtx);
+    suki_free(f);
+}
+
+// ─── Channel ────────────────────────────────────────────────────────────────────
+struct SukiChannel {
+    suki_bmtx_t    mtx;
+    suki_cvar_t    notFull;
+    suki_cvar_t    notEmpty;
+    int64_t        capacity;   // number of element slots
+    int64_t        elemSize;   // bytes per element
+    int64_t        count;      // elements currently buffered
+    int64_t        head;       // index of the oldest element
+    int64_t        closed;
+    unsigned char* buf;
+};
+
+SukiChannel* suki_channel_create(int64_t capacity, int64_t elemSize) {
+    if (capacity < 1) capacity = 1;
+    if (elemSize < 1) elemSize = 1;
+    SukiChannel* c = (SukiChannel*)suki_alloc(sizeof(SukiChannel));
+    c->capacity = capacity;
+    c->elemSize = elemSize;
+    c->count = 0;
+    c->head = 0;
+    c->closed = 0;
+    c->buf = (unsigned char*)suki_alloc((size_t)(capacity * elemSize));
+    suki_bmtx_init(&c->mtx);
+    suki_cvar_init(&c->notFull);
+    suki_cvar_init(&c->notEmpty);
+    return c;
+}
+
+void suki_channel_send(SukiChannel* c, const void* elem) {
+    if (!c || !elem) return;
+    suki_bmtx_lock(&c->mtx);
+    while (!c->closed && c->count == c->capacity)
+        suki_cvar_wait(&c->notFull, &c->mtx);
+    if (!c->closed) {
+        size_t off = (size_t)((c->head + c->count) % c->capacity) * (size_t)c->elemSize;
+        memcpy(c->buf + off, elem, (size_t)c->elemSize);
+        c->count += 1;
+        suki_cvar_broadcast(&c->notEmpty);
+    }
+    suki_bmtx_unlock(&c->mtx);
+}
+
+int32_t suki_channel_receive(SukiChannel* c, void* out_elem) {
+    if (!c || !out_elem) return -1;
+    suki_bmtx_lock(&c->mtx);
+    while (c->count == 0 && !c->closed)
+        suki_cvar_wait(&c->notEmpty, &c->mtx);
+    if (c->count == 0) {          // closed and drained
+        suki_bmtx_unlock(&c->mtx);
+        return -1;
+    }
+    size_t off = (size_t)c->head * (size_t)c->elemSize;
+    memcpy(out_elem, c->buf + off, (size_t)c->elemSize);
+    c->head = (c->head + 1) % c->capacity;
+    c->count -= 1;
+    suki_cvar_broadcast(&c->notFull);
+    suki_bmtx_unlock(&c->mtx);
+    return 0;
+}
+
+void suki_channel_close(SukiChannel* c) {
+    if (!c) return;
+    suki_bmtx_lock(&c->mtx);
+    c->closed = 1;
+    suki_cvar_broadcast(&c->notEmpty);
+    suki_cvar_broadcast(&c->notFull);
+    suki_bmtx_unlock(&c->mtx);
+}
+
+void suki_channel_free(SukiChannel* c) {
+    if (!c) return;
+    if (c->buf) suki_free(c->buf);
+    suki_cvar_destroy(&c->notEmpty);
+    suki_cvar_destroy(&c->notFull);
+    suki_bmtx_destroy(&c->mtx);
+    suki_free(c);
+}
+
+// ─── Task / TaskGroup ───────────────────────────────────────────────────────────
+typedef struct { SukiClosureFn fn; void* ctx; SukiFuture* fut; } SukiClosureStart;
+
+#if defined(_WIN32)
+static unsigned __stdcall suki_closure_thread_proc(void* p) {
+    SukiClosureStart* s = (SukiClosureStart*)p;
+    s->fn(s->ctx);
+    suki_future_finish(s->fut);
+    suki_free(s);
+    return 0;
+}
+#else
+static void* suki_closure_thread_proc(void* p) {
+    SukiClosureStart* s = (SukiClosureStart*)p;
+    s->fn(s->ctx);
+    suki_future_finish(s->fut);
+    suki_free(s);
+    return NULL;
+}
+#endif
+
+int suki_closure_thread_start(SukiClosureFn fn, void* ctx, SukiFuture* fut) {
+    if (!fn) return -1;
+    SukiClosureStart* s = (SukiClosureStart*)suki_alloc(sizeof(SukiClosureStart));
+    if (!s) return -1;
+    s->fn = fn;
+    s->ctx = ctx;
+    s->fut = fut;
+#if defined(_WIN32)
+    uintptr_t h = _beginthreadex(NULL, 0, suki_closure_thread_proc, s, 0, NULL);
+    if (!h) { suki_free(s); return -1; }
+    CloseHandle((HANDLE)h);
+    return 0;
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, suki_closure_thread_proc, s) != 0) {
+        suki_free(s);
+        return -1;
+    }
+    pthread_detach(t);
+    return 0;
+#endif
+}
+
+struct SukiTaskGroup {
+    suki_bmtx_t   mtx;
+    SukiFuture**  futures;
+    int64_t       count;
+    int64_t       capacity;
+};
+
+SukiTaskGroup* suki_taskgroup_create(void) {
+    SukiTaskGroup* g = (SukiTaskGroup*)suki_alloc(sizeof(SukiTaskGroup));
+    g->capacity = 8;
+    g->count = 0;
+    g->futures = (SukiFuture**)suki_alloc(sizeof(SukiFuture*) * (size_t)g->capacity);
+    suki_bmtx_init(&g->mtx);
+    return g;
+}
+
+void suki_taskgroup_add(SukiTaskGroup* g, SukiFuture* f) {
+    if (!g || !f) return;
+    suki_bmtx_lock(&g->mtx);
+    if (g->count == g->capacity) {
+        int64_t nc = g->capacity * 2;
+        SukiFuture** nf = (SukiFuture**)suki_alloc(sizeof(SukiFuture*) * (size_t)nc);
+        for (int64_t i = 0; i < g->count; ++i) nf[i] = g->futures[i];
+        suki_free(g->futures);
+        g->futures = nf;
+        g->capacity = nc;
+    }
+    g->futures[g->count++] = f;
+    suki_bmtx_unlock(&g->mtx);
+}
+
+void suki_taskgroup_wait_all(SukiTaskGroup* g) {
+    if (!g) return;
+    // Snapshot under the lock, then wait outside it: a child that finishes may
+    // still be touching the group, and holding the lock while waiting would
+    // deadlock against `add`.
+    suki_bmtx_lock(&g->mtx);
+    int64_t n = g->count;
+    SukiFuture** snap = NULL;
+    if (n > 0) {
+        snap = (SukiFuture**)suki_alloc(sizeof(SukiFuture*) * (size_t)n);
+        for (int64_t i = 0; i < n; ++i) snap[i] = g->futures[i];
+    }
+    suki_bmtx_unlock(&g->mtx);
+    if (!snap) return;
+    int64_t dummy = 0;
+    for (int64_t i = 0; i < n; ++i) suki_future_await(snap[i], &dummy);
+    suki_free(snap);
+}
+
+void suki_taskgroup_free(SukiTaskGroup* g) {
+    if (!g) return;
+    if (g->futures) {
+        for (int64_t i = 0; i < g->count; ++i)
+            if (g->futures[i]) suki_future_free(g->futures[i]);
+        suki_free(g->futures);
+    }
+    suki_bmtx_destroy(&g->mtx);
+    suki_free(g);
 }

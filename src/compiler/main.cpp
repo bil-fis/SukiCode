@@ -942,8 +942,19 @@ static int commandRun(const std::vector<std::string>& files, const std::string& 
 #ifdef SUKI_PREFER_LLD
     linker += " -fuse-ld=lld";
 #endif
-    std::string link = linker + " '" + obj + "' '" + SUKI_RUNTIME_OBJECT +
-                       "' -o '" + exe + "'";
+    // Threading libraries are named per platform: Linux needs an explicit
+    // -lpthread, macOS resolves pthreads from libSystem and Windows needs
+    // nothing, so the link line stays correct on each without extra flags.
+    std::string linkLibs;
+#if defined(__linux__)
+    linkLibs = " -lpthread";
+#elif defined(__APPLE__)
+    linkLibs = "";
+#elif defined(_WIN32)
+    linkLibs = "";
+#endif
+    std::string link = linker + linkLibs + " '" + obj + "' '" +
+                       SUKI_RUNTIME_OBJECT + "' -o '" + exe + "'";
     if (std::system(link.c_str()) != 0) { fprintf(stderr, "sukic: link failed\n"); return 1; }
     // `sh -c "name"` searches PATH, not the current directory, so a relative
     // executable must be invoked as ./name.
