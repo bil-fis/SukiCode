@@ -30,9 +30,43 @@ target_link_libraries(sukic PRIVATE sukicompiler)
 if(SUKI_CLANG_EXECUTABLE)
     target_compile_definitions(sukic PRIVATE SUKI_CLANG_DRIVER="${SUKI_CLANG_EXECUTABLE}")
 endif()
-# Path to the C runtime source, linked into `suki run` executables.
+
+# Prefer lld for the final link when it is installed. The driver then passes
+# `-fuse-ld=lld` to the clang driver, which still resolves crt/libc paths while
+# lld performs the actual link (BLK-B).
+find_program(SUKI_LD_LLD_EXECUTABLE NAMES ld.lld)
+if(SUKI_LD_LLD_EXECUTABLE)
+    target_compile_definitions(sukic PRIVATE SUKI_PREFER_LLD=1)
+    message(STATUS "Found ld.lld: `suki run` will link through lld")
+endif()
+# BLK-B: precompile the C runtime into an object at build time so `suki run`
+# links a ready-made runtime object instead of asking clang to *compile* C at
+# link time. The driver then only links (optionally through lld).
+# Use the host's native object-file extension (e.g. `.obj` on Windows) so the
+# output matches what the platform's linker expects — keeps the build portable.
+set(SUKI_RUNTIME_O "${CMAKE_CURRENT_BINARY_DIR}/runtime${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT "${SUKI_RUNTIME_O}"
+    COMMAND ${CMAKE_C_COMPILER} -c
+            -I "${CMAKE_SOURCE_DIR}/src/runtime"
+            "${CMAKE_SOURCE_DIR}/src/runtime/runtime.c"
+            -o "${SUKI_RUNTIME_O}"
+    DEPENDS "${CMAKE_SOURCE_DIR}/src/runtime/runtime.c"
+            "${CMAKE_SOURCE_DIR}/src/runtime/runtime.h"
+    COMMENT "Precompiling SukiCode C runtime -> runtime.o"
+    VERBATIM)
+add_custom_target(suki_runtime_o DEPENDS "${SUKI_RUNTIME_O}")
+add_dependencies(sukic suki_runtime_o)
 target_compile_definitions(sukic PRIVATE
-    SUKI_RUNTIME_SOURCE="${CMAKE_SOURCE_DIR}/src/runtime/runtime.c")
+    SUKI_RUNTIME_OBJECT="${SUKI_RUNTIME_O}")
+
+# 标准库：目录 + 模块文件清单，供驱动在编译期按 `import` 解析（见 main.cpp
+# 的 loadImportedStdlib）。文件清单在配置期 glob 得到，新增 .suki 模块后需重跑 cmake。
+file(GLOB_RECURSE SUKI_STDLIB_FILES "${CMAKE_SOURCE_DIR}/src/stdlib/*.suki")
+string(JOIN "|" SUKI_STDLIB_FILES_STR ${SUKI_STDLIB_FILES})
+target_compile_definitions(sukic PRIVATE
+    SUKI_STDLIB_DIR="${CMAKE_SOURCE_DIR}/src/stdlib"
+    SUKI_STDLIB_FILES="${SUKI_STDLIB_FILES_STR}")
 
 if(MSVC)
     target_compile_options(sukicompiler PRIVATE /utf-8)

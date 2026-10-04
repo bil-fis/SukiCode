@@ -1,0 +1,10 @@
+// 关联类型负例（规范 2.2）：遵守含 associatedtype 的协议却未提供 typealias 绑定应报错。
+protocol P {
+    associatedtype E
+}
+struct S : P {
+    // 缺少 typealias E = ... 绑定
+}
+func main() {
+    let s = S()
+}

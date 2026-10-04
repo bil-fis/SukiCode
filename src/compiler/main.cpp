@@ -21,6 +21,7 @@
 #include "compiler/codegen/IRGenerator.h"
 #include "compiler/codegen/TargetInfo.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -741,6 +742,8 @@ static int commandParse(const std::vector<std::string>& files, bool dumpAst) {
 }
 
 // Parse + run semantic analysis, reporting all semantic diagnostics.
+static void loadImportedStdlib(NodeList& userDecls);
+
 static int commandCheck(const std::vector<std::string>& files) {
     int rc = 0;
     for (const auto& path : files) {
@@ -756,6 +759,7 @@ static int commandCheck(const std::vector<std::string>& files) {
         Parser parser(std::move(toks), diags);
         NodeList decls = parser.parseModule();
         // Only run Sema if parsing produced a usable tree.
+        loadImportedStdlib(decls);
         if (!diags.hasErrors()) {
             Sema sema(diags);
             sema.analyze(decls);
@@ -779,6 +783,63 @@ static bool parseFile(const std::string& path, DiagnosticEngine& diags, NodeList
     return !diags.hasErrors();
 }
 
+// Map an `import X` directive to the matching standard-library source file and
+// prepend its declarations to the translation unit. This is a minimal,
+// import-driven module loader; full multi-file module resolution is tracked
+// separately (todo T1). Loading is opt-in: files that do not `import` a stdlib
+// module compile exactly as before, so the existing test suite is unaffected.
+static void loadImportedStdlib(NodeList& userDecls) {
+    std::string dir = SUKI_STDLIB_DIR;
+    std::string files = SUKI_STDLIB_FILES;
+    if (dir.empty() || files.empty()) return;
+
+    // Build moduleName -> absolute path from the CMake-provided file list.
+    std::vector<std::pair<std::string, std::string>> mods;
+    size_t start = 0;
+    while (start <= files.size()) {
+        size_t end = files.find('|', start);
+        if (end == std::string::npos) end = files.size();
+        std::string p = files.substr(start, end - start);
+        if (!p.empty()) {
+            std::string name = p.substr(p.find_last_of("/\\") + 1);
+            const size_t ext = name.find(".suki");
+            if (!name.empty() && ext != std::string::npos && ext == name.size() - 5)
+                name.resize(name.size() - 5);
+            mods.emplace_back(name, p);
+        }
+        if (end == files.size()) break;
+        start = end + 1;
+    }
+
+    // Collect paths requested via `import`.
+    std::vector<std::string> toLoad;
+    for (auto& d : userDecls) {
+        if (d && d->kind == NodeKind::ImportDecl) {
+            auto* imp = static_cast<ImportDecl*>(d.get());
+            for (auto& m : mods)
+                if (m.first == imp->moduleName) { toLoad.push_back(m.second); break; }
+        }
+    }
+    if (toLoad.empty()) return;
+
+    // De-duplicate and parse + prepend.
+    std::sort(toLoad.begin(), toLoad.end());
+    toLoad.erase(std::unique(toLoad.begin(), toLoad.end()), toLoad.end());
+    NodeList prelude;
+    for (const auto& p : toLoad) {
+        DiagnosticEngine d;
+        NodeList dl;
+        if (parseFile(p, d, dl))
+            for (auto& n : dl) prelude.push_back(std::move(n));
+        else
+            fprintf(stderr, "sukic: warning: stdlib module '%s' failed to parse\n", p.c_str());
+    }
+    if (!prelude.empty())
+        userDecls.insert(userDecls.begin(),
+                         std::make_move_iterator(prelude.begin()),
+                         std::make_move_iterator(prelude.end()));
+}
+
 static TargetInfo resolveTarget(const std::string& triple) {
     if (!triple.empty()) {
         TargetInfo t;
@@ -794,6 +855,15 @@ static TargetInfo resolveTarget(const std::string& triple) {
 #ifndef SUKI_RUNTIME_SOURCE
 #define SUKI_RUNTIME_SOURCE "runtime.c"
 #endif
+#ifndef SUKI_RUNTIME_OBJECT
+#define SUKI_RUNTIME_OBJECT "runtime.o"
+#endif
+#ifndef SUKI_STDLIB_DIR
+#define SUKI_STDLIB_DIR ""
+#endif
+#ifndef SUKI_STDLIB_FILES
+#define SUKI_STDLIB_FILES ""
+#endif
 
 // Compile one source file to a target object file: SukiCode -> LLVM IR, then
 // clang (an LLVM frontend) lowers the IR to a native object file.
@@ -803,26 +873,21 @@ static bool compileOne(const std::string& path, const std::string& triple,
     DiagnosticEngine diags;
     NodeList decls;
     if (!parseFile(path, diags, decls)) { diags.emit(stderr); return false; }
+    loadImportedStdlib(decls);
     Sema sema(diags);
     sema.analyze(decls);
     if (diags.hasErrors()) { diags.emit(stderr); return false; }
     IRGenerator gen(resolveTarget(triple));
     std::string ir, err;
-    if (!gen.emitIR(decls, sema, ir, err)) { errOut = err; return false; }
-    if (irOut) *irOut = ir;
-    std::string llPath = objPath + ".ll";
-    {
-        std::ofstream ofs(llPath);
-        if (!ofs) { errOut = "cannot write '" + llPath + "'"; return false; }
-        ofs << ir;
+    // BLK-B: lower SukiCode -> LLVM IR -> native object entirely in-process via
+    // LLVM's TargetMachine/MC backend. No external `clang -c` is invoked, so the
+    // driver no longer depends on a C/IR frontend to produce an object file. The
+    // textual IR is still produced when requested (used to locate `@main`).
+    if (!gen.emitObject(decls, sema, objPath, irOut ? &ir : nullptr, err)) {
+        errOut = err;
+        return false;
     }
-    // The IR already carries the target triple and data layout; keep clang
-    // from re-warning that it is overriding them with the host triple.
-    std::string cmd = std::string(SUKI_CLANG_DRIVER) + " -Wno-override-module -c '" +
-                      llPath + "' -o '" + objPath + "'";
-    int rc = std::system(cmd.c_str());
-    std::remove(llPath.c_str());
-    if (rc != 0) { errOut = "clang failed to lower IR to an object file"; return false; }
+    if (irOut) *irOut = ir;
     return true;
 }
 
@@ -832,6 +897,7 @@ static int commandEmitIR(const std::vector<std::string>& files, const std::strin
         DiagnosticEngine diags;
         NodeList decls;
         if (!parseFile(path, diags, decls)) { diags.emit(stderr); rc = 1; continue; }
+        loadImportedStdlib(decls);
         Sema sema(diags);
         sema.analyze(decls);
         if (diags.hasErrors()) { diags.emit(stderr); rc = 1; continue; }
@@ -867,9 +933,17 @@ static int commandRun(const std::vector<std::string>& files, const std::string& 
                 files[0].c_str());
         return 1;
     }
-    // Link the object with the C runtime (print/println/panic/alloc/ARC).
-    std::string link = std::string(SUKI_CLANG_DRIVER) + " -Wno-override-module '" + obj +
-                       "' '" + SUKI_RUNTIME_SOURCE + "' -o '" + exe + "'";
+    // BLK-B: the object was produced in-process by LLVM; link it with the
+    // precompiled C runtime object. When lld is installed we ask the clang driver
+    // to use it as the linker (`-fuse-ld=lld`), so the actual link is performed
+    // by lld while clang still supplies the correct crt/libc search paths.
+    // Otherwise the default system linker (via the clang driver) is used.
+    std::string linker = std::string(SUKI_CLANG_DRIVER);
+#ifdef SUKI_PREFER_LLD
+    linker += " -fuse-ld=lld";
+#endif
+    std::string link = linker + " '" + obj + "' '" + SUKI_RUNTIME_OBJECT +
+                       "' -o '" + exe + "'";
     if (std::system(link.c_str()) != 0) { fprintf(stderr, "sukic: link failed\n"); return 1; }
     // `sh -c "name"` searches PATH, not the current directory, so a relative
     // executable must be invoked as ./name.

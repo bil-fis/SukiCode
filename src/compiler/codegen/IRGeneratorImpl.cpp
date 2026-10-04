@@ -25,6 +25,12 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 
+// BLK-B: in-process object emission needs the legacy pass manager and the file
+// system helpers. These headers live only in this TU (strict PIMPL).
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Support/FileSystem.h>
+#include <system_error>
+
 #include <cctype>
 #include <cstdlib>
 #include <map>
@@ -47,6 +53,11 @@ private:
             llvm::InitializeAllTargetInfos();
             llvm::InitializeAllTargets();
             llvm::InitializeAllTargetMCs();
+            // BLK-B: in-process object emission needs the AsmPrinter backend that
+            // turns MC instructions into an ELF object; without it
+            // addPassesToEmitFile(CGFT_ObjectFile) fails.
+            llvm::InitializeAllAsmPrinters();
+            llvm::InitializeAllAsmParsers();
             initialized = true;
         }
         ctx_ = std::make_unique<llvm::LLVMContext>();
@@ -2489,6 +2500,19 @@ private:
         bool lf = l->getType()->isFloatingPointTy();
         bool rf = r->getType()->isFloatingPointTy();
         if (lf != rf) { if (lf) r = coerce(r, l->getType()); else l = coerce(l, r->getType()); }
+        // Integer operands with different bit-widths (e.g. an `Int32` value
+        // compared against an `Int` literal `0`) must be widened to a common
+        // width before the ALU / ICmp, otherwise LLVM rejects the mismatched
+        // operands (`icmp ne i32 %x, i64 0`). Extend the narrower to the wider
+        // with sign extension, matching `coerce`'s integer rule.
+        bool li = l->getType()->isIntegerTy() && !l->getType()->isIntegerTy(1);
+        bool ri = r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1);
+        if (li && ri && l->getType()->getIntegerBitWidth() != r->getType()->getIntegerBitWidth()) {
+            if (l->getType()->getIntegerBitWidth() < r->getType()->getIntegerBitWidth())
+                l = coerce(l, r->getType());
+            else
+                r = coerce(r, l->getType());
+        }
         switch (e->op) {
             case PunctuatorID::Plus: return lf ? b_->CreateFAdd(l, r) : b_->CreateAdd(l, r);
             case PunctuatorID::Minus: return lf ? b_->CreateFSub(l, r) : b_->CreateSub(l, r);
@@ -3842,6 +3866,9 @@ public:
         // 函数体内对 `obj[idx]` 的调用在查表时还找不到对应方法（规范 3.1）。
         genSubscriptBodies(decls);
         for (auto& pb : pendingBodies_) {
+            // 外部函数（foreign）只声明符号、不发射函数体，否则会与
+            // runtime.c 里的真实定义产生 multiple definition 冲突。
+            if (pb.first->isForeign) continue;
             if (fns_.count(pb.second) && !fns_[pb.second]->empty()) continue;
             generateBodyAs(pb.first, pb.second);
         }
@@ -3893,6 +3920,57 @@ public:
         llvm::raw_string_ostream os(out);
         module_->print(os, nullptr);
         return os.str();
+    }
+
+    // BLK-B: lower the generated module directly to a native object file using
+    // LLVM's TargetMachine + MC/AsmPrinter. Replaces the old `clang -c`
+    // shell-out so the driver is fully self-contained for code generation.
+    bool emitObject(const NodeList& decls, const std::string& objPath,
+                    std::string* irOut, std::string& errOut) {
+        if (!generate(decls, errOut)) return false;
+        if (irOut) *irOut = irText();
+
+        std::string err;
+        const llvm::Target* target =
+            llvm::TargetRegistry::lookupTarget(target_.triple, err);
+        if (!target) {
+            errOut = "cannot select LLVM target for '" + target_.triple +
+                     "': " + err;
+            return false;
+        }
+        llvm::TargetOptions opts;
+        // Emit position-independent code: the system linker builds a PIE
+        // executable by default, so absolute (R_X86_64_32) relocations would be
+        // rejected. PIC relocations (R_X86_64_PC32, RIP-relative) match what the
+        // precompiled runtime object uses and link cleanly into a PIE.
+        std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
+            target_.triple, "generic", "", opts, llvm::Reloc::PIC_,
+            std::nullopt, llvm::CodeGenOptLevel::None));
+        if (!tm) {
+            errOut = "cannot create target machine for '" + target_.triple + "'";
+            return false;
+        }
+        // Keep the module's data layout in lock-step with the machine that will
+        // emit code for it (the layout drives ABI padding decisions).
+        module_->setDataLayout(tm->createDataLayout());
+
+        std::error_code ec;
+        llvm::raw_fd_ostream dest(objPath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            errOut = "cannot open object file '" + objPath + "': " + ec.message();
+            return false;
+        }
+
+        llvm::legacy::PassManager pm;
+        if (tm->addPassesToEmitFile(pm, dest, /*DwoOut=*/nullptr,
+                                    llvm::CodeGenFileType::ObjectFile)) {
+            errOut = "target '" + target_.triple +
+                     "' does not support object-file emission";
+            return false;
+        }
+        pm.run(*module_);
+        dest.flush();
+        return true;
     }
 
     TargetInfo target_;
@@ -4598,6 +4676,13 @@ bool IRGenerator::emitIR(const NodeList& decls, Sema& sema, std::string& irOut,
     if (!impl_->generate(decls, errOut)) return false;
     irOut = impl_->irText();
     return true;
+}
+
+bool IRGenerator::emitObject(const NodeList& decls, Sema& sema,
+                            const std::string& objPath, std::string* irOut,
+                            std::string& errOut) {
+    impl_->sema_ = &sema;
+    return impl_->emitObject(decls, objPath, irOut, errOut);
 }
 
 } // namespace suki

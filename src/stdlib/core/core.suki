@@ -1,0 +1,103 @@
+/// SukiCode standard library — `core` module.
+///
+/// Provides the foundational protocols and thin foreign-function wrappers over
+/// the C runtime (`src/runtime/runtime.c`). Builtin types such as `Int`,
+/// `String`, `Array`, `Dictionary` and `Set` are supplied by the compiler;
+/// this module layers safer, named APIs on top where the compiler does not
+/// already provide an intrinsic.
+
+module core
+
+// ─── Protocols ───────────────────────────────────────────────────────────────
+
+/// Marker protocol for types that can be compared for equality.
+protocol Equatable {}
+
+/// Types that can be hashed; refines `Equatable`.
+protocol Hashable: Equatable {
+    /// A hash value for use in hash-based collections.
+    func hashValue() -> Int
+}
+
+/// Types that have a natural ordering.
+protocol Comparable: Equatable {}
+
+/// Provides a human-readable textual description.
+protocol CustomStringConvertible {
+    /// A textual representation of this value.
+    func description() -> String
+}
+
+/// The error protocol. Conform to this to throw typed errors.
+protocol Error {}
+
+/// A value that can be awaited with `await` (see §7.3).
+///
+/// `await future` desugars to `try await future.waitForValue()`.
+protocol Awaitable {
+    associatedtype Value
+    /// Suspend the current task and resume with the produced value.
+    func waitForValue() async throws -> Value
+}
+
+// ─── Runtime string wrappers (safe by-value ABI) ──────────────────────────────
+// These mirror the `suki_str_*` entry points in `runtime.c`. `String` lowers to
+// the same `{ i8* data, i64 length }` aggregate the runtime expects, so the ABI
+// matches without any glue code.
+
+foreign func suki_str_length(_ s: String) -> Int
+foreign func suki_str_concat(_ a: String, _ b: String) -> String
+foreign func suki_str_compare(_ a: String, _ b: String) -> Int32
+foreign func suki_str_has_prefix(_ s: String, _ p: String) -> Int32
+foreign func suki_str_has_suffix(_ s: String, _ p: String) -> Int32
+foreign func suki_str_to_int(_ s: String) -> Int
+foreign func suki_int_to_string(_ v: Int) -> String
+foreign func suki_double_to_string(_ v: Double) -> String
+foreign func suki_char_to_string(_ v: Int32) -> String
+
+// ─── Named convenience API ───────────────────────────────────────────────────
+
+/// The number of Unicode scalars in `s`.
+func stringLength(_ s: String) -> Int {
+    return suki_str_length(s)
+}
+
+/// Concatenate two strings.
+func stringConcat(_ a: String, _ b: String) -> String {
+    return suki_str_concat(a, b)
+}
+
+/// `true` if `s` begins with `prefix`.
+func stringHasPrefix(_ s: String, _ prefix: String) -> Bool {
+    return suki_str_has_prefix(s, prefix) != 0
+}
+
+/// `true` if `s` ends with `suffix`.
+func stringHasSuffix(_ s: String, _ suffix: String) -> Bool {
+    return suki_str_has_suffix(s, suffix) != 0
+}
+
+/// Lexicographic comparison: negative if `a < b`, 0 if equal, positive if `a > b`.
+func stringCompare(_ a: String, _ b: String) -> Int32 {
+    return suki_str_compare(a, b)
+}
+
+/// Render an integer as a string.
+func intToString(_ v: Int) -> String {
+    return suki_int_to_string(v)
+}
+
+/// Render a floating-point value as a string.
+func doubleToString(_ v: Double) -> String {
+    return suki_double_to_string(v)
+}
+
+/// Render a Unicode scalar (21-bit) as a one-character string.
+func charToString(_ v: Int32) -> String {
+    return suki_char_to_string(v)
+}
+
+/// Parse a string into an integer (`Int("42")`).
+func stringToInt(_ s: String) -> Int {
+    return suki_str_to_int(s)
+}

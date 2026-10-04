@@ -1,0 +1,17 @@
+// 关联类型 associatedtype（规范 2.2）：协议方法返回关联类型，遵守类型以
+// typealias 提供绑定并实现，调用点真实解析使用。
+protocol Container {
+    associatedtype Item
+    func first() -> Item
+}
+struct IntBox : Container {
+    typealias Item = Int
+    var v: Int
+    init(v: Int) { self.v = v }
+    func first() -> Int { return v }
+}
+func main() {
+    let b = IntBox(v: 7)
+    let x = b.first()
+    if x == 7 { print(7) } else { print(0) }
+}

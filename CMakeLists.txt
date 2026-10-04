@@ -117,12 +117,27 @@ elseif(UNIX)
     set(SUKI_PLATFORM "linux")
 endif()
 
+# Derive the host architecture from the actual build target instead of a
+# hardcoded value, so this variable stays correct on every platform
+# (e.g. aarch64 / arm), not just x86_64. The real target detection used by
+# code generation lives in TargetInfo.cpp (compiler builtins __x86_64__ /
+# __aarch64__ ...); this is only an informational variable.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    set(SUKI_ARCH "x86_64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(SUKI_ARCH "aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv6|arm)$")
+    set(SUKI_ARCH "arm")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(i[3-6]86)$")
+    set(SUKI_ARCH "x86")
+else()
+    set(SUKI_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_compile_definitions(SUKI_ARCH_64BIT=1)
-    set(SUKI_ARCH "x86_64")
 else()
     add_compile_definitions(SUKI_ARCH_32BIT=1)
-    set(SUKI_ARCH "x86")
 endif()
 
 # ─── Warning flags ────────────────────────────────────────────────────────

@@ -1,0 +1,30 @@
+/// SukiCode standard library — `concurrency` module.
+///
+/// Declares the core concurrency protocols and opaque handle types. The actual
+/// executors, task scheduling and `Future`/`Channel` runtime are filled in by the
+/// async/await state-machine work (compiler todos C1–C4, C6).
+
+module concurrency
+
+/// An execution context that runs work serially (e.g. the main actor).
+protocol TaskExecutor {}
+
+/// Opaque handle identifying a spawned task.
+struct TaskHandle {
+    var id: Int
+}
+
+/// Opaque handle identifying a group of child tasks.
+struct TaskGroupHandle {
+    var id: Int
+}
+
+/// A simple mutual-exclusion lock (backed by the C runtime spin lock).
+struct Mutex {
+    var state: Int
+}
+
+/// An atomic integer counter.
+struct AtomicInt {
+    var value: Int
+}

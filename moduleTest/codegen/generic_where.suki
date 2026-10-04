@@ -1,0 +1,12 @@
+// 泛型 where 子句（规范 2.1）：编译期强制协议约束，可任意顺序、支持 & 组合。
+protocol Equatable {}
+struct S : Equatable {
+    func code() -> Int { return 7 }
+}
+func id<T>(x: T) -> T where T: Equatable { return x }
+func main() {
+    let s = S()
+    let r = id(s)            // where T: Equatable 满足
+    let c = r.code()
+    if c == 7 { print(7) } else { print(0) }
+}

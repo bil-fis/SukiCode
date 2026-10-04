@@ -1,0 +1,18 @@
+// async/await（规范 7.2）：工作线程模型。async 函数调用立即返回 Future，
+// `await` 阻塞取回结果；内置 `sleep(ms)` 提供真实挂起，验证并发执行。
+async func slow() -> Int {
+    await sleep(10)
+    return 7
+}
+async func inner() -> Int {
+    return 99
+}
+async func outer() -> Int {
+    let a = await inner()
+    let b = await slow()
+    return a + b
+}
+func main() {
+    let r = await outer()
+    print(r)
+}

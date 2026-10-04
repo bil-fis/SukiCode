@@ -1,10 +1,11 @@
 # SukiCode 语言规范
+
 **版本 1.0.0**
-**设计修改第10次**
+**设计修改第 13 次（语义收敛修订）**
 
 **设计目标**：融合 Swift、TypeScript 与 Objective-C 语法优势的现代系统编程语言，通过 AOT 编译、确定性 ARC 内存管理与 Pool/Collection 资源抽象，提供 C 级性能与高度可预测的运行时行为，同时支持全部主流操作系统特性。
 
-
+---
 
 ## 目录
 
@@ -33,7 +34,7 @@
 SukiCode 源文件使用 `.suki` 扩展名。每个文件属于一个模块，模块名在文件首行声明：
 
 ```swift
-module MyApp;
+module MyApp
 ```
 
 同一模块可由多个文件组成，无需重复模块声明（除入口文件外）。模块名需与文件系统目录及包清单一致。入口文件（包含 `@main` 属性的文件）可以省略 `module` 声明。
@@ -60,6 +61,16 @@ let count: Int             // 允许延迟初始化，但使用前必须赋值
 
 对于 `let` 常量，如果其类型是拥有 `mutating` 方法的结构体，这些方法不能被调用，以保证值不可变。
 
+**延迟初始化规则**：
+
+- `let` 声明可以不立即赋值，但必须在 **所有控制流路径** 上恰好赋值一次。
+- 编译器对 `let` 做 **确定性赋值分析**：
+  - 不允许在任何路径上读取未赋值的 `let`。
+  - 不允许对同一个 `let` 赋值两次。
+  - 不允许在条件分支中只赋值部分路径。
+- `let` 不能被闭包捕获，除非它在捕获点之前已经确定赋值。
+- 在 `init` 中，`let` 存储属性必须在 `self` 可用之前赋值；`convenience init` 必须委托给指定初始化器完成赋值。
+
 ### 1.4 基础数据类型
 
 | 类型     | 说明                                   |
@@ -72,6 +83,7 @@ let count: Int             // 允许延迟初始化，但使用前必须赋值
 | `Double` | 64 位浮点数                            |
 | `Char`   | **Unicode 标量**（21位值），表示单个 Unicode 码点 |
 | `Void`   | 表示无值，用于函数返回类型（可省略）   |
+| `Never`  | 无值类型，表示永不返回                 |
 
 ### 1.5 字符串与字符
 
@@ -87,10 +99,17 @@ let char: Char = "A"
 ```
 
 `String` 是值类型，但内部存储采用写时复制（COW）。`Char` 类型代表一个 **Unicode 标量**（不同于 Swift 的 Extended Grapheme Cluster）。`String` 提供了视图用于处理不同粒度的 Unicode：
-- `.unicodeScalars`: `Collection<UnicodeScalar>`
-- `.characters`: `Collection<Char>` (Unicode 标量序列，字形簇边界需要额外组合)
+
+- `.unicodeScalars`: `Collection<UnicodeScalar>` — Unicode 标量序列
+- `.chars`: `Collection<Char>` — 与 `.unicodeScalars` 同义，`Char` 即 Unicode 标量的类型别名
 - `.utf8`: `Collection<UInt8>`
 - `.utf16`: `Collection<UInt16>`
+
+**说明**：
+
+- SukiCode **不提供** Swift 风格的 Extended Grapheme Cluster 视图。
+- 如果需要字形簇边界，必须使用 `I18n` 模块中的 `GraphemeBreaker` 工具，显式调用。
+- `.characters` 这个名字 **不再使用**，避免与 Swift 的 `Character` 混淆。
 
 ### 1.6 集合类型
 
@@ -136,9 +155,22 @@ for (key, value) in dictionary { }
 // while / repeat-while
 while condition { }
 repeat { } while condition
+
+// loop：无限循环，只能由 break / return / 抛出错误退出
+loop {
+    // ...
+}
 ```
 
 `switch` 必须穷举所有可能的值。对于枚举，编译器会进行检查；对于其他类型，必须包含 `default` 分支。`fallthrough` 关键字被保留，用于显式落入下一个 `case`。
+
+**`loop` 规则**：
+
+- `loop` 是无限循环，条件恒为真。
+- `loop` 只能通过 `break`、`return`、`throw` 或 `Never` 返回退出。
+- `loop` 可以带标签：`outer: loop { ... break outer ... }`。
+- `loop` 与 `while true` 语义等价；`loop` 是推荐写法，`while true` 仍允许但 `suki-fmt` 会建议改为 `loop`。
+- `loop` 可作为表达式，其值类型为 `Never`（若永不退出）或 `break` 携带的值类型。
 
 ### 1.8 区间
 
@@ -151,6 +183,7 @@ repeat { } while condition
 SukiCode 强制采用以下风格约定，以确保代码整洁、一致。编译器 `sukic` 和格式化工具 `suki-fmt` 会强制执行这些规则。
 
 #### 分号 (`;`)
+
 - **禁止使用分号作为语句结束符**。每个语句独立成行，不使用 `;` 结尾。
 - 唯一例外：同一行内写多个语句时，必须用 `;` 分隔，但此写法强烈不推荐。
 
@@ -167,6 +200,7 @@ let x = 1; let y = 2
 ```
 
 #### 缩进与空白
+
 - 使用 **4 个空格** 作为一级缩进，禁止使用制表符。
 - 大括号 `{` 不另起新行，紧跟在上文之后，并在 `{` 前加一个空格。
 - `else`、`catch` 等关键字不另起行，与前面的 `}` 之间用空格隔开。
@@ -194,6 +228,7 @@ else {
 - 冒号 `:` 在类型标注时，前无空格，后有一个空格：`name: String`。在三目运算符 `? :` 中，`?` 和 `:` 前后各留一个空格。
 
 #### 命名约定
+
 - **类型名**（类、结构体、枚举、协议）：**大驼峰**（UpperCamelCase），如 `MyClass`, `HTTPConnection`。
 - **变量、常量、函数、方法、属性、参数标签**：**小驼峰**（lowerCamelCase），如 `myVariable`, `calculateTotal()`。
 - **枚举值**：**小驼峰**，如 `case success`, `case invalidInput`。
@@ -208,6 +243,7 @@ func fetchData(from url: String) { }
 ```
 
 #### 括号与换行
+
 - 函数调用：左括号 `(` 前不加空格，右括号后不加空格（除非后跟语法元素）。
 - 控制流语句（`if`, `for`, `while`, `switch` 等）后的圆括号与关键字之间留一个空格。
 
@@ -231,11 +267,13 @@ if error { return }
 - 函数体、类体等即使只有一行，也建议使用大括号换行书写。
 
 #### 文件组织
+
 - 一个源文件主要定义一个类型（类/结构体/枚举），类型名与文件名一致（如 `User.suki` 定义 `User` 类型）。
 - 扩展（`extension`）可以放在同一文件或独立文件中。
 - 导入语句（`import`）放在文件顶部，模块声明之后，注释之前。按标准库、第三方库、内部模块分组，每组内按字母序排列。
 
 #### 文档注释
+
 - 公开 API 必须使用 `///` 编写文档注释，支持 Markdown 格式。
 - 注释内容应描述作用、参数、返回值和可能抛出的错误。
 
@@ -251,6 +289,7 @@ func add(_ a: Int, _ b: Int) -> Int {
 ```
 
 #### 禁止的特性
+
 - 禁止使用隐式解包可选类型（`Type!`），除非在极少数与 Objective-C 交互的桥接代码中。
 - 禁止使用 `++` 和 `--` 运算符（已移除）。
 - 禁止在条件判断中直接使用非布尔值（如 `if x { }` 非法，必须写 `if x != 0 { }`）。
@@ -261,8 +300,10 @@ func add(_ a: Int, _ b: Int) -> Int {
 
 ### 2.1 值类型与引用类型
 
-- **值类型**：`struct`, `enum`，分配在栈或内联，赋值时拷贝（深拷贝）。
-- **引用类型**：`class`, `actor`，分配在堆上，由 ARC 管理。
+- **值类型**：`struct`, `enum`，赋值时具有 **值语义**——语义上产生独立副本，修改一方不影响另一方。物理实现可采用写时复制（COW）优化，但对外行为始终是值语义。
+- **引用类型**：`class`, `actor`，赋值时共享同一实例，由 ARC 管理生命周期。
+
+> “深拷贝”仅描述语义，不描述物理实现。`String`、`Array`、`Dictionary`、`Set` 等值类型在赋值时可能共享底层缓冲区，直到任一方发生写入才分离。这一优化不改变值语义的可观察行为。
 
 ### 2.2 结构体
 
@@ -414,8 +455,9 @@ let multiply = (a: Int, b: Int) => a * b
 ```
 
 闭包可捕获上下文，支持捕获列表 `[weak self]`、`[unowned self]` 以打破循环引用。捕获列表语法：`[weak varName, unowned self]` 等。闭包有两种形式：
-- **Swift风格**: `{ (参数) -> 返回值 in 语句 }`
-- **箭头风格**: `(参数) => 表达式` (只能包含一个表达式，其值被隐式返回)
+
+- **Swift 风格**：`{ (参数) -> 返回值 in 语句 }`
+- **箭头风格**：`(参数) => 表达式`（只能包含一个表达式，其值被隐式返回）
 
 两种闭包都是 **非逃逸** 的，除非显式标记 `@escaping`。
 
@@ -476,7 +518,10 @@ class Matrix {
 ```swift
 class Base {
     required init() { }
-    convenience init(value: Int) { self.init(); /*...*/ }
+    convenience init(value: Int) {
+        self.init()
+        // ...
+    }
 }
 ```
 
@@ -498,7 +543,9 @@ class Base {
 
 ```swift
 func swap<T>(_ a: inout T, _ b: inout T) {
-    let temp = a; a = b; b = temp
+    let temp = a
+    a = b
+    b = temp
 }
 ```
 
@@ -531,20 +578,61 @@ func allEqual<T: Equatable>(_ seq: [T], to value: T) -> Bool {
 
 ### 5.6 宏（编译期元编程）
 
-SukiCode 支持声明式宏（类似 Swift Macros），通过 `@macro` 在编译期展开。
+SukiCode 支持声明式宏（类似 Swift Macros）。宏用 `macro` 关键字声明，并必须搭配 **`@freestanding`** 或 **`@attached`** 标注之一；规范中不再使用单独的 `@macro` 写法。宏分两类：
+
+- **`@freestanding` 宏**：独立出现在调用位置，不依附于任何声明。再细分为 `expression`（如 `#stringify(x)`、`#log(msg)`）与 `declaration`（在作用域顶层展开为一组声明）两种角色。
+- **`@attached` 宏**：依附于某个声明（类型 / 成员 / 扩展），向其「添加」成员或对成员做变换，如 `@attached(member)`、`@attached(accessor)`、`@attached(peer)`。
+
+#### 宏的实现模型
+
+宏的 **实现体使用 SukiCode 编写**，但只能调用编译器注入的 **`Syntax` 元编程 API**（类型 `SyntaxNode` / `SyntaxExpr` / `SyntaxDecl` 等，由 `import SukiSyntax` 提供，仅在宏库作用域内可见）：
 
 ```swift
-@macro func stringify<T>(_ value: T) -> String {
-    return "\"\(value)\""
+// 表达式宏：接收单个表达式语法节点，返回「(值, 字符串描述)」语法节点
+@freestanding(expression)
+macro stringify<T>(_ value: T) -> (T, String) {
+    // 用 #makeExpr 以字符串插值（quote）构造语法节点，
+    // 其中 \(value) 是 unquote：把参数 value（一个 SyntaxExpr 节点）原样嵌入
+    return #makeExpr("((\(value)), \"\(value)\")")
 }
 ```
 
-提供 `@freestanding` 和 `@attached` 宏。
+**`#makeExpr` 与 quote / unquote 的形式化**：
 
-**宏的安全性和卫生性**：
-- 宏在 **编译期** 执行，运行在受限的沙盒中：**禁止文件 I/O、网络访问、进程启动、系统调用**。宏只能操作语法树（`Syntax` 节点）和字符串。
-- 宏是 **卫生的**：宏内部生成的所有符号都会自动添加唯一的作用域前缀，避免与外部代码的命名冲突。如果需要生成全局唯一标识符，可以使用 `#unique("base")`。
-- 宏的实现代码必须与宏的使用者在同一个模块，或作为独立的宏库导入。
+- `#makeExpr(s)` 是一个 **宏期原语**，其参数 `s` 必须是一个 **字符串字面量**；编译器把 `s` 当作一段 SukiCode 表达式源代码解析，产生一个 `SyntaxExpr` 节点作为宏的返回值（对 `freestanding(declaration)` 宏则使用 `#makeDecl` 产生 `SyntaxDecl` 列表）。
+- **Quote（引用）**：字符串字面量整体是一个「待解析的模板」；除 `\(...)` 之外的内容按字面量作为源代码。
+- **Unquote（反引用）**：`\(node)` 中的 `node` **必须** 是宏参数或宏体内构造出的 `SyntaxNode` 值（**不是**运行期值）。在解析前，编译器先用各 `node` 的 **原始源代码文本** 替换 `\(node)`，再把整段字符串一次性解析为单个语法树。
+- **卫生性影响**：`#makeExpr` 解析出的树与手写代码地位相同，随后统一进行下节「卫生性（hygiene）」的重命名处理——展开体内新引入的绑定名会被加上 `__suki_macro_<scopeID>_` 前缀，而 unquote 嵌入的节点（来自调用方）保留其原始作用域、不会被重命名，从而避免注入或遮蔽。
+- **防注入 / 歧义**：unquote 只接受 `SyntaxNode` 类型、且以「源代码文本替换 + 整段解析」方式构造，因此无法把任意运行期字符串拼进展开结果；解析在最后一次性完成，也不受插值顺序影响，从根本上防止了代码注入与括号/运算符优先级歧义。
+- **边界规则**：`#makeExpr(s)` 中的 `\(node)` **只接受 `SyntaxNode`**（`SyntaxExpr` / `SyntaxDecl` / `SyntaxPattern` 等），不接受运行期值。宏体内 **普通字符串插值不可用**；`"\(runtimeValue)"` 在宏期是非法写法。若需要在生成代码中嵌入字面量文本，使用转义 `\\(` 或辅助原语 `#literal("...")`。`#makeDecl` 与 `#makeExpr` 规则相同，只是产生 `SyntaxDecl` 列表。
+
+- 宏体在 **编译期** 由编译器解释执行（**不是**运行时执行）；其输入是 **语法树节点**，输出也是 **语法树节点**（或供 `freestanding(declaration)` 使用的声明节点列表）。
+- 宏体 **不能** 包含任意运行时逻辑、循环依赖、对外部状态（文件 / 网络 / 进程 / 内存）的读写；它只能遍历、构造、重写 `Syntax` 节点，以及做字符串拼接（`#unique`、字面量插值）。
+- 宏的实现代码必须与宏的使用者在 **同一个模块**，或作为独立的 **宏库**（通过 `sukipm` 发布，导入后使用）。
+
+#### 调试展开
+
+- `sukic -expand-macros <file>`：将宏展开后的 AST / 源码打印到标准输出，便于排查展开结果。
+- `sukipm build --verbose-macro`：构建时在日志中输出每个宏的展开前后差异。
+
+#### 实现建议与错误报告要求
+
+- `#makeExpr` / `#makeDecl` 的实现 **应使用解析器而非字符串拼接**：unquote 替换应产生带源位置的语法节点，再拼接为完整模板，最后解析。
+- 错误信息必须指向模板中的具体位置，例如 `#makeExpr` 内第 3 个字符处的语法错误，应报告为宏展开点的子位置。
+- 卫生性重命名必须在解析后、类型检查前完成；重命名表应保留原始名与源位置，供调试器与 LSP 使用。
+- 宏展开的复杂度上限由编译器设定；超出上限时报告 `MacroExpansionTooComplex` 错误。
+
+#### 宏的安全性与卫生性（hygiene）
+
+1. **沙盒**：宏体运行在受限环境中，**禁止文件 I/O、网络访问、进程启动、系统调用、任意内存读写**。任何越界操作在编译期被拒绝并报错。
+2. **卫生性（hygiene）**：每个宏调用点都被分配一个 **唯一作用域 ID**（`scopeID`）。宏展开体内部新引入的绑定名，编译器自动重写为 `__suki_macro_<scopeID>_<origName>` 形式，从而：
+   - 不会遮蔽或冲突于调用处的同名符号；
+   - 不会意外捕获调用处的变量（宏体引用的名字只在宏自身作用域内解析）；
+   - 调用处已有的符号 **绝不会被宏重命名**。
+3. **显式导出全局名**：若宏确实要引入一个调用方可见的全局唯一符号（例如生成辅助函数），必须使用 `#unique("base")` 表达式，它生成形如 `__suki_unique_<module>_<base>_<counter>` 的标识符，保证模块内唯一且不与其他 `#unique` 冲突。
+4. **不透明性**：宏体无法读取调用点的词法环境，只能拿到显式传入的语法节点参数；这从机制上保证「宏不会泄露调用方作用域」。
+
+> 注：`@attached` 宏向类型添加的成员名（如 `init`、`foo`）属于目标类型的作用域，按正常的访问控制（§10.1）与重载规则处理，不受上述卫生性前缀影响。
 
 ---
 
@@ -573,16 +661,19 @@ protocol PoolProtocol {
 ```
 
 内置池：
+
 - `MemoryPool<T>`：从预分配内存块分配对象，池销毁时统一释放，跳过单独 ARC。
 - `ThreadPool`：管理工作线程。
 - `ChannelPool`：管理 IPC 通道。
 - `ConnectionPool`：管理数据库或网络连接。
 
 **线程安全指南**：
+
 - `allocate()` 可能从多个线程并发调用，实现必须使用同步原语（如 `Mutex`）保护内部状态。
 - `releaseAll()` 通常由 `Collection` 在析构时调用，但该析构可能发生在任何线程。为了安全，`releaseAll()` 也应具备线程安全性（例如使用相同的锁）。
 
 **依赖关系与循环检测**：
+
 - 池可以显式声明对其他池的依赖：通过 `@depends(on:)` 标注。
 - `Collection` 在添加池时，会检查依赖图是否存在循环。若存在循环依赖，编译报错。
 - `shutdown()` 按照依赖关系的逆拓扑序释放池（而非简单的添加逆序）。
@@ -617,6 +708,16 @@ take(ownership: move buffer)  // 移动后 buffer 不可用
 ```
 
 **限制**：`Owned<T>` 只能用于 **值类型**（`struct`, `enum`, 基本类型）或 `Unmanaged<T>`（裸指针包装）。若 `T` 为 `class`（ARC 管理），禁止使用 `Owned<T>`，因为唯一所有权语义与 ARC 的多引用模型冲突，会导致双重释放或内存泄漏。编译器会在实例化 `Owned<SomeClass>` 时报错。
+
+**与 COW 类型的独占性**：
+
+- 当 `T` 是 COW 值类型时，`Owned<T>` 在构造与每次移动时调用 `.unique()`。
+- `.unique()` 在运行期 **总是可以成功**：
+  - 若底层缓冲区引用计数为 1，则原地独占，零拷贝。
+  - 若引用计数大于 1，则复制一份新缓冲区，旧副本不受影响。
+- 因此 `Owned<T>` 的唯一所有权语义始终成立，不存在“运行期无法 unique”的情况。
+- **编译器报错**的情况是：`T` 没有实现 `.unique()`（即不是 COW 类型，也没有提供独占化方法），而不是运行期判定失败。
+- 性能建议：若 `T` 是 `Array` / `String` / `Dictionary`，在构造 `Owned<T>` 前避免保留其他副本，可让 `.unique()` 走零拷贝路径。
 
 `Owned<T>` 是一种“移动语义”类型，不能被复制，只能被 **移动**。
 
@@ -665,6 +766,7 @@ async func fetchData() throws -> Data {
 `async` 函数由 **全局协作线程池** 执行（除非指定自定义执行器）。编译器将 `async` 函数转换为状态机。`throws` 和 `async` 可以组合使用：`async throws`。
 
 **自定义执行器**：
+
 - 可以通过 `@executor` 属性指定函数或类型使用的执行器。
 - `@MainActor` 用于要求在主线程上执行的代码。
 
@@ -692,10 +794,18 @@ await withTaskGroup(of: Data.self) { group in
 - `Task`：非结构化任务，可取消。
 
 **取消机制**：
+
 - `Task` 拥有 `cancel()` 方法和 `isCancelled` 属性。
 - 取消是协作式的：任务内部的 `await` 点（包括 `Task.sleep`、通道操作、异步函数调用）会检查取消状态，如果已取消则抛出 `CancellationError`。
 - 任务可以使用 `withTaskCancellationHandler` 注册清理代码。
 - 子任务继承父任务的取消状态。
+
+**`Duration` 与时间字面量**：
+
+- `Task.sleep`、超时与定时器统一接收 **`Duration`** 类型（由 `core` 模块提供的值类型）。其构造使用静态工厂：`Duration.seconds(5)`、`Duration.milliseconds(250)`、`Duration.microseconds(1)`。
+- 句法约定：在需要 `Duration` 的实参位置，用 **前导点** 成员写法 `.seconds(5)`（即 `Duration.seconds(5)` 的隐式成员表达式，由编译器在目标类型为 `Duration` 时解析）。
+- 规范 **不** 把 `5.seconds` 这种「字面量 + 成员后缀」当作独立字面量语法——它会造成与成员访问的歧义，且无法静态确定底层单位。因此一律写作 `.seconds(5)` / `.milliseconds(200)`。
+- 示例：`await Task.sleep(.seconds(5))`、`future.await(timeout: .seconds(5))`。
 
 ```swift
 let task = Task {
@@ -708,9 +818,44 @@ let task = Task {
 task.cancel()
 ```
 
-**Future.await 的超时与取消**：
-- `future.await(timeout: .seconds(5))` 可指定超时，超时后抛出 `TimeoutError`。
-- `future.await()` 可以响应包含它的任务的取消信号（如果任务已取消，`await` 立即抛出 `CancellationError`）。
+**`Future.await()` 与 `await` 关键字的区分（重要）**：
+
+- `future.await()` 是 **阻塞方法**：在 **当前线程** 上等待结果就绪，**占用线程、不挂起任务、也不观察 `Task` 取消**。它属于「线程池 Future」（`ThreadPool.submitWithResult` 产生），用于 **非 async 上下文** 或确实要同步等待的场景。
+- `await <expr>` 是语言级 **异步挂起点**：**挂起当前 `async` 任务、让出线程、不阻塞**，并在挂起点检查所在 `Task` 的取消状态（已取消则抛 `CancellationError`）。
+
+> 结论：**不要在 `async` 热路径里把 `future.await()` 当挂起原语**——那会卡住协作线程池。async 内等待请用 `await` 化的接口（例如 `await future`）；同步代码里拿结果才用 `future.await()`。
+
+- `future.await(timeout: .seconds(5))`：阻塞等待，最长 `.seconds(5)`；超时抛 `TimeoutError`（这是 **线程阻塞超时**，与任务取消无直接关系）。
+- 明确：**`future.await()` 不会响应任务取消**（它不在 async 任务上下文中运行、不检查取消令牌）。async 上下文里需要「可取消地等待 Future」时，应使用 `await future`——它在后台线程阻塞等待、对外以挂起语义暴露，从而能在 `await` 点响应取消并抛 `CancellationError`。
+
+**`await future` 的正式定义**：
+
+- 能被 `await` 直接等待的值必须遵循 **`Awaitable`** 协议：
+
+  ```swift
+  protocol Awaitable {
+      associatedtype Value
+      func waitForValue() async throws -> Value
+  }
+  ```
+
+- `Future<T>` 遵循 `Awaitable`，其关联类型 `Value == T`。`await future` 是 **语法糖**，脱糖为 `try await future.waitForValue()`。
+- **实现与取消语义**：`Future<T>` 在后台线程（由 `ThreadPool` 托管）执行阻塞计算；`waitForValue()` 在调用处 **挂起当前 `async` 任务** 并注册一个 continuation，把「等待」交给后台线程，自己让出线程。当后台计算完成（或失败）时，运行时唤醒 continuation 并恢复任务。
+- 在 `await` 挂起点，运行时检查所在 `Task` 的取消状态：若已取消，则 `waitForValue()` 立即抛 `CancellationError` 而不再等待；同时运行时也会向后台计算发出取消请求（尽力而为，计算本身需协作式响应）。这就把「线程池 Future 的阻塞等待」安全地包装成了「语言级可取消挂起」。
+
+**`Future` 的取消协议**：
+
+```swift
+protocol Cancellable {
+    func cancel()
+    var isCancelled: Bool { get }
+}
+```
+
+- `Future<T>` 遵循 `Awaitable & Cancellable`。
+- `waitForValue()` 在 `await` 挂起点检查取消：若所在 `Task` 已取消，立即抛 `CancellationError`，并调用 `Future.cancel()` 通知后台计算。
+- 后台计算通过 `Future.isCancelled` 协作式检查取消；`cancel()` 只是发出请求，不强制终止线程。
+- `future.await()`（阻塞方法）不响应任务取消；`await future`（挂起语义）响应取消。两者语义严格区分，不得混用。
 
 ### 7.4 Actor
 
@@ -731,7 +876,7 @@ Actor 内部方法为异步调用：`await counter.increment()`。Actor 的所�
 ```swift
 actor Cache {
     private var storage: [String: Data] = [:]
-    
+
     func get(key: String) async -> Data? {
         if let cached = storage[key] {
             return cached
@@ -746,7 +891,6 @@ actor Cache {
     }
 }
 ```
-
 
 ### 7.5 通道与 IPC
 
@@ -781,16 +925,24 @@ let reply = await client.send(message: "ping")
 
 ```swift
 select {
-case pattern <- sendExpr: statements   // 发送操作
-case recvPattern <- channel: statements // 接收操作
-case default: statements                // 非阻塞分支（可选）
+case <expr> <- <channel>: statements        // 发送：将 expr 求值后发送到 channel
+case let <pattern> <- <channel>: statements // 接收：从 channel 接收并绑定到 pattern
+case _ <- <channel>: statements             // 接收：仅等待就绪、丢弃值
+default: statements                          // 非阻塞分支（可选）
 }
 ```
 
+**消歧规则**：
+
+- 左侧没有 `let` / `var` / `_` 的标识符模式，一律视为 **发送表达式**。
+- 左侧写 `let pattern`、`var pattern` 或 `_`，一律视为 **接收绑定**。
+- `case <- channel` 视为 `case _ <- channel` 的简写，仅接收并丢弃。
+- `default` 不带 `case`，使 `select` 非阻塞。
+
 **详细规则**：
 
-1. **发送分支**：`case value <- channel` 尝试将 `value` 发送到 `channel`。如果通道可写（有缓冲区空间或接收方等待），则执行该分支并发送。
-2. **接收分支**：`case let recv <- channel` 尝试从 `channel` 接收一个值。如果通道非空或有发送方等待，则执行该分支并将接收到的值绑定到 `recv`（可指定变量名）。
+1. **发送分支**：`case <expr> <- <channel>` 将 **左侧表达式** 求值后 **发送** 到 **右侧的** `channel`。如果通道可写（有缓冲区空间或接收方等待），则执行该分支并发送。左侧必须是可求值的表达式（字面量、变量、调用等），**不是** 绑定模式。
+2. **接收分支**：`case let <pattern> <- <channel>` 从 **右侧的** `channel` **接收** 一个值，并绑定到 **左侧的** `pattern`。也可写为 `case _ <- <channel>` 仅等待通道就绪而不绑定值。如果通道非空或有发送方等待，则执行该分支。
 3. **`default` 分支**：如果没有任何其他分支可以立即执行（即所有通道操作都会阻塞），则执行 `default` 分支。**`default` 分支使 `select` 变为非阻塞**。`default` 分支是可选的，若未提供且所有分支均阻塞，则 `select` 会挂起等待第一个就绪的分支。
 4. **公平性**：当多个分支同时就绪时，`select` **随机选择** 其中一个执行，以避免饥饿。不保证严格轮询。
 5. **超时模拟**：可通过结合 `default` 与手动循环实现超时，或使用 `after` 通道（见示例）。
@@ -800,15 +952,15 @@ case default: statements                // 非阻塞分支（可选）
 ```swift
 // 阻塞等待第一个就绪的通道
 select {
-case msg <- ch1:
+case let msg <- ch1:
     print("从 ch1 收到: \(msg)")
-case ch2 <- 42:
+case 42 <- ch2:
     print("向 ch2 发送 42 成功")
 }
 
 // 非阻塞尝试
 select {
-case msg <- ch1:
+case let msg <- ch1:
     print(msg)
 default:
     print("没有立即可用的操作")
@@ -817,24 +969,30 @@ default:
 // 超时模式（使用 after 通道）
 let timeout = Channel<Bool>(capacity: 1)
 Task {
-    await Task.sleep(5.seconds)
+    await Task.sleep(.seconds(5))
     await timeout.send(true)
 }
 select {
-case data <- dataChannel:
+case let data <- dataChannel:
     process(data)
-case <-timeout:
+case _ <- timeout:
     print("操作超时")
 }
 ```
 
-**注意**：`select` 语句必须在 `async` 上下文中使用，因为通道操作可能挂起。`default` 分支中的代码不会挂起，因此即使不在 `async` 函数中也可使用（但 `select` 整体仍要求异步环境，除非所有分支均非阻塞——目前不支持混合）。
+**注意**：当前版本的 `select` **只能在 `async` 上下文中使用**（因为通道的发送/接收可能挂起当前任务）。`default` 分支本身不挂起，但 **不会放宽这一环境要求**——即使所有分支都非阻塞，`select` 仍须处于 `async` 函数内。
 
+**同步 `select` 的路线图**：
 
+- 当前版本 `select` 只能在 `async` 上下文中使用，即使所有分支都带 `default`。
+- 未来版本将提供 `selectSync { ... }`，要求所有分支非阻塞且必须带 `default`，可在普通函数中使用。
+- `selectSync` 与 `select` 共享分支语法，但编译器会静态检查所有分支均不挂起。
+- 在此之前，普通函数中需要非阻塞通道操作时，请使用 `tryReceive` / `trySend` 等单通道原语。
 
 ### 7.6 原子操作与锁
 
 标准库提供：
+
 - `Atomic<T>`（整数/指针特化）
 - `Mutex`, `RWLock`, `Semaphore`, `Condition`
 - `DispatchQueue`（串行/并行队列）
@@ -846,6 +1004,7 @@ case <-timeout:
 ### 8.1 指针与内存操作
 
 参见 6.5。额外提供：
+
 - `MemoryLayout<T>` 查询大小、对齐、步幅
 - 未初始化内存：`UnsafeMutableBufferPointer.allocate(count: type:)`
 
@@ -862,6 +1021,7 @@ unsafe {
 语法与 LLVM 内联汇编兼容，使用 `asm` 关键字，必须在 `unsafe` 块内。
 
 **支持的约束**：
+
 - `r`：任意寄存器
 - `m`：内存操作数
 - `i`：立即数
@@ -886,6 +1046,7 @@ let sinFunc = lib.lookup("sin") as (@convention(c) (Double) -> Double)?
 ### 8.5 系统调用封装
 
 标准库 `sys` 模块直接暴露主要操作系统原语：
+
 - 进程管理：`fork`, `exec`, `waitpid`
 - 线程：`pthread_create` 等（但推荐高层抽象）
 - 文件 I/O：`open`, `read`, `write`, `ioctl`
@@ -896,6 +1057,7 @@ let sinFunc = lib.lookup("sin") as (@convention(c) (Double) -> Double)?
 `sys` 模块中的函数是直接系统调用的薄封装，不进行额外的错误检查（除了映射 `errno` 到 `SystemError`）。
 
 **错误映射**：系统调用失败时，抛出 `SystemError`，其中包含：
+
 - `code: Int32`（原始 `errno` 值）
 - `message: String`（通过 `strerror` 获得的描述）
 - 可通过 `static func fromErrno() -> SystemError` 获取当前错误。
@@ -911,6 +1073,7 @@ do {
 ### 8.6 unsafe 块的规则
 
 `unsafe` 块用于声明该区域包含编译器无法保证安全的操作。在 `unsafe` 块之外，以下操作被禁止：
+
 - 直接使用 `UnsafePointer`、`UnsafeMutablePointer` 等非托管指针类型（除非是通过 `&` 自动生成的临时指针）。
 - 调用任何标记为 `@_unsafe` 的函数。
 - 内联汇编（`asm`）。
@@ -921,24 +1084,45 @@ do {
 ### 8.7 裸机支持
 
 通过 `--target bare-metal` 编译选项，可禁用标准库，仅使用 `core` 模块。`core` 模块提供：
+
 - 基本类型（`Int`, `UInt`, `Bool`, `Char`, 指针类型）
-- `core::panic_handler`：用户必须提供一个 `#[panic_handler]` 函数，签名 `fn(&PanicInfo) -> !`。
-- `core::alloc::GlobalAlloc`：若使用分配器，用户需实现 `#[global_allocator]`。
-- 启动入口：用户必须提供 `_start` 符号（通常用汇编或 `#[no_mangle] extern "C" fn _start()` 定义）。
+- `Never`：无值类型，表示永不返回。`core` 模块必须提供 `Never`，供 `@panic_handler`、`_start`、`loop` 表达式等使用。
+- `PanicInfo`：panic 处理函数的参数类型，`core` 模块必须提供。
+- `core::panic_handler`：用户必须提供一个 **`@panic_handler`** 标注的函数，签名 `func panic(info: PanicInfo) -> Never`。
+- `core::alloc::GlobalAlloc`：若使用分配器，用户需实现 **`@global_allocator`** 标注的全局分配器类型（遵守 `GlobalAlloc` 协议）。
+- 启动入口：用户必须提供 `_start` 符号，用 **`@no_mangle public func _start() -> Never`** 定义（裸机下不使用 `extern`，因为入口是被引导器直接跳转、而非被外部按 C ABI 调用）。
+
+**`Never` 规则**：
+
+- `Never` 是空枚举，等价于 `enum Never {}`。
+- `Never` 是所有类型的子类型（bottom type），可出现在任何需要返回值的上下文中。
+- 在裸机下，`Never` 由 `core` 提供；在标准库下，`Never` 由 `Core` 模块提供。
+
+SukiCode 统一采用 **`@` 风格属性**，不使用 Rust 的 `#[...]` 写法。裸机相关属性一览：
+
+| 属性 | 作用 |
+|------|------|
+| `@no_mangle` | 禁止名称改写，保留给定符号名（用于 `_start`、C 可链接符号） |
+| `@panic_handler` | 标记 panic 处理函数（签名 `func panic(info: PanicInfo) -> Never`） |
+| `@global_allocator` | 标记全局分配器类型（遵守 `GlobalAlloc` 协议） |
 
 示例最小的裸机程序：
 
 ```swift
 // 裸机程序，无标准库
 @no_mangle
-public extern func _start() -> Never {
+public func _start() -> Never {
     // 直接操作硬件或调用核心功能
-    loop {}
+    loop {
+        // ...
+    }
 }
 
 @panic_handler
 func panic(info: PanicInfo) -> Never {
-    loop {}
+    loop {
+        // ...
+    }
 }
 ```
 
@@ -1021,6 +1205,7 @@ extension FileError: CustomStringConvertible {
 支持自定义编译标志：`-D FLAG` 或 `-D LEVEL=5`。在代码中可以使用 `#if LEVEL == 5` 进行条件编译。
 
 支持的预定义条件：
+
 - 操作系统：`os(Linux)`, `os(macOS)`, `os(Windows)`, `os(iOS)`, `os(Android)`, `os(FreeBSD)` 等。
 - 架构：`arch(x86_64)`, `arch(arm64)`, `arch(arm)`, `arch(riscv64)`。
 - 编译器版本：`suki(>=1.0)`。
@@ -1173,16 +1358,20 @@ package {
 }
 ```
 
+> **`.sukiproj` 与 `.sukipkg` 的关系**：`.sukiproj` 是构建系统**唯一消费**的权威项目清单；`.sukipkg` 只是分布式 Git 模式下的轻量**注册描述符**，用于在缺少中心索引时辅助发现与版本策略声明。二者可共存；若并存，**以 `.sukiproj` 为准**。`.sukipkg` 可由 `.sukiproj` 自动生成，不应手工维护两套互相矛盾的元信息。
+
 **版本标签规范**：版本号必须使用语义化版本标签，支持 `v1.0.0` 或 `1.0.0` 两种格式，工具自动识别。推荐使用 `v` 前缀。
 
 #### 11.7.3 私有注册表认证与安全性
 
 私有注册表服务支持多种 GitHub 认证方式：
+
 - **GitHub OAuth App**：适用于公共组织的包管理。
 - **Personal Access Token (PAT)**：适用于个人或自动化流水线。
 - **GitHub App**：适用于企业级统一管理，可精细控制仓库访问权限。
 
 Token 存储位置：
+
 - macOS：系统密钥链（Keychain）
 - Windows：凭据管理器（Credential Manager）
 - Linux：加密的本地文件 `~/.config/sukipm/tokens.json`（文件权限 600）
@@ -1196,23 +1385,47 @@ Token 存储位置：
 dependencies: {
     // 模式一：集中式注册表索引——从默认公共注册表拉取
     "Alamofire": .version("5.0.0"..."5.9.0"),
-    
+
     // 模式一：私有注册表——明确指定注册表
     "InternalLib": .registry("my-company", .exact("2.1.0")),
-    
+
     // 模式二：分布式 Git 仓库——直接以 Git 仓库为源
-    "MyUtils": .git(url: "https://github.com/myorg/MyUtils.git", from: "1.0.0"),
-    
-    // 模式二：约定式推断（自动解析为 github.com/myorg/MyUtils）
-    "MyUtils": .infer(from: "myorg/MyUtils", tag: "v1.0.0")
+    "MyUtilsGit": .git(url: "https://github.com/myorg/MyUtils.git", from: "1.0.0"),
+
+    // 模式二：约定式推断（自动解析为 github.com/myorg/MyUtilsInfer）
+    "MyUtilsInfer": .infer(from: "myorg/MyUtilsInfer", tag: "v1.0.0")
 }
 ```
+
+> 同一依赖键在同一个 `dependencies` 块中只能出现一次；不同模式用不同键名展示。实际项目中按需选择其中一种模式。
 
 ---
 
 ## 12. 标准库概览
 
-标准库设计为跨平台，提供现代 OS 所需的大部分功能。主要模块：
+标准库设计为跨平台，提供现代 OS 所需的大部分功能。
+
+### 标准库 1.0 范围
+
+SukiCode 1.0 的标准库分为两层：
+
+**核心必备（1.0 必须交付）**：
+
+- `Core`：基本类型、集合、可选、`Result`、`Range`、打印、断言、数字运算、随机数。
+- `System`：进程、环境变量、路径、文件系统、时间、OS 信息。
+- `Concurrency`：`ThreadPool`、`Task`、`TaskGroup`、`Actor`、`Future`、`Channel`、`ChannelPool`、`Atomic`、`Mutex`、`Semaphore`。
+- `Data`：`Data`、Base64、Hex、GZip、Zlib。
+- `Test`：`expect`、`assertEqual`、`assertThrows`、`measure`。
+
+**后续扩展（1.x 逐步交付）**：
+
+- `Network`：`URLSession`、WebSocket、Socket、DNS、TLS、`JSONEncoder/Decoder`、XML、CSV、MessagePack。
+- `Crypto`：SHA256、MD5、HMAC、AES、ChaCha20、RSA、Ed25519、证书与密钥管理。
+- `I18n`：字符串本地化、数字/日期/货币格式化、Unicode 正规化、字形簇工具。
+- `CLI`：`ArgumentParser`、彩色输出、进度条。
+- `SukiUI`：可选包，不内置核心标准库。
+
+主要模块详述：
 
 ### 12.1 核心 (`Core`)
 
@@ -1260,6 +1473,7 @@ dependencies: {
 - 字符串本地化（`.strings` 文件）
 - 数字、日期、货币格式化
 - Unicode 正规化
+- 字形簇工具（`GraphemeBreaker`）
 
 ### 12.8 测试 (`Test`)
 
@@ -1332,6 +1546,7 @@ extern "C" func printf(fmt: UnsafePointer<Int8>, ...) -> Int32
 #### 13.1.4 调用约定
 
 默认调用约定为 `"C"`。支持的调用约定：
+
 - `"C"` — C 调用约定（默认）
 - `"stdcall"` — Windows stdcall 调用约定
 
@@ -1348,54 +1563,66 @@ Objective-C 的方法调用本质上是调用运行时库（`libobjc`）的函�
 编译器自动预声明以下 ObjC 运行时函数，用户无需手动声明：
 
 ```swift
+typealias Selector = OpaquePointer
+
 // 消息发送
-extern "C" func objc_msgSend(self: UnsafeMutablePointer<Void>, _cmd: UnsafeMutablePointer<Void>, ...) -> UnsafeMutablePointer<Void>
-extern "C" func objc_msgSend_stret(self: UnsafeMutablePointer<Void>, _cmd: UnsafeMutablePointer<Void>, ...)
+extern "C" func objc_msgSend(self: AnyObject, _cmd: Selector, ...) -> AnyObject
+extern "C" func objc_msgSend_stret(self: AnyObject, _cmd: Selector, ...)
 
 // 选择器
-extern "C" func sel_registerName(name: UnsafePointer<Int8>) -> UnsafeMutablePointer<Void>
+extern "C" func sel_registerName(name: UnsafePointer<Int8>) -> Selector
 
 // 类
-extern "C" func objc_getClass(name: UnsafePointer<Int8>) -> UnsafeMutablePointer<Void>
-extern "C" func objc_getProtocol(name: UnsafePointer<Int8>) -> UnsafeMutablePointer<Void>
+extern "C" func objc_getClass(name: UnsafePointer<Int8>) -> AnyObject
+extern "C" func objc_getProtocol(name: UnsafePointer<Int8>) -> AnyObject
 
 // 引用计数
-extern "C" func objc_retain(obj: UnsafeMutablePointer<Void>) -> UnsafeMutablePointer<Void>
-extern "C" func objc_release(obj: UnsafeMutablePointer<Void>)
-extern "C" func objc_storeStrong(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>, obj: UnsafeMutablePointer<Void>)
+extern "C" func objc_retain(obj: AnyObject) -> AnyObject
+extern "C" func objc_release(obj: AnyObject)
+extern "C" func objc_storeStrong(location: UnsafeMutablePointer<AnyObject?>, obj: AnyObject?)
 
 // 弱引用
-extern "C" func objc_initWeak(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>, obj: UnsafeMutablePointer<Void>)
-extern "C" func objc_loadWeakRetained(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>) -> UnsafeMutablePointer<Void>
-extern "C" func objc_destroyWeak(location: UnsafeMutablePointer<UnsafeMutablePointer<Void>>)
+extern "C" func objc_initWeak(location: UnsafeMutablePointer<AnyObject?>, obj: AnyObject?)
+extern "C" func objc_loadWeakRetained(location: UnsafeMutablePointer<AnyObject?>) -> AnyObject?
+extern "C" func objc_destroyWeak(location: UnsafeMutablePointer<AnyObject?>)
 
 // 类操作
-extern "C" func class_getMethodImplementation(cls: UnsafeMutablePointer<Void>, name: UnsafeMutablePointer<Void>) -> UnsafeMutablePointer<Void>
-extern "C" func class_addMethod(cls: UnsafeMutablePointer<Void>, name: UnsafeMutablePointer<Void>, imp: UnsafeMutablePointer<Void>, types: UnsafePointer<Int8>) -> Bool
-extern "C" func objc_allocateClassPair(superclass: UnsafeMutablePointer<Void>, name: UnsafePointer<Int8>, extraBytes: UInt64) -> UnsafeMutablePointer<Void>
-extern "C" func objc_registerClassPair(cls: UnsafeMutablePointer<Void>)
+extern "C" func class_getMethodImplementation(cls: AnyObject, name: Selector) -> OpaquePointer?
+extern "C" func class_addMethod(cls: AnyObject, name: Selector, imp: OpaquePointer, types: UnsafePointer<Int8>) -> Bool
+extern "C" func objc_allocateClassPair(superclass: AnyObject, name: UnsafePointer<Int8>, extraBytes: UInt64) -> AnyObject?
+extern "C" func objc_registerClassPair(cls: AnyObject)
 ```
 
 #### 13.2.2 调用 ObjC 方法
 
-通过 `objc_msgSend` 调用 ObjC 方法：
+通过 **类型化函数指针** 调用，避免可变参数 `objc_msgSend` 在 64 位下的 ABI 问题：
 
 ```swift
-// 获取 NSString 类
-let nsStringClass = objc_getClass("NSString")
+unsafe {
+    typealias MsgSend1Ptr = @convention(c) (AnyObject, Selector, UnsafePointer<Int8>) -> AnyObject
+    typealias MsgSend0 = @convention(c) (AnyObject, Selector) -> AnyObject
 
-// 注册选择器
-let sel = sel_registerName("stringWithUTF8String:")
+    let nsStringClass = objc_getClass("NSString")
+    let sel = sel_registerName("stringWithUTF8String:")
 
-// 调用类方法
-let str = objc_msgSend(nsStringClass, sel, "Hello, ObjC!")
+    let send1 = unsafeBitCast(objc_msgSend, to: MsgSend1Ptr.self)
+    let str = send1(nsStringClass, sel, "Hello, ObjC!")
 
-// 注册实例方法选择器
-let lengthSel = sel_registerName("length")
-
-// 调用实例方法
-let length = objc_msgSend(str, lengthSel)
+    let lengthSel = sel_registerName("length")
+    let send0 = unsafeBitCast(objc_msgSend, to: MsgSend0.self)
+    let length = send0(str, lengthSel) as! Int
+}
 ```
+
+**字符串桥接规则**：`"Hello, ObjC!"` 是字符串字面量，在参数类型恰好为 `UnsafePointer<Int8>` 时隐式桥接为 NUL 结尾的 UTF-8 指针。运行期 `String` 变量不会自动桥接，须显式 `withCString` 或 `s.cString`。
+
+**补充标准库原语**：
+
+```swift
+func unsafeBitCast<T, U>(_ value: T, to type: U.Type) -> U
+```
+
+`unsafeBitCast` 必须在 `unsafe` 块中调用，语义与 Swift 相同：按位重新解释类型，不做检查。
 
 #### 13.2.3 ARC 管理
 
@@ -1406,18 +1633,22 @@ SukiCode 的 ARC 运行时自动管理 ObjC 对象的引用计数。`weak`/`unow
 `#selector` 语法用于创建方法选择器：
 
 ```swift
-let sel = #selector(myMethod)
+let sel = #selector(myMethod(_:))
 // 等价于
-let sel = sel_registerName("myMethod")
+let sel = sel_registerName("myMethod:")
 ```
+
+选择器名必须包含参数标签对应的冒号；无参数方法则无冒号。
 
 ### 13.3 导出 SukiCode 给 C 使用
 
 通过 `@_cdecl("exported_function")` 导出 **自由函数**（不能是结构体/类的方法），使其可从 C 调用。导出的函数使用 C 调用约定，参数和返回值必须是 C 兼容的类型（基本类型、指针、`OpaquePointer`）。
 
+> **重要**：SukiCode 的 `Int` / `UInt` 是 **平台字长**（64 位平台为 64 位），**不等于** C 的 `int`（通常 32 位）。与 C 互操作必须使用定宽类型 `Int8`/`Int16`/`Int32`/`Int64`、`UInt8`/…/`UInt64`、`Float`、`Double`、指针与 `OpaquePointer`，否则在 64 位平台会出现 ABI 宽度不匹配。
+
 ```swift
 @_cdecl("add_numbers")
-public func addNumbers(a: Int, b: Int) -> Int {
+public func addNumbers(a: Int32, b: Int32) -> Int32 {
     return a + b
 }
 ```
@@ -1425,8 +1656,28 @@ public func addNumbers(a: Int, b: Int) -> Int {
 在 C 中声明为：
 
 ```c
-int add_numbers(int a, int b);
+int32_t add_numbers(int32_t a, int32_t b);
 ```
+
+#### SukiCode ↔ C 类型映射表
+
+| SukiCode 类型 | C 类型 | 备注 |
+|---------------|--------|------|
+| `Int8` | `int8_t` | 定宽，一一对应 |
+| `Int16` | `int16_t` |  |
+| `Int32` | `int32_t` | 常用作 C `int` 的精确对应 |
+| `Int64` | `int64_t` |  |
+| `UInt8` | `uint8_t` |  |
+| `UInt16` / `UInt32` / `UInt64` | `uint16_t` / `uint32_t` / `uint64_t` |  |
+| `Int` / `UInt` | （无直接对应） | **平台字长**，不要当 C `int` 用 |
+| `Float` | `float` | 32 位 IEEE 754 |
+| `Double` | `double` | 64 位 IEEE 754 |
+| `Bool` | `bool` / `_Bool` | 建议 C 侧用 `bool`（1 字节） |
+| `Char` | （无对应） | SukiCode `Char` 是 21 位 Unicode 标量，**不是** C `char`，不可直接互传 |
+| `UnsafePointer<T>` / `UnsafeMutablePointer<T>` | `T*` | 指针，需 `unsafe` 上下文 |
+| `OpaquePointer` | `void*` | 不透明指针 |
+| `Void` | `void` | 仅作返回类型 |
+| C 兼容结构体 / `@enum(C)` 枚举 | 对应 C `struct` / 联合体 | 内存布局须一致（见 §2.3、§6.5） |
 
 ### 13.4 链接
 
@@ -1452,6 +1703,23 @@ SukiCode 的 C/ObjC 互操作遵循以下设计原则：
 3. **链接器负责解析**：编译器生成对外部符号的引用，链接器负责连接实现。
 4. **零运行时开销**：extern 函数调用与 C 函数调用完全相同，没有额外的包装层。
 5. **类型安全**：extern 声明的参数类型在编译时检查，确保类型安全。
+
+### 13.6 函数值的调用约定：`@convention(c)` / `@convention(stdcall)`
+
+`extern "C" {...}`（§13.1）解决的是 **外部函数声明** 的调用约定；而当需要把「**函数类型的值**」（闭包、函数指针）按某种 C 调用约定传给 C API（如 `qsort` 的比较回调、`lib.lookup("sin")` 取出的函数指针）时，用 `@convention` 属性标注该 **函数类型本身**：
+
+```swift
+// 标注该函数类型的值使用 C 调用约定（而非 SukiCode 默认的 Swift 风格快传约定）
+let sinFunc = lib.lookup("sin") as (@convention(c) (Double) -> Double)?
+
+// Windows stdcall 回调
+typealias WndProc = @convention(stdcall) (IntPtr, UInt32, UInt64, UInt64) -> Int64
+```
+
+- `@convention(c)`：值按 C 调用约定传递（平台默认，如 System V AMD64 / cdecl / arm64 AAPCS）。
+- `@convention(stdcall)`：值按 Windows `stdcall` 约定传递（x86 上由被调用方清理栈）。
+- 带 `@convention` 的函数值可安全传给 `UnsafePointer` 风格的 C 回调参数，或在 `unsafe` 块中通过 `withUnsafeFunctionPointer` 拿到裸函数指针。
+- 它与 §13.1 的 `extern "C"` / `extern "stdcall"` 声明层面约定、**§13.3 的 `@_cdecl` 导出** 共同构成完整的 C ABI 映射：声明用 `extern`、导出用 `@_cdecl`、函数类型的值用 `@convention`。
 
 ---
 
@@ -1651,7 +1919,9 @@ MyApp/
 
 ### 15.5 为何 ObjC 消息语法是可选特性？
 
-为了兼容现有 Objective-C 代码库，但为了避免鼓励非必要的消息发送风格（与现代面向对象语言习惯不同），默认推荐点语法。消息语法只在显式导入 ObjC 头文件后可用，且优先级低于点语法，以保持代码风格统一。
+为了兼容现有 Objective-C 代码库，但为了避免鼓励非必要的消息发送风格（与现代面向对象语言习惯不同），默认推荐点语法。
+
+**当前状态（重要）**：ObjC 消息语法（方括号 / `obj message:args` 式消息发送）属于 **预留的可选特性**，且 **当前规范尚未正式定义、编译器也未实现**。现阶段与 Objective-C 互操作的唯一途径是通过 §13.2 的 `objc_msgSend` 等运行时函数做 **手动互操作**。未来若正式定义该语法，它将只在显式导入 ObjC 模块后可用，且优先级 **低于** 点语法，以保持代码风格统一。
 
 ### 15.6 为何 `String` 的 `Char` 定义为 Unicode 标量而非字形簇？
 
@@ -1659,7 +1929,7 @@ MyApp/
 - **C 互操作性**：多数 C 字符串 API 处理的是标量（或 UTF-8 码元）。
 - **确定性**：字形簇的边界依赖 Unicode 版本，跨平台行为可能不同。
 
-如果需要处理字形簇，可以使用 `String.characters` 视图（实际是由标量序列组成，但会做边界检测）。
+如果需要处理字形簇，可以使用 `I18n` 模块中的 `GraphemeBreaker` 工具。
 
 ### 15.7 为何没有内置的异步 HTTP 客户端？
 

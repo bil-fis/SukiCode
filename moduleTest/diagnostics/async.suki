@@ -1,0 +1,9 @@
+// async 负例（规范 7.2）：`await` 只能作用于「async 调用」或「暂存的 Future 句柄」，
+// 作用于普通（非 async）调用应报错。
+func compute() -> Int {
+    return 42
+}
+func main() {
+    let x = await compute()
+    print(x)
+}

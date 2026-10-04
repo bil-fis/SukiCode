@@ -1,0 +1,8 @@
+// 泛型 where 子句负例（规范 2.1）：类型不满足 where 约束应报错。
+protocol Equatable {}
+struct S {}
+func id<T>(x: T) -> T where T: Equatable { return x }
+func main() {
+    let s = S()
+    let r = id(s)   // 期望 error: S 不遵循 Equatable
+}

@@ -1,0 +1,13 @@
+/// SukiCode standard library — `system` module.
+///
+/// Low-level system interfaces. The `MMapRegion`, `DynamicLibrary` and `sys`
+/// APIs are filled in by the system-programming work (todo S3). For now this
+/// module provides the error type used by system calls.
+
+module system
+
+/// Error returned by system calls; `code` is the raw `errno` value.
+struct SystemError {
+    var code: Int
+    var message: String
+}

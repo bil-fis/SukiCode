@@ -1,0 +1,12 @@
+/// SukiCode standard library — `objc` module.
+///
+/// NOTE: Objective-C message syntax is a *reserved optional feature* and is not
+/// yet defined or implemented (see specification §15.5). The only supported
+/// interop path today is manual `objc_msgSend` binding, which is wired up by the
+/// ObjC interop work (todo E5). This module currently only declares the marker
+/// protocol.
+
+module objc
+
+/// Marker protocol for types backed by an Objective-C object.
+protocol ObjCObject {}

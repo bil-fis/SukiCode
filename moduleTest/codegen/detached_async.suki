@@ -1,0 +1,39 @@
+// detached 任务 + 原子/锁（规范 7.2 / 7.3 / 7.6）：先同时发起多个 async 任务再分批
+// await，实现真实并行；内置 atomicAdd / 自旋锁 mutex 保证并发竞争下共享变量正确。
+var counter: Int = 0
+var mu: Int = 0
+
+async func workerAtomic() -> Int {
+    var i = 0
+    while i < 50000 {
+        atomicAdd(&counter, 1)
+        i = i + 1
+    }
+    return 0
+}
+
+async func workerMutex() -> Int {
+    var i = 0
+    while i < 50000 {
+        mutexLock(&mu)
+        counter = counter + 1
+        mutexUnlock(&mu)
+        i = i + 1
+    }
+    return 0
+}
+
+func main() {
+    // 真实并行：两个工作线程在 await 之前已同时启动。
+    let f1 = workerAtomic()
+    let f2 = workerAtomic()
+    let r1 = await f1
+    let r2 = await f2
+    print(counter)
+    counter = 0
+    let g1 = workerMutex()
+    let g2 = workerMutex()
+    let s1 = await g1
+    let s2 = await g2
+    print(counter)
+}
