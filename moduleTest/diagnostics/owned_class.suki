@@ -1,0 +1,2 @@
+class C {}
+struct S { var x: Owned<C> = Owned<C>() }

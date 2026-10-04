@@ -7,6 +7,34 @@ namespace suki {
 
 static SourceRange rangeOf(Node* n) { return n ? n->range : SourceRange{}; }
 
+// 访问控制级别推导（规范 10.1）：修饰符按出现顺序生效，后者覆盖前者；
+// 未标注默认 Internal。
+static AccessLevel accessLevelFromModifiers(const std::vector<std::string>& mods) {
+    AccessLevel lvl = AccessLevel::Internal;
+    for (const auto& m : mods) {
+        if (m == "public" || m == "open") lvl = AccessLevel::Public;
+        else if (m == "private") lvl = AccessLevel::Private;
+        else if (m == "fileprivate") lvl = AccessLevel::Fileprivate;
+        else if (m == "internal") lvl = AccessLevel::Internal;
+    }
+    return lvl;
+}
+
+// 从 Decl 节点取出其修饰符向量（用于推导成员访问级别）。
+static std::vector<std::string> nodeModifiers(Node* m) {
+    if (!m) return {};
+    switch (m->kind) {
+        case NodeKind::VarDecl: return static_cast<VarDecl*>(m)->modifiers;
+        case NodeKind::FunctionDecl: return static_cast<FunctionDecl*>(m)->modifiers;
+        case NodeKind::InitDecl: return static_cast<InitDecl*>(m)->modifiers;
+        case NodeKind::SubscriptDecl: return static_cast<SubscriptDecl*>(m)->modifiers;
+        case NodeKind::EnumCaseDecl: return static_cast<EnumCaseDecl*>(m)->modifiers;
+        case NodeKind::TypealiasDecl: return static_cast<TypealiasDecl*>(m)->modifiers;
+        case NodeKind::AssociatedTypeDecl: return static_cast<AssociatedTypeDecl*>(m)->modifiers;
+        default: return {};
+    }
+}
+
 
 // Check each recorded generic instantiation with its type arguments bound.
 void Sema::monomorphise(const NodeList& decls) {
@@ -238,6 +266,8 @@ void Sema::analyze(const NodeList& decls) {
     mergeDefaultImplementations();
     // 继承校验（规范 4.3）：override / final 语义，需在成员收集完成后进行。
     checkOverrides();
+    // 构造器规则（规范 4.4）：required / convenience 语义。
+    checkInitRules();
 
     // Pass 4: collect global functions and variables.
     for (auto& d : decls) {
@@ -374,6 +404,95 @@ void Sema::checkConformances() {
     }
 }
 
+void Sema::checkMemberAccess(const TypeRecord* owner, const TypeRecord::Member* m, Node* at) {
+    (void)owner;
+    if (!m) return;
+    // 规范 10.1：`private` 成员仅当 currentType_ 等于其所属类型时可见；
+    // `fileprivate`/`internal`/`public` 在当前单模块模型下均可见。
+    if (m->access == AccessLevel::Private && currentType_ != m->owner) {
+        hadError_ = true;
+        diags_.reportError("'" + m->name + "' is private and cannot be accessed from here",
+                           rangeOf(at));
+    }
+}
+
+void Sema::checkInitRules() {
+    // 规范 4.4：required / convenience 构造器的语义校验。
+    struct InitInfo { std::string sig; bool required; bool convenience; Node* decl; };
+    std::unordered_map<const TypeRecord*, std::vector<InitInfo>> inits;
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl || rec->kind != TypeDeclKind::Class) continue;
+        for (auto& m : rec->members) {
+            if (m.name != "init" || !m.isFunction || !m.decl ||
+                m.decl->kind != NodeKind::InitDecl) continue;
+            auto* id = static_cast<InitDecl*>(m.decl);
+            std::string sig;
+            if (m.type) for (size_t i = 0; i < m.type->elements.size(); ++i) {
+                if (i) sig += ":";
+                sig += typeToString(m.type->elements[i]);
+            }
+            inits[rec].push_back({sig, id->isRequired, id->isConvenience, m.decl});
+        }
+    }
+    // 某个类可见的 required 签名 = 自身 + 所有父类的 required 签名。
+    auto requiredSigs = [&](const TypeRecord* rec) {
+        std::unordered_set<std::string> s;
+        for (const TypeRecord* r = rec; r; r = r->superclass) {
+            auto it = inits.find(r);
+            if (it == inits.end()) continue;
+            for (auto& ii : it->second) if (ii.required) s.insert(ii.sig);
+        }
+        return s;
+    };
+    // 规则 A：每个子类必须重新声明父类链中所有 required 构造器。
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl || rec->kind != TypeDeclKind::Class || !rec->superclass) continue;
+        std::unordered_set<std::string> req = requiredSigs(rec->superclass);
+        if (req.empty()) continue;
+        auto it = inits.find(rec);
+        std::unordered_set<std::string> own;
+        if (it != inits.end()) for (auto& ii : it->second) if (ii.required) own.insert(ii.sig);
+        for (auto& sig : req)
+            if (own.find(sig) == own.end()) {
+                hadError_ = true;
+                diags_.reportError("class '" + rec->name +
+                    "' must provide a 'required' initializer matching '" + sig + "'",
+                    rangeOf(rec->decl));
+            }
+    }
+    // 规则 B：convenience 构造器必须通过 `self.init(...)` 委派给另一构造器。
+    for (auto& kv : inits) {
+        for (auto& ii : kv.second) {
+            if (!ii.convenience) continue;
+            auto* id = static_cast<InitDecl*>(ii.decl);
+            if (id->body.empty()) continue;
+            Node* first = id->body.front().get();
+            if (first && first->kind == NodeKind::ExprStmt)
+                first = static_cast<ExprStmt*>(first)->expr.get();
+            bool delegates = false;
+            if (first && first->kind == NodeKind::CallExpr) {
+                auto* c = static_cast<CallExpr*>(first);
+                if (c->callee && c->callee->kind == NodeKind::MemberExpr) {
+                    auto* me = static_cast<MemberExpr*>(c->callee.get());
+                    if (me->member == "init" && me->base && me->base->kind == NodeKind::IdentExpr &&
+                        static_cast<IdentExpr*>(me->base.get())->name == "self")
+                        delegates = true;
+                } else if (c->callee && c->callee->kind == NodeKind::IdentExpr &&
+                           static_cast<IdentExpr*>(c->callee.get())->name == "init") {
+                    delegates = true;
+                }
+            }
+            if (!delegates) {
+                hadError_ = true;
+                diags_.reportError("convenience initializer must delegate to another "
+                                   "initializer via 'self.init(...)'", rangeOf(ii.decl));
+            }
+        }
+    }
+}
+
 // ─── Collection ────────────────────────────────────────────────────────────
 void Sema::registerBuiltins() {
     auto addFn = [&](const char* name, std::vector<const Type*> params, const Type* ret) {
@@ -449,6 +568,8 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
             if (vd->type) mem.type = resolveTypeRepr(vd->type.get(), &rec);
             else if (vd->initializer) mem.type = checkExpr(vd->initializer.get(), &rec);
             else mem.type = types_.unknownType();
+            mem.access = accessLevelFromModifiers(nodeModifiers(m));
+            mem.owner = &rec;
             rec.members.push_back(std::move(mem));
         }
     } else if (m->kind == NodeKind::FunctionDecl) {
@@ -480,8 +601,12 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
             // protocol so conforming types can inherit it; a pure requirement
             // (no body) is only a requirement to be satisfied elsewhere.
             fn->isDefaultImpl = !fn->body.empty();
+            mem.access = accessLevelFromModifiers(nodeModifiers(m));
+            mem.owner = &rec;
             rec.requirements.push_back(mem);
         } else {
+            mem.access = accessLevelFromModifiers(nodeModifiers(m));
+            mem.owner = &rec;
             rec.members.push_back(std::move(mem));
         }
     } else if (m->kind == NodeKind::InitDecl) {
@@ -779,6 +904,36 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
             if (auto bt = genericBindings_.find(name);
                 bt != genericBindings_.end() && bt->second)
                 return bt->second;
+            // `unsafe` 强制（规范 8.6）：裸指针/非托管类型仅可在 unsafe 块内使用。
+            if ((name == "UnsafePointer" || name == "UnsafeMutablePointer" ||
+                 name == "Unmanaged") && !unsafeContext_) {
+                diags_.reportError("'" + name +
+                    "' may only be used inside an 'unsafe' block", rangeOf(repr));
+            }
+
+            // `unsafe` 强制（规范 8.6）：裸指针/非托管类型仅可在 unsafe 块内使用。
+            if ((name == "UnsafePointer" || name == "UnsafeMutablePointer" ||
+                 name == "Unmanaged") && !unsafeContext_) {
+                diags_.reportError("'" + name +
+                    "' may only be used inside an 'unsafe' block", rangeOf(repr));
+            }
+
+            // Owned<T> / Unmanaged<T>：裸所有权包装（规范 6.4）。即便标准库未声明
+            // 也在此解析；并强制禁止 Owned<class>（与 ARC 多引用模型冲突）。
+            if (name == "Owned" || name == "Unmanaged") {
+                const Type* e = nt->genericArgs.empty()
+                    ? types_.unknownType()
+                    : resolveTypeRepr(nt->genericArgs[0].get(), context);
+                if (name == "Owned" && e && e->kind == TypeKind::Named && e->record &&
+                    (e->record->kind == TypeDeclKind::Class ||
+                     e->record->kind == TypeDeclKind::Actor)) {
+                    diags_.reportError("'Owned<class>' is not allowed; use a "
+                                       "reference type or 'Unmanaged' for class instances",
+                                       rangeOf(repr));
+                }
+                return types_.ref(RefKind::Owned, e);
+            }
+
             const TypeRecord* rec = findType(name);
             if (rec) {
                 std::vector<const Type*> args;
@@ -1644,9 +1799,14 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
         case NodeKind::DeferStmt:
             checkStatement(static_cast<DeferStmt*>(stmt)->body.get(), context, fnReturnType, isThrowing);
             break;
-        case NodeKind::UnsafeStmt:
+        case NodeKind::UnsafeStmt: {
+            // 进入 unsafe 上下文（规范 8.6）：裸指针/非托管类型在此可用。
+            bool savedUnsafe = unsafeContext_;
+            unsafeContext_ = true;
             checkStatements(static_cast<UnsafeStmt*>(stmt)->body, context, fnReturnType, isThrowing);
+            unsafeContext_ = savedUnsafe;
             break;
+        }
         case NodeKind::BreakStmt:
         case NodeKind::ContinueStmt:
             break;
@@ -2014,6 +2174,13 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                 diags_.reportError("tuple has no element '" + m->member + "'",
                                    rangeOf(e));
                 return types_.unknownType();
+            }
+            // 访问控制（规范 10.1）：private 成员仅在本类型内可访问。
+            if (base && base->kind == TypeKind::Named && base->record) {
+                if (const TypeRecord::Member* mm = lookupMember(base->record, m->member, false))
+                    checkMemberAccess(base->record, mm, e);
+                else if (const TypeRecord::Member* mm = lookupMethod(base->record, m->member, 0))
+                    checkMemberAccess(base->record, mm, e);
             }
             const Type* mt = resolveMemberType(base, m->member, e, context);
             if (m->optionalChain) return types_.optional(mt);

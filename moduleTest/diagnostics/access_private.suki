@@ -1,0 +1,2 @@
+struct Foo { private var secret: Int = 1 }
+func main() { let f = Foo(); let x = f.secret }

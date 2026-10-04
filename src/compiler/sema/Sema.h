@@ -46,6 +46,10 @@ struct TypeRecord {
         Node* decl = nullptr;
         bool isLet = false;
         bool isStatic = false;
+        // 访问控制级别与成员所属类型（规范 10.1）。`owner` 指向包含本成员的
+        // TypeRecord；`private` 成员仅当 currentType_ 等于 owner 时可见。
+        AccessLevel access = AccessLevel::Internal;
+        const TypeRecord* owner = nullptr;
     };
     std::vector<Member> members;
     // Enum cases (name → associated value types).
@@ -126,6 +130,11 @@ private:
     // met by a matching member on the type (or a superclass); protocol
     // requirements that carry a default implementation are exempt.
     void checkConformances();
+
+    // 校验 required/convenience 构造器语义（规范 4.4）。
+    void checkInitRules();
+    // 成员访问的访问控制检查（规范 10.1）：`private` 成员仅在本类型内可见。
+    void checkMemberAccess(const TypeRecord* owner, const TypeRecord::Member* m, Node* at);
 
     // ── type resolution (TypeRepr → semantic Type) ──────────────────────────
     const Type* resolveTypeRepr(Node* repr, const TypeRecord* context);
@@ -222,6 +231,8 @@ private:
     // is only allowed there.
     bool inCaseBody_ = false;
     bool hadError_ = false;
+    // 进入 `unsafe` 块时置位（规范 8.6）：裸指针/非托管类型仅在此上下文可用。
+    bool unsafeContext_ = false;
     // Current generic parameter names in scope (for constraints / type names).
     std::vector<std::string> genericParams_;
     // Concrete type for each in-scope type parameter of the instantiation being

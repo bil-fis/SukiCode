@@ -1,0 +1,2 @@
+class Base { required init() {} }
+class Derived: Base {}

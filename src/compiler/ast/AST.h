@@ -21,6 +21,9 @@ using NodeList = std::vector<NodePtr>;
 // here preserves the layering: the front end does not depend on the analyser.
 struct Type;
 
+// 访问控制级别（规范 10.1）。未显式标注时默认为 Internal。
+enum class AccessLevel { Public, Internal, Fileprivate, Private };
+
 enum class NodeKind {
     // Declarations
     ModuleDecl, ImportDecl,
@@ -167,6 +170,7 @@ struct DeinitDecl : Node {
 
 struct SubscriptDecl : Node {
     SubscriptDecl() : Node(NodeKind::SubscriptDecl) {}
+    std::vector<std::string> modifiers;
     std::vector<Param> params;
     NodePtr elementType;
     NodeList getter;   // get { ... }
@@ -175,6 +179,7 @@ struct SubscriptDecl : Node {
 
 struct TypealiasDecl : Node {
     TypealiasDecl() : Node(NodeKind::TypealiasDecl) {}
+    std::vector<std::string> modifiers;
     std::string name;
     std::vector<std::string> genericParams;
     NodePtr underlying; // TypeRepr
@@ -182,6 +187,7 @@ struct TypealiasDecl : Node {
 
 struct EnumCaseDecl : Node {
     EnumCaseDecl() : Node(NodeKind::EnumCaseDecl) {}
+    std::vector<std::string> modifiers;
     std::string name;
     std::vector<NodePtr> associatedTypes; // TypeRepr list (if any)
     bool hasAssociated = false;
@@ -198,6 +204,7 @@ struct AccessorDecl : Node {
 
 struct AssociatedTypeDecl : Node {
     AssociatedTypeDecl() : Node(NodeKind::AssociatedTypeDecl) {}
+    std::vector<std::string> modifiers;
     std::string name;
     NodeList inherited;
     NodePtr defaultType;

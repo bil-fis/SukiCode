@@ -393,8 +393,8 @@ NodePtr Parser::parseDeinitializerDecl() {
 }
 
 NodePtr Parser::parseSubscriptDecl(std::vector<std::string> modifiers) {
-    (void)modifiers;
     auto sub = std::make_unique<SubscriptDecl>();
+    sub->modifiers = modifiers;
     advance(); // subscript
     sub->params = parseParameterList();
     expectPunct(PunctuatorID::Arrow, "expected '->'");
