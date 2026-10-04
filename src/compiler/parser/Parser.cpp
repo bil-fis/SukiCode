@@ -992,6 +992,51 @@ NodePtr Parser::parseUnsafeStmt() {
     return u;
 }
 
+NodePtr Parser::parseAsmExpr() {
+    auto a = std::make_unique<AsmExpr>();
+    advance(); // asm
+    expectPunct(PunctuatorID::LParen, "expected '(' after 'asm'");
+    if (check(TokenKind::TK_StringLiteral)) { a->templateStr = cur().stringValue; advance(); }
+    else errorAt(cur(), "expected asm template string");
+    // outputs : <out> : <in> : <clobber>
+    if (matchPunct(PunctuatorID::Colon)) {
+        // 输出操作数列表（为空时直接走到下一个 ':'）
+        if (!checkPunct(PunctuatorID::Colon)) {
+            while (!atEnd()) {
+                if (!check(TokenKind::TK_StringLiteral)) break;
+                std::string c = cur().stringValue; advance();
+                expectPunct(PunctuatorID::LParen, "expected '(' in asm operand");
+                auto e = parseExpr();
+                expectPunct(PunctuatorID::RParen, "expected ')' in asm operand");
+                a->outputs.push_back({ std::move(c), std::move(e) });
+                if (!matchPunct(PunctuatorID::Comma)) break;
+            }
+        }
+        if (matchPunct(PunctuatorID::Colon)) {
+            if (!checkPunct(PunctuatorID::Colon)) {
+                while (!atEnd()) {
+                    if (!check(TokenKind::TK_StringLiteral)) break;
+                    std::string c = cur().stringValue; advance();
+                    expectPunct(PunctuatorID::LParen, "expected '(' in asm operand");
+                    auto e = parseExpr();
+                    expectPunct(PunctuatorID::RParen, "expected ')' in asm operand");
+                    a->inputs.push_back({ std::move(c), std::move(e) });
+                    if (!matchPunct(PunctuatorID::Comma)) break;
+                }
+            }
+            if (matchPunct(PunctuatorID::Colon)) {
+                while (!atEnd()) {
+                    if (!check(TokenKind::TK_StringLiteral)) break;
+                    a->clobbers.push_back(cur().stringValue); advance();
+                    if (!matchPunct(PunctuatorID::Comma)) break;
+                }
+            }
+        }
+    }
+    expectPunct(PunctuatorID::RParen, "expected ')' to close 'asm'");
+    return a;
+}
+
 NodePtr Parser::parseSelectStmt() {
     // `select { case <pat> <- <chan>: ... default: ... }` — structurally a
     // SwitchStmt without a subject; each case pattern is a `<-` channel expression.
@@ -1539,6 +1584,10 @@ bool Parser::looksLikeArrowClosure() {
 
 NodePtr Parser::parsePrimary() {
     Token t = cur();
+    // 内联汇编（规范 8.2）：上下文关键字 `asm`，仅在后跟 `(` 时按汇编表达式解析。
+    if (t.kind == TokenKind::TK_Identifier && t.text == "asm" &&
+        peek(1).kind == TokenKind::TK_Punctuator && peek(1).punct == PunctuatorID::LParen)
+        return parseAsmExpr();
     // if used as an expression: `let x = if cond { a } else { b }`
     if (checkKw(KeywordID::If)) {
         auto e = std::make_unique<IfExpr>();

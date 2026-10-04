@@ -41,7 +41,7 @@ enum class NodeKind {
     IdentExpr, IntLitExpr, FloatLitExpr, StrLitExpr, CharLitExpr, BoolLitExpr,
     BinaryExpr, UnaryExpr, CallExpr, MemberExpr, SubscriptExpr,
     OptionalChainExpr, ForceUnwrapExpr, TupleExpr, ArrayLitExpr, DictLitExpr,
-    SetLitExpr,
+    SetLitExpr, AsmExpr,
     ClosureExpr, ParenExpr, AsExpr, IsExpr, AssignmentExpr, RangeExpr,
     NilLitExpr, GenericExpr, MoveExpr, IfExpr, TernaryExpr,
     // Type representations
@@ -357,6 +357,20 @@ struct ThrowStmt : Node {
 struct UnsafeStmt : Node {
     UnsafeStmt() : Node(NodeKind::UnsafeStmt) {}
     NodeList body;
+};
+
+// 内联汇编（规范 8.2）：LLVM 风格 `asm("..." : outputs : inputs : clobbers)`，
+// 必须在 unsafe 块内。
+struct AsmOperand {
+    std::string constraint;   // 如 "=r"、"r"、"m"、"i"
+    NodePtr expr;             // 输出/输入操作数表达式（输出通常是变量）
+};
+struct AsmExpr : Node {
+    AsmExpr() : Node(NodeKind::AsmExpr) {}
+    std::string templateStr;                 // 汇编模板
+    std::vector<AsmOperand> outputs;         // ": ..." 输出操作数
+    std::vector<AsmOperand> inputs;          // ": ..." 输入操作数
+    std::vector<std::string> clobbers;       // ": ..." 破坏寄存器（"cc"/"memory"）
 };
 
 // ─── Expressions ─────────────────────────────────────────────────────────────

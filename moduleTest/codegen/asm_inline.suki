@@ -1,0 +1,15 @@
+func main() -> Int {
+    var input: Int = 42
+    var output: Int = 0
+    unsafe {
+        asm("mov $1, $0" : "=r"(output) : "r"(input))
+    }
+    if output != 42 { return 1 }
+    // 立即数输入
+    var v: Int = 0
+    unsafe {
+        asm("mov $1, $0" : "=r"(v) : "i"(7))
+    }
+    if v != 7 { return 2 }
+    return 0
+}

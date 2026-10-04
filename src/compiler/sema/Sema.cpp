@@ -2231,6 +2231,23 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             resolveTypeRepr(is->type.get(), context);
             return types_.boolType();
         }
+        case NodeKind::AsmExpr: {
+            auto* a = static_cast<AsmExpr*>(e);
+            // 内联汇编仅允许在 unsafe 块内（规范 8.2 / 8.6）。
+            if (!unsafeContext_) {
+                hadError_ = true;
+                diags_.reportError("inline assembly 'asm' may only appear inside an "
+                                   "'unsafe' block", rangeOf(e));
+            }
+            for (auto& o : a->outputs) checkExpr(o.expr.get(), context);
+            for (auto& i : a->inputs) checkExpr(i.expr.get(), context);
+            // 整体类型取首个输出操作数的类型，否则 Void（通常作为语句出现）。
+            if (!a->outputs.empty() && a->outputs[0].expr && a->outputs[0].expr->semaType)
+                a->semaType = a->outputs[0].expr->semaType;
+            else
+                a->semaType = types_.voidType();
+            return a->semaType;
+        }
         case NodeKind::MemberExpr: {
             auto* m = static_cast<MemberExpr*>(e);
             // MemoryLayout<T>.size / .stride / .alignment（规范 P4.5）：编译期布局

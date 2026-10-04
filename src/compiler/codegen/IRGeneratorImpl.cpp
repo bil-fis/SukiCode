@@ -9,6 +9,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
@@ -302,6 +303,12 @@ private:
                 break;
             }
                 break;
+            case NodeKind::UnsafeStmt: {
+                // `unsafe` 仅影响语义检查（规范 8.6），codegen 直接生成块内语句。
+                auto* us = static_cast<UnsafeStmt*>(s);
+                for (auto& st : us->body) genStmt(st.get());
+                break;
+            }
             case NodeKind::ExprStmt: genExpr(static_cast<ExprStmt*>(s)->expr.get()); break;
             case NodeKind::ThrowStmt: genThrow(static_cast<ThrowStmt*>(s)); return;
             case NodeKind::DoStmt: genDoStmt(static_cast<DoStmt*>(s)); return;
@@ -2035,6 +2042,59 @@ private:
                     }
                 }
                 return nullptr;
+            }
+            case NodeKind::AsmExpr: {
+                auto* a = static_cast<AsmExpr*>(e);
+                // 输入操作数求值（rvalue）。
+                std::vector<llvm::Value*> inVals;
+                std::vector<llvm::Type*> inTys;
+                for (auto& inp : a->inputs) {
+                    llvm::Value* v = genExpr(inp.expr.get());
+                    if (!v) return nullptr;
+                    inVals.push_back(v);
+                    inTys.push_back(v->getType());
+                }
+                // 约束串：输出在前（含 '='），输入在后，逗号分隔。
+                std::string constraints;
+                bool first = true;
+                std::vector<llvm::Type*> outTys;
+                for (auto& o : a->outputs) {
+                    llvm::Type* ot = o.expr->semaType ? layout_->lower(o.expr->semaType)
+                                                      : nullptr;
+                    if (!ot) return nullptr;
+                    outTys.push_back(ot);
+                    if (!first) constraints += ",";
+                    constraints += o.constraint;
+                    first = false;
+                }
+                for (auto& inp : a->inputs) {
+                    if (!first) constraints += ",";
+                    constraints += inp.constraint;
+                    first = false;
+                }
+                llvm::Type* retTy;
+                if (outTys.empty()) retTy = llvm::Type::getVoidTy(*ctx_);
+                else if (outTys.size() == 1) retTy = outTys[0];
+                else retTy = llvm::StructType::get(*ctx_, outTys);
+                llvm::FunctionType* ft = llvm::FunctionType::get(retTy, inTys, false);
+                llvm::InlineAsm* ia = llvm::InlineAsm::get(
+                    ft, a->templateStr, constraints, /*hasSideEffects=*/true);
+                llvm::Value* call = b_->CreateCall(ia, inVals);
+                // 把内联汇编的输出写回对应变量（暂支持 IdentExpr 输出目标）。
+                for (size_t i = 0; i < a->outputs.size(); ++i) {
+                    llvm::Value* ov = (a->outputs.size() == 1)
+                                          ? call
+                                          : b_->CreateExtractValue(call, {(unsigned)i});
+                    llvm::Value* addr = nullptr;
+                    if (a->outputs[i].expr->kind == NodeKind::IdentExpr) {
+                        auto it = locals_.find(
+                            static_cast<IdentExpr*>(a->outputs[i].expr.get())->name);
+                        if (it != locals_.end()) addr = it->second;
+                    }
+                    if (addr) b_->CreateStore(ov, addr);
+                }
+                if (retTy->isVoidTy()) return llvm::UndefValue::get(retTy);
+                return call;
             }
             case NodeKind::MemberExpr: {
                 auto* m = static_cast<MemberExpr*>(e);

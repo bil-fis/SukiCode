@@ -83,6 +83,7 @@ private:
     NodePtr parseDeferStmt();
     NodePtr parseDoStmt();
     NodePtr parseUnsafeStmt();
+    NodePtr parseAsmExpr();
     NodePtr parseCondition();
 
     // ── expressions (precedence climbing) ─────────────────────────────────────
