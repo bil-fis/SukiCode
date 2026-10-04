@@ -104,6 +104,11 @@ void TypeLayout::defineRecord(const TypeRecord* rec, llvm::StructType* st) {
         body.push_back(i8Ptr());                        // vtable pointer
         body.push_back(llvm::Type::getInt64Ty(ctx_));  // ARC retain count
         body.push_back(i8Ptr());                        // deinit function
+        // Actors carry one extra header word: the isolation lock (规范 7.4).
+        // Callers acquire it around a cross-actor call so the actor's state is
+        // only ever touched by one caller at a time.
+        if (rec->kind == TypeDeclKind::Actor)
+            body.push_back(llvm::Type::getInt64Ty(ctx_));
     }
     // Single inheritance: superclass storage precedes the subclass fields.
     if (isRef && rec->superclass) {
@@ -214,6 +219,7 @@ int TypeLayout::fieldIndex(const TypeRecord* rec, const std::string& name) const
     int idx = 0;
     if (isRefKind(rec->kind)) {
         idx = 3; // skip vtable + retain count + deinit slot
+        if (rec->kind == TypeDeclKind::Actor) idx = 4; // ...plus the isolation lock
         if (rec->superclass)
             idx += static_cast<int>(valueMembers(rec->superclass).size());
     }

@@ -3693,6 +3693,77 @@ private:
         }
     }
 
+    // A Future that is already complete. Used by runtime-backed async members
+    // (Channel.send / receive / close): the operation itself blocks, so the
+    // Future only has to carry its result for `await` to collect.
+    llvm::Value* asyncCompletedFuture(llvm::Type* valueTy, llvm::Value* valuePtr) {
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        const int64_t sz = valueTy ? (int64_t)sizeOf(valueTy) : 0;
+        llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
+                                          { llvm::ConstantInt::get(i64, sz) });
+        if (valueTy && valuePtr)
+            b_->CreateCall(declareExternalSig("suki_future_store", { i8p, i8p },
+                                              voidTy),
+                           { fut, b_->CreateBitCast(valuePtr, i8p) });
+        b_->CreateCall(declareExternalSig("suki_future_finish", { i8p }, voidTy),
+                       { fut });
+        return fut;
+    }
+
+    // Emit an async Channel member: perform the blocking runtime operation, then
+    // return an already-complete Future so `await ch.send(x)` type-checks and
+    // yields the operation's result.
+    void genChannelMethod(FunctionDecl* mf, const Type* instTy) {
+        const std::string mkey = std::string(instTy->record->name) + "." +
+                                 mf->name;
+        if (methodFns_.count(mkey)) return;
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        const Type* elemTy = (!instTy->elements.empty())
+                                 ? instTy->elements[0] : nullptr;
+        llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
+        llvm::Type* selfTy = layout_->lower(instTy);
+        if (!selfTy) return;
+
+        std::vector<llvm::Type*> ptys{ selfTy };
+        if (mf->name == "send") ptys.push_back(elemLLVM);
+        llvm::FunctionType* fty = llvm::FunctionType::get(i8p, ptys, false);
+        llvm::Function* f = llvm::Function::Create(fty,
+            llvm::GlobalValue::ExternalLinkage, mkey, module_.get());
+        b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+
+        llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
+        b_->CreateStore(f->getArg(0), selfSlot);
+        llvm::Value* hp = b_->CreateStructGEP(selfTy, selfSlot, 0, "handle.addr");
+        llvm::Value* handle = b_->CreateLoad(i8p, hp, "handle");
+
+        if (mf->name == "send") {
+            llvm::Value* vSlot = b_->CreateAlloca(elemLLVM, nullptr, "value");
+            b_->CreateStore(coerce(f->getArg(1), elemLLVM), vSlot);
+            b_->CreateCall(declareExternalSig("suki_channel_send", { i8p, i8p },
+                                              voidTy),
+                           { handle, b_->CreateBitCast(vSlot, i8p) });
+            b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+        } else if (mf->name == "receive") {
+            llvm::Value* out = b_->CreateAlloca(elemLLVM, nullptr, "out");
+            b_->CreateCall(declareExternalSig("suki_channel_receive",
+                                              { i8p, i8p },
+                                              llvm::Type::getInt32Ty(*ctx_)),
+                           { handle, b_->CreateBitCast(out, i8p) });
+            b_->CreateRet(asyncCompletedFuture(elemLLVM, out));
+        } else if (mf->name == "close") {
+            b_->CreateCall(declareExternalSig("suki_channel_close", { i8p },
+                                              voidTy), { handle });
+            b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+        } else {
+            b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+        }
+        methodFns_[mkey] = f;
+    }
+
     // ─── Task / TaskGroup ───────────────────────────────────────────────────
     // Both are `{ i8* handle }` wrappers around a runtime object. They are
     // registered by Sema rather than declared in source, so the struct type is
@@ -4098,6 +4169,26 @@ private:
                     // belonging to the object's dynamic type. `final` methods
                     // (and non-class receivers) keep the static call above, which
                     // is what lets an override extend rather than replace.
+                    // Actor isolation (规范 7.4): a call into an actor crosses an
+                    // isolation boundary, so it is asynchronous — and the actor's
+                    // own lock is held for the duration of the call, which is what
+                    // keeps its mutable state free of data races.
+                    const bool isActorCall = bt->record &&
+                        bt->record->kind == TypeDeclKind::Actor;
+                    llvm::Value* actorLockPtr = nullptr;
+                    if (isActorCall) {
+                        llvm::StructType* ost = layout_->objectType(bt->record);
+                        if (ost) {
+                            actorLockPtr = b_->CreateStructGEP(ost, recv, 3,
+                                                               "actor.lock");
+                            llvm::PointerType* i64p = llvm::PointerType::getUnqual(
+                                llvm::Type::getInt64Ty(*ctx_));
+                            b_->CreateCall(declareExternalSig("suki_spin_lock",
+                                { i64p }, llvm::Type::getVoidTy(*ctx_)),
+                                { b_->CreateBitCast(actorLockPtr, i64p) });
+                        }
+                    }
+
                     const bool methodThrows =
                         methodThrows_.count(bt->name + "." + m->member)
                             ? methodThrows_[bt->name + "." + m->member] : false;
@@ -4106,23 +4197,41 @@ private:
                         errSlot = errorSlotForCall();
                         args.push_back(errSlot);
                     }
+                    llvm::Value* result = nullptr;
                     if (bt->record && layout_->isReferenceType(bt) &&
                         !nonVirtual_.count(bt->name + "." + m->member)) {
-                        if (llvm::Value* v = genVirtualCall(
-                                bt->record, m->member, recv, args)) {
-                            if (methodThrows) finishThrowingCall(errSlot);
-                            return v;
+                        result = genVirtualCall(bt->record, m->member, recv, args);
+                        if (result && methodThrows) finishThrowingCall(errSlot);
+                    }
+                    if (!result) {
+                        if (methodThrows) {
+                            llvm::FunctionType* fty = mf->getFunctionType();
+                            for (size_t i = 0; i < args.size() &&
+                                 i < fty->getNumParams(); ++i)
+                                args[i] = coerce(args[i], fty->getParamType(i));
+                            result = b_->CreateCall(mf, args);
+                            finishThrowingCall(errSlot);
+                        } else {
+                            result = b_->CreateCall(mf, args);
                         }
                     }
-                    if (methodThrows) {
-                        llvm::FunctionType* fty = mf->getFunctionType();
-                        for (size_t i = 0; i < args.size() && i < fty->getNumParams(); ++i)
-                            args[i] = coerce(args[i], fty->getParamType(i));
-                        llvm::Value* r = b_->CreateCall(mf, args);
-                        finishThrowingCall(errSlot);
-                        return r;
+                    if (isActorCall && actorLockPtr) {
+                        llvm::PointerType* i64p = llvm::PointerType::getUnqual(
+                            llvm::Type::getInt64Ty(*ctx_));
+                        b_->CreateCall(declareExternalSig("suki_spin_unlock",
+                            { i64p }, llvm::Type::getVoidTy(*ctx_)),
+                            { b_->CreateBitCast(actorLockPtr, i64p) });
+                        // The call itself completed synchronously under the lock, so
+                        // an already-complete Future carries its result to `await`.
+                        if (!result || result->getType()->isVoidTy())
+                            return asyncCompletedFuture(nullptr, nullptr);
+                        llvm::Value* slot = b_->CreateAlloca(result->getType(),
+                                                             nullptr,
+                                                             "actor.result");
+                        b_->CreateStore(result, slot);
+                        return asyncCompletedFuture(result->getType(), slot);
                     }
-                    return b_->CreateCall(mf, args);
+                    return result;
                 }
             }
             return nullptr;
@@ -4331,8 +4440,12 @@ public:
             }
         }
 
+        // Actors are reference types like classes (ARC-managed, vtable, init), so
+        // they take the same path — the only difference is the isolation lock in
+        // the object header and the Future returned by their methods.
         for (auto& d : decls) {
-            if (!d || d->kind != NodeKind::ClassDecl) continue;
+            if (!d || (d->kind != NodeKind::ClassDecl &&
+                       d->kind != NodeKind::ActorDecl)) continue;
             auto* td = static_cast<TypeDecl*>(d.get());
             if (td->semaType) {
                 // The calling convention is needed before declaring accessors.
@@ -4459,17 +4572,17 @@ public:
                         mem.decl->kind != NodeKind::FunctionDecl) continue;
                     auto* mf = static_cast<FunctionDecl*>(mem.decl);
                     sema_->resolveFunctionSignature(mf);
+                    // Channel's members are runtime-backed and async, so they are
+                    // emitted directly (returning a completed Future) instead of
+                    // being declared from the signature and lowered from a body.
+                    if (gi.typeName == "Channel") {
+                        genChannelMethod(mf, instTy);
+                        continue;
+                    }
                     const std::string mkey = gi.key + "." + mf->name;
                     declareMethod(mkey, mf, instTy);
                     auto mit = methodFns_.find(mkey);
-                    if (mit != methodFns_.end()) {
-                        // Channel's operations are implemented by the runtime, so
-                        // they get runtime-backed bodies rather than a lowered one.
-                        if (gi.typeName == "Channel")
-                            genChannelMethodBody(mf->name, instTy, mit->second);
-                        else
-                            genMethodBody(mf, instTy, mit->second);
-                    }
+                    if (mit != methodFns_.end()) genMethodBody(mf, instTy, mit->second);
                 }
                 sema_->unbindTypeParams();
             }

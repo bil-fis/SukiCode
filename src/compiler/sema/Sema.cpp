@@ -179,7 +179,10 @@ const Type* Sema::monomorphiseGenericType(const TypeRecord* rec,
             const Type* rt = fd->returnType
                 ? resolveTypeRepr(fd->returnType.get(), nullptr)
                 : types_.voidType();
-            nm.type = types_.function(std::move(pts), rt);
+            // Calling an async member yields a Future of its declared result, so
+            // the instance's member type must say so for `await` to type-check.
+            nm.type = types_.function(std::move(pts),
+                                      fd->isAsync ? types_.future(rt) : rt);
         } else if (m.decl && m.decl->kind == NodeKind::VarDecl) {
             auto* vd = static_cast<VarDecl*>(m.decl);
             if (vd->type) {
@@ -761,10 +764,13 @@ void Sema::registerBuiltins() {
         handleMem.decl = handleDecl;
         rec->members.push_back(handleMem);
 
+        // `send` / `receive` / `close` are async: they may block, so callers
+        // `await` them and the result type is a Future (规范 7.5).
         // func send(_ value: T)
         {
             auto* fd = new FunctionDecl();
             fd->name = "send";
+            fd->isAsync = true;
             fd->params.emplace_back();
             Param& p = fd->params.back();
             p.externalName = "_";
@@ -773,7 +779,8 @@ void Sema::registerBuiltins() {
             fd->returnType.reset(typeRepr("Void"));
             TypeRecord::Member m;
             m.isFunction = true; m.name = "send";
-            m.type = types_.function({ types_.unknownType() }, types_.voidType());
+            m.type = types_.function({ types_.unknownType() },
+                                     types_.future(types_.voidType()));
             m.decl = fd;
             rec->members.push_back(m);
         }
@@ -781,10 +788,11 @@ void Sema::registerBuiltins() {
         {
             auto* fd = new FunctionDecl();
             fd->name = "receive";
+            fd->isAsync = true;
             fd->returnType.reset(typeRepr("T"));
             TypeRecord::Member m;
             m.isFunction = true; m.name = "receive";
-            m.type = types_.function({}, types_.unknownType());
+            m.type = types_.function({}, types_.future(types_.unknownType()));
             m.decl = fd;
             rec->members.push_back(m);
         }
@@ -792,10 +800,11 @@ void Sema::registerBuiltins() {
         {
             auto* fd = new FunctionDecl();
             fd->name = "close";
+            fd->isAsync = true;
             fd->returnType.reset(typeRepr("Void"));
             TypeRecord::Member m;
             m.isFunction = true; m.name = "close";
-            m.type = types_.function({}, types_.voidType());
+            m.type = types_.function({}, types_.future(types_.voidType()));
             m.decl = fd;
             rec->members.push_back(m);
         }
@@ -1003,7 +1012,12 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
         const Type* ret = fn->returnType ? resolveTypeRepr(fn->returnType.get(), &rec)
                                          : types_.voidType();
         if (fn->returnType) fn->returnType->semaType = ret;
-        mem.type = types_.function(std::move(params), ret);
+        // 规范 7.4（actor 隔离）：从外部调用 actor 的方法要跨越隔离边界，因此是
+        // 异步的——成员类型的返回值为 Future<R>，调用方须 `await` 取结果。
+        if (rec.kind == TypeDeclKind::Actor)
+            mem.type = types_.function(params, types_.future(ret));
+        else
+            mem.type = types_.function(std::move(params), ret);
         fn->semaType = mem.type; // 缓存函数类型对象，供 some 推断改写 ret
         if (rec.isProtocol()) {
             // A default implementation (a body present) is recorded on the
