@@ -1,0 +1,14 @@
+struct Pair { var a: Int; var b: Int }
+struct Packed { var x: Int; var flag: Int8 }
+func main() -> Int {
+    if MemoryLayout<Int>.size != 8 { return 1 }
+    if MemoryLayout<Int>.stride != 8 { return 2 }
+    if MemoryLayout<Int>.alignment != 8 { return 3 }
+    if MemoryLayout<Int8>.size != 1 { return 4 }
+    if MemoryLayout<Int8>.alignment != 1 { return 5 }
+    if MemoryLayout<Pair>.size != 16 { return 6 }
+    if MemoryLayout<Pair>.alignment != 8 { return 7 }
+    if MemoryLayout<Packed>.size != 16 { return 8 }
+    if MemoryLayout<Packed>.alignment != 8 { return 9 }
+    return 0
+}

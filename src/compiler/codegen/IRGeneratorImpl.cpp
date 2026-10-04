@@ -2038,6 +2038,17 @@ private:
             }
             case NodeKind::MemberExpr: {
                 auto* m = static_cast<MemberExpr*>(e);
+                // MemoryLayout<T>.size / .stride / .alignment（规范 P4.5）：编译期
+                // 布局常量。依据 Sema 标记出的关联类型 T 查 DataLayout 生成常量。
+                if (m->isMemoryLayoutQuery && m->memoryLayoutType) {
+                    if (llvm::Type* lt = layout_->lower(m->memoryLayoutType)) {
+                        const llvm::DataLayout& dl = module_->getDataLayout();
+                        uint64_t sz = dl.getTypeAllocSize(lt);
+                        uint64_t al = dl.getABITypeAlign(lt).value();
+                        uint64_t v = (m->member == "alignment") ? al : sz; // size/stride 均含尾部填充
+                        return tagConstant((int64_t)v);
+                    }
+                }
                 // A labelled tuple element (`pair.code`) is indexed by the label's
                 // position, not looked up as a field. Sema records the element
                 // type on the expression, so the index comes from there.

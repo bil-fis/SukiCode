@@ -2233,6 +2233,32 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         case NodeKind::MemberExpr: {
             auto* m = static_cast<MemberExpr*>(e);
+            // MemoryLayout<T>.size / .stride / .alignment（规范 P4.5）：编译期布局
+            // 常量。须在 checkExpr(base) 之前识别，否则 `MemoryLayout` 作为未声明
+            // 标识符会误报 "not found"。支持两种解析形态：NamedType 带泛型实参
+            // （类型位置）与 GenericExpr（表达式位置）。
+            {
+                Node* mlBase = m->base.get();
+                Node* mlArg = nullptr;
+                if (mlBase && mlBase->kind == NodeKind::NamedType) {
+                    auto* bnt = static_cast<NamedType*>(mlBase);
+                    if (bnt->name == "MemoryLayout" && !bnt->genericArgs.empty())
+                        mlArg = bnt->genericArgs[0].get();
+                } else if (mlBase && mlBase->kind == NodeKind::GenericExpr) {
+                    auto* ge = static_cast<GenericExpr*>(mlBase);
+                    if (ge->base && ge->base->kind == NodeKind::IdentExpr &&
+                        static_cast<IdentExpr*>(ge->base.get())->name == "MemoryLayout" &&
+                        !ge->args.empty())
+                        mlArg = ge->args[0].get();
+                }
+                if (mlArg && (m->member == "size" || m->member == "stride" ||
+                              m->member == "alignment")) {
+                    m->isMemoryLayoutQuery = true;
+                    m->memoryLayoutType = resolveTypeRepr(mlArg, context);
+                    m->semaType = types_.intType();
+                    return m->semaType;
+                }
+            }
             const Type* base = checkExpr(m->base.get(), context);
             // 类型名作命名空间：`Type.case` / `Type.self` 等成员访问（规范 1.7
             // 枚举成员值）。裸类型名本身在引用处被解析为 Unknown，但作为成员

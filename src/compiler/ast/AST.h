@@ -426,6 +426,8 @@ struct MemberExpr : Node {
     NodePtr base;
     std::string member;
     bool optionalChain = false; // base?.member
+    bool isMemoryLayoutQuery = false;        // MemoryLayout<T>.size/stride/alignment（规范 P4.5）
+    const Type* memoryLayoutType = nullptr;  // 关联类型 T（供 codegen 查布局）
 };
 
 struct SubscriptExpr : Node {
