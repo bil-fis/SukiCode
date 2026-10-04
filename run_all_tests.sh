@@ -215,15 +215,30 @@ run_negative() {
 }
 
 D="$PROJECT_DIR/moduleTest/diagnostics"
-[ -d "$D" ] && {
-    run_negative "$D/type_mismatch.suki"      "cannot convert" "type_mismatch"
-    run_negative "$D/unknown_name.suki"       "cannot find"   "unknown_name"
-    run_negative "$D/missing_return.suki"     "missing return" "missing_return"
-    run_negative "$D/tuple_index_range.suki"  "out of range"  "tuple_index_range"
-    run_negative "$D/enum_arity.suki"          "expects"       "enum_arity"
-    run_negative "$D/switch_exhaustive.suki"   "exhaustive"   "switch_exhaustive"
-    run_negative "$D/access_override.suki"      "final"         "access_override"
-}
+# 带明确预期子串的重点负例（保持严格校验）。
+run_negative "$D/type_mismatch.suki"      "cannot convert" "type_mismatch"
+run_negative "$D/unknown_name.suki"       "cannot find"   "unknown_name"
+run_negative "$D/missing_return.suki"     "missing return" "missing_return"
+run_negative "$D/tuple_index_range.suki"  "out of range"  "tuple_index_range"
+run_negative "$D/enum_arity.suki"          "expects"       "enum_arity"
+run_negative "$D/switch_exhaustive.suki"   "exhaustive"   "switch_exhaustive"
+run_negative "$D/access_override.suki"      "final"         "access_override"
+# 覆盖该目录下全部其余负例：每个文件经 `sukic check` 必须被拒绝（退出码非 0）。
+# 与 CTest 的 Rejects_* 用例一致，但在此以脚本方式统一执行，新增负例后无需
+# 再到此处登记即可被覆盖。
+_STRICT=" type_mismatch unknown_name missing_return tuple_index_range enum_arity switch_exhaustive access_override "
+for f in "$D"/*.suki; do
+    [ -e "$f" ] || continue
+    n="$(basename "$f" .suki)"
+    case "$_STRICT" in
+        *" $n "*) continue ;;   # 已在上面按子串严格校验
+    esac
+    if timeout "$CASE_TIMEOUT" "$SUKIC" check "$f" > /dev/null 2>&1; then
+        bad "diagnostics/$n" "负例竟被接受（sukic check 退出码 0）"
+    else
+        ok "diagnostics/$n"
+    fi
+done
 
 # ── 4. 待实现特性用例：登记过的缺口允许失败，意外通过则报警 ──────────────────
 section "待实现特性 / Pending feature cases"
