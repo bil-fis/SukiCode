@@ -1,1763 +1,2082 @@
-// SukiCode semantic analyzer implementation.
-// Performs type checking, scope resolution, and validation on the parsed AST.
+#include "compiler/sema/Sema.h"
 
-#include "Sema.h"
-#include "compiler/lexer/Lexer.h"
-#include "compiler/parser/Parser.h"
-#include <fstream>
-#include <set>
+#include <algorithm>
+#include <map>
 
 namespace suki {
 
-Sema::Sema(DiagnosticEngine& diag) : diag_(diag), typeChecker_(diag, symbols_) {}
-Sema::~Sema() = default;
+static SourceRange rangeOf(Node* n) { return n ? n->range : SourceRange{}; }
 
-bool Sema::analyze(CompilationUnit& cu) {
-    currentCu_ = &cu;
-    currentFilePath_ = cu.filename;
 
-    // Register built-in types
-    auto regType = [&](const char* name) {
-        Symbol sym;
-        sym.kind = SymbolKind::Type;
-        sym.name = name;
-        sym.type = resolvePrimitiveType(name);
-        sym.isPublic = true;
-        symbols_.define(sym);
-    };
-    regType("Void");
-    regType("Bool");
-    regType("Int");
-    regType("Int8");
-    regType("Int16");
-    regType("Int32");
-    regType("Int64");
-    regType("UInt");
-    regType("UInt8");
-    regType("UInt16");
-    regType("UInt32");
-    regType("UInt64");
-    regType("UnsafePointer");
-    regType("UnsafeMutablePointer");
-    regType("UnsafeBufferPointer");
-    regType("Float");
-    regType("Double");
-    regType("Char");
-    regType("String");
+// Check each recorded generic instantiation with its type arguments bound.
+void Sema::monomorphise(const NodeList& decls) {
+    // Index the generic functions by name so an instance can find its body.
+    std::unordered_map<std::string, FunctionDecl*> genericFns;
+    for (auto& d : decls) {
+        if (!d || d->kind != NodeKind::FunctionDecl) continue;
+        auto* fn = static_cast<FunctionDecl*>(d.get());
+        if (!fn->genericParams.empty()) genericFns[fn->name] = fn;
+    }
+    if (genericFns.empty()) return;
 
-    // Register built-in functions
-    {
-        Symbol s;
-        s.kind = SymbolKind::Function;
-        s.name = "print";
-        s.returnType = getVoidType();
-        s.isPublic = true;
-        s.paramTypes.push_back(getAnyType());
-        symbols_.define(s);
+    // Reset the error state so a body that only fails for some instantiation
+    // does not abort the others; the diagnostic is deduplicated on emit.
+    const std::vector<GenericInstance> instances = genericInstances_;
+    for (const GenericInstance& gi : instances) {
+        auto fit = genericFns.find(gi.funcName);
+        if (fit == genericFns.end()) continue;
+        FunctionDecl* fn = fit->second;
+        if (gi.typeArgs.size() != fn->genericParams.size()) continue;
+
+        std::unordered_map<std::string, const Type*> saved = genericBindings_;
+        for (size_t i = 0; i < gi.typeArgs.size(); ++i)
+            genericBindings_[fn->genericParams[i]] = typeByName(gi.typeArgs[i]);
+        // Re-check the body with the parameters bound, so each instantiation is
+        // verified against the types it will actually be used with.
+        checkFunctionBody(fn, nullptr);
+        genericBindings_ = saved;
+    }
+}
+
+// Resolve a written type name the way an annotation would. An unknown name (a
+// type parameter used as an argument, for instance) stays opaque.
+const Type* Sema::typeByName(const std::string& name) {
+
+    if (const TypeRecord* rec = findType(name))
+        return types_.named(rec, name);
+    TypeKind bk;
+    if (builtinTypeFromName(name, bk)) {
+        if (bk == TypeKind::Array) return types_.array(types_.unknownType());
+        return types_.primitive(bk);
+    }
+    return types_.unknownType();
+}
+
+void Sema::bindInstance(size_t index, FunctionDecl* fn) {
+    bindingStack_.push_back(genericBindings_);
+    if (index >= genericInstances_.size() || !fn) return;
+    const GenericInstance& gi = genericInstances_[index];
+    if (gi.funcName != fn->name) return;
+    if (gi.typeArgs.size() != fn->genericParams.size()) return;
+    for (size_t i = 0; i < gi.typeArgs.size(); ++i)
+        genericBindings_[fn->genericParams[i]] = typeByName(gi.typeArgs[i]);
+    // Parameter types were fixed during collection, when the parameters were
+    // still opaque. Re-resolve them now so the signature matches this instance.
+    for (Param& prm : fn->params) {
+        prm.semaType = prm.type ? resolveTypeRepr(prm.type.get(), nullptr) : nullptr;
+        std::string d; if (prm.type && prm.type->kind == NodeKind::ArrayType)
+            d = typeToString(prm.semaType);
+    }
+    checkFunctionBody(fn, nullptr);
+}
+
+void Sema::unbindInstance() {
+    if (bindingStack_.empty()) return;
+    genericBindings_ = bindingStack_.back();
+    bindingStack_.pop_back();
+}
+
+// The type a generic argument should be inferred as. A parameter written `[T]`
+// or `Dictionary<K,V>` is matched by its element(s), not by the container, which
+// is what the instantiation has to be named after.
+const Type* Sema::inferTypeArgument(const Type* t) {
+    if (!t) return t;
+    switch (t->kind) {
+        case TypeKind::Array: case TypeKind::Optional:
+            return t->element ? t->element : t;
+        case TypeKind::Set:
+            return t->element ? t->element : t;
+        case TypeKind::Dict:
+            // A two-parameter function is instantiated per key/value pair; the
+            // caller splits them, so a dict contributes its key here.
+            return t->key ? t->key : t;
+        default: return t;
+    }
+}
+
+void Sema::checkInstance(size_t index, FunctionDecl* fn) {
+    bindInstance(index, fn);
+    unbindInstance();
+}
+
+void Sema::recordGenericInstance(const std::string& funcName,
+                                const std::vector<std::string>& typeArgs) {
+    for (const GenericInstance& gi : genericInstances_)
+        if (gi.funcName == funcName && gi.typeArgs == typeArgs) return;
+    genericInstances_.push_back(GenericInstance{funcName, typeArgs});
+}
+
+// Report class properties that form a retain cycle.
+//
+// A class is a node; a strong reference from one class to another is an edge.
+// Any cycle means two objects keep each other alive, so neither can be
+// collected. The language does not silently downgrade such a reference to
+// `unowned` — that would change the programmer's intent — so this is a
+// diagnostic naming the property to make `weak` or `unowned`.
+void Sema::checkReferenceCycles() {
+    std::map<std::string, std::vector<std::string>> edges; // class -> classes
+    std::map<std::string, const TypeRecord*> byName;
+    for (const auto& kv : typeIndex_) byName[kv.first] = kv.second;
+
+    for (const auto& kv : typeIndex_) {
+        const TypeRecord* rec = kv.second;
+        if (rec->kind != TypeDeclKind::Class && rec->kind != TypeDeclKind::Actor)
+            continue;
+        for (const auto& m : rec->members) {
+            // A `weak` / `unowned` property does not retain, so it is not an edge.
+            if (m.decl && m.decl->kind == NodeKind::VarDecl) {
+                auto* vd = static_cast<VarDecl*>(m.decl);
+                if (vd->isWeak || vd->isUnowned) continue;
+            }
+            if (!m.type || m.type->kind != TypeKind::Named || !m.type->record)
+                continue;
+            const TypeRecord* target = m.type->record;
+            if (target->kind != TypeDeclKind::Class &&
+                target->kind != TypeDeclKind::Actor)
+                continue;
+            edges[rec->name].push_back(target->name);
+        }
+    }
+    if (edges.empty()) return;
+
+    // Iterative depth-first search with an explicit stack: recursion would risk
+    // deep stacks on long inheritance chains, and the graph is small but cyclic.
+    std::map<std::string, int> state; // 0 unvisited, 1 on stack, 2 done
+    std::vector<std::pair<std::string, size_t>> stack;
+    for (const auto& kv : edges) {
+        if (state[kv.first]) continue;
+        stack.push_back({kv.first, 0});
+        state[kv.first] = 1;
+        while (!stack.empty()) {
+            auto& top = stack.back();
+            const std::vector<std::string>& outs = edges[top.first];
+            if (top.second < outs.size()) {
+                const std::string next = outs[top.second++];
+                if (state[next] == 1) {
+                    // Found a back edge: report the property that closes it.
+                    const std::string& from = top.first;
+                    for (const auto& m : byName[from]->members)
+                        if (m.type && m.type->name == next)
+                            diags_.reportWarning("class '" + from + "' has a strong reference to '" +
+                                          next + "' through '" + m.name +
+                                          "', forming a retain cycle; declare it "
+                                          "'weak' or 'unowned' to break the cycle",
+                                          m.decl ? rangeOf(m.decl) : SourceRange());
+                } else if (state[next] == 0) {
+                    state[next] = 1;
+                    stack.push_back({next, 0});
+                }
+            } else {
+                state[top.first] = 2;
+                stack.pop_back();
+            }
+        }
+    }
+}
+
+// Check `e` where a `Char` is expected: a one-scalar string literal denotes a
+// character, anything else keeps its own type.
+const Type* Sema::checkAsChar(Node* e, const TypeRecord* context) {
+    if (!e || e->kind != NodeKind::StrLitExpr) return checkExpr(e, context);
+    charContext_ = true;
+    const Type* t = checkExpr(e, context);
+    charContext_ = false;
+    return t;
+}
+
+void Sema::analyze(const NodeList& decls) {
+    hadError_ = false;
+    globals_.pushScope();
+    locals_.pushScope();
+    registerBuiltins();
+
+    // Pass 1: create type records for every named type declaration.
+    for (auto& d : decls) {
+        if (!d) continue;
+        switch (d->kind) {
+            case NodeKind::StructDecl: case NodeKind::EnumDecl:
+            case NodeKind::ClassDecl: case NodeKind::ActorDecl:
+            case NodeKind::ProtocolDecl:
+                collectTypeDecl(d.get());
+                break;
+            case NodeKind::TypealiasDecl:
+                collectTypeAlias(static_cast<TypealiasDecl*>(d.get()));
+                break;
+            default: break;
+        }
     }
 
-    if (cu.moduleDecl) {
-        currentModule_ = cu.moduleDecl->name;
-    }
-
-    // 第零遍：预注册所有类型声明
-    // Zeroth pass: pre-register all type declarations
-    for (auto& decl : cu.declarations) {
-        if (!decl) continue;
-        if (decl->declKind == DeclKind::Struct ||
-            decl->declKind == DeclKind::Class ||
-            decl->declKind == DeclKind::Enum ||
-            decl->declKind == DeclKind::Protocol ||
-            decl->declKind == DeclKind::Actor) {
-            auto& td = static_cast<TypeDecl&>(*decl);
-            // 命名规范检查 / Naming convention check
-            checkNamingConvention(td.name, true, td.loc);
-            Symbol* existing = symbols_.lookup(td.name);
-            if (!existing) {
-                Symbol sym;
-                sym.kind = SymbolKind::Type;
-                sym.name = td.name;
-                sym.isPublic = (td.access == AccessLevel::Public);
-                symbols_.define(sym);
+    // Pass 2: resolve inheritance / conformances by name.
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl) continue;
+        auto* td = static_cast<TypeDecl*>(rec->decl);
+        for (auto& base : td->inherited) {
+            if (!base || base->kind != NodeKind::NamedType) continue;
+            auto* nt = static_cast<NamedType*>(base.get());
+            const TypeRecord* baseRec = findType(nt->name);
+            if (!baseRec) continue;
+            if (baseRec->isProtocol()) {
+                rec->protocols.push_back(baseRec);
+            } else if (rec->kind == TypeDeclKind::Class && !rec->superclass) {
+                rec->superclass = baseRec;
             }
         }
     }
 
-    // 第一遍：预注册所有函数声明（支持前向引用）
-    // First pass: pre-register all function declarations (support forward references)
-    for (auto& decl : cu.declarations) {
-        if (decl && decl->declKind == DeclKind::Function) {
-            auto& fd = static_cast<FunctionDecl&>(*decl);
-            Symbol* existing = symbols_.lookup(fd.name);
-            if (!existing) {
-                // 临时注册泛型参数以解析类型 / Temporarily register generic params for type resolution
-                symbols_.enterScope();
-                for (const auto& gp : fd.genericParams) {
-                    Symbol gs;
-                    gs.kind = SymbolKind::Type;
-                    gs.name = gp.name;
-                    gs.type = getAnyType();
-                    symbols_.define(gs);
+    // Pass 3: collect members of every type.
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (rec->decl) collectMembers(*rec, static_cast<TypeDecl*>(rec->decl));
+    }
+
+    // Pass 3.5: fold extension members (and the conformances they declare)
+    // into the extended type, then inherit protocol default implementations.
+    // After this the member list of every type is flat, so code generation
+    // and member lookup need no special handling for extensions (规范 2.6/4.5).
+    mergeExtensions(decls);
+    mergeDefaultImplementations();
+
+    // Pass 4: collect global functions and variables.
+    for (auto& d : decls) {
+        if (!d) continue;
+        if (d->kind == NodeKind::FunctionDecl) {
+            collectFunction(static_cast<FunctionDecl*>(d.get()), nullptr);
+        } else if (d->kind == NodeKind::VarDecl) {
+            collectGlobalVar(static_cast<VarDecl*>(d.get()));
+        }
+    }
+
+    // Pass 5: check function bodies.
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl) continue;
+        auto* td = static_cast<TypeDecl*>(rec->decl);
+        for (auto& m : td->members) {
+            if (m && m->kind == NodeKind::FunctionDecl) {
+                checkFunctionBody(static_cast<FunctionDecl*>(m.get()), rec);
+            } else if (m && m->kind == NodeKind::InitDecl) {
+                auto* init = static_cast<InitDecl*>(m.get());
+                currentType_ = rec;
+                currentReturn_ = types_.voidType();
+                currentThrows_ = false;
+                locals_.pushScope();
+                // `self` is implicitly available in methods.
+                Symbol self; self.kind = Symbol::Kind::Variable;
+                self.type = types_.named(rec, rec->name);
+                self.decl = m.get();
+                locals_.declare("self", self);
+                for (auto& prm : init->params) {
+                    Symbol s; s.kind = Symbol::Kind::Parameter;
+                    s.type = resolveTypeRepr(prm.type.get(), rec);
+                    s.decl = m.get();
+                    locals_.declare(prm.internalName, s);
                 }
+                checkStatements(init->body, rec, types_.voidType(), false);
+                locals_.popScope();
+                currentType_ = nullptr;
+            }
+        }
+    }
+    for (auto& d : decls) {
+        if (d && d->kind == NodeKind::FunctionDecl) {
+            checkFunctionBody(static_cast<FunctionDecl*>(d.get()), nullptr);
+        } else if (d && d->kind == NodeKind::VarDecl) {
+            checkGlobalVarBody(static_cast<VarDecl*>(d.get()));
+        }
+    }
 
-                Symbol sym;
-                sym.kind = SymbolKind::Function;
-                sym.name = fd.name;
-                sym.isPublic = (fd.access == AccessLevel::Public);
+    // Monomorphisation: the first pass above checked every generic body with its
+    // type parameters still opaque, so nothing concrete was recorded. Now that
+    // the call sites have revealed which type arguments are used, check each
+    // distinct instantiation again with those parameters bound, which annotates
+    // the body with real types for lowering.
+    if (!genericInstances_.empty()) monomorphise(decls);
 
-                // 解析参数类型（泛型参数在此作用域内可用）
-                // Resolve parameter types (generic params available in this scope)
-                for (const auto& param : fd.params) {
-                    if (param.type) {
-                        sym.paramTypes.push_back(resolveTypeRepr(*param.type));
+    locals_.popScope();
+    globals_.popScope();
+
+    // Trait / protocol conformance checking.
+    checkConformances();
+
+    // Retain-cycle detection runs last: it needs every class's property types,
+    // which are only final after the bodies above have been checked.
+    checkReferenceCycles();
+}
+
+void Sema::checkConformances() {
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        for (const TypeRecord* proto : rec->protocols) {
+            if (!proto || !proto->isProtocol()) continue;
+            for (const auto& req : proto->requirements) {
+                // Default implementation supplied by the protocol itself?
+                bool hasDefault = false;
+                if (req.isFunction && req.decl &&
+                    req.decl->kind == NodeKind::FunctionDecl) {
+                    auto* fd = static_cast<FunctionDecl*>(req.decl);
+                    hasDefault = !fd->body.empty();
+                }
+                if (hasDefault) continue;
+                // Satisfied by a member on the type or any superclass?
+                bool satisfied = false;
+                for (const TypeRecord* r = rec; r && !satisfied; r = r->superclass) {
+                    if (req.isFunction) {
+                        if (lookupMethod(r, req.name, req.type ? req.type->elements.size() : 0))
+                            satisfied = true;
                     } else {
-                        sym.paramTypes.push_back(getErrorType());
+                        if (lookupMember(r, req.name, false)) satisfied = true;
                     }
                 }
-                if (fd.returnType) {
-                    sym.returnType = resolveTypeRepr(*fd.returnType);
-                } else {
-                    sym.returnType = getVoidType();
-                }
-
-                // 离开临时作用域 / Leave temporary scope
-                symbols_.leaveScope();
-
-                // 在外部作用域定义函数 / Define function in outer scope
-                symbols_.define(sym);
-            }
-        }
-    }
-
-    // 第二遍：处理所有声明
-    // Second pass: process all declarations
-    for (auto& decl : cu.declarations) {
-        if (decl) processDecl(*decl);
-    }
-
-    return !diag_.hadErrors();
-}
-
-void Sema::processDecl(Decl& decl) {
-    switch (decl.declKind) {
-        case DeclKind::Module: break;
-        case DeclKind::Import: {
-            // 注册导入模块 / Register imported module
-            auto& imp = static_cast<ImportDecl&>(decl);
-
-            // 防止重复导入 / Prevent duplicate imports
-            bool alreadyImported = false;
-            for (const auto& mod : importedModules_) {
-                if (mod == imp.moduleName) { alreadyImported = true; break; }
-            }
-            if (alreadyImported) break;
-
-            importedModules_.push_back(imp.moduleName);
-
-            // 尝试查找并加载模块文件 / Try to find and load module file
-            std::vector<std::string> searchPaths = {
-                imp.moduleName + ".suki",
-                "Sources/" + imp.moduleName + "/" + imp.moduleName + ".suki",
-                "../Sources/" + imp.moduleName + "/" + imp.moduleName + ".suki",
-            };
-
-            std::string foundPath;
-            for (const auto& path : searchPaths) {
-                std::ifstream testFile(path);
-                if (testFile.good()) {
-                    foundPath = path;
-                    break;
+                if (!satisfied) {
+                    hadError_ = true;
+                    diags_.reportError("type '" + rec->name + "' does not conform to protocol '" +
+                                       proto->name + "': missing requirement '" + req.name + "'",
+                                       rangeOf(rec->decl));
                 }
             }
-
-            if (!foundPath.empty()) {
-                // 加载模块文件 / Load module file
-                std::ifstream file(foundPath);
-                std::string source((std::istreambuf_iterator<char>(file)),
-                                    std::istreambuf_iterator<char>());
-
-                // 词法分析 / Lexical analysis
-                Lexer lexer(source, foundPath, diag_);
-                auto tokens = lexer.lexAll();
-
-                // 语法分析 / Parsing
-                Parser parser(std::move(tokens), source, foundPath, diag_);
-                auto moduleCu = parser.parse();
-
-                if (!diag_.hadErrors() && moduleCu) {
-                    // 进入模块作用域 / Enter module scope
-                    symbols_.enterScope();
-
-                    // 处理模块中的所有声明
-                    // Process all declarations in the module
-                    for (const auto& modDecl : moduleCu->declarations) {
-                        if (modDecl) processDecl(*modDecl);
-                    }
-
-                    // 收集 public 符号并复制到父作用域
-                    // Collect public symbols and copy to parent scope
-                    auto currentScope = symbols_.currentScope();
-                    if (currentScope && currentScope->parent()) {
-                        for (const auto& [name, sym] : currentScope->symbols()) {
-                            if (sym.isPublic) {
-                                currentScope->parent()->define(sym);
-                            }
-                        }
-                    }
-
-                    // 离开模块作用域
-                    symbols_.leaveScope();
-                }
-            }
-            // 内置模块（Core、System 等）通过标准库头文件提供
-            // Built-in modules (Core, System etc.) are provided via stdlib headers
-            break;
         }
-        case DeclKind::Variable:
-            processVariableDecl(static_cast<VariableDecl&>(decl));
-            break;
-        case DeclKind::Function:
-            processFunctionDecl(static_cast<FunctionDecl&>(decl));
-            break;
-        case DeclKind::Struct:
-            processStructDecl(static_cast<StructDecl&>(decl));
-            break;
-        case DeclKind::Class:
-            processClassDecl(static_cast<ClassDecl&>(decl));
-            break;
-        case DeclKind::Enum:
-            processEnumDecl(static_cast<EnumDecl&>(decl));
-            break;
-        case DeclKind::Extension: {
-            // Extension: 处理扩展体内的成员
-            auto& ext = static_cast<ExtensionDecl&>(decl);
-            symbols_.enterScope();
-            for (auto& member : ext.members) {
-                if (member) processDecl(*member);
-            }
-            symbols_.leaveScope();
-            break;
-        }
-        case DeclKind::Protocol: {
-            // Protocol: 注册协议类型
-            auto& proto = static_cast<ProtocolDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Type;
-            sym.name = proto.name;
-            sym.isPublic = (proto.access == AccessLevel::Public);
-            symbols_.define(sym);
-            break;
-        }
-        case DeclKind::Actor: {
-            // Actor: 处理为类类型，注册为 Actor
-            auto& actor = static_cast<ActorDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Type;
-            sym.name = actor.name;
-            sym.isPublic = (actor.access == AccessLevel::Public);
-            symbols_.define(sym);
-            // 注册 Actor 类型 / Register actor type
-            actorTypes_.insert(actor.name);
-            // 进入 Actor 作用域 / Enter actor scope
-            std::string prevActor = currentActor_;
-            currentActor_ = actor.name;
-            symbols_.enterScope();
-            for (auto& member : actor.members) {
-                if (member) processDecl(*member);
-            }
-            symbols_.leaveScope();
-            currentActor_ = prevActor;
-            break;
-        }
-        case DeclKind::Typealias: {
-            // Typealias: 注册类型别名
-            auto& ta = static_cast<TypealiasDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Type;
-            sym.name = ta.name;
-            sym.isPublic = (ta.access == AccessLevel::Public);
-            if (ta.underlyingType) {
-                sym.type = resolveTypeRepr(*ta.underlyingType);
-            }
-            symbols_.define(sym);
-            break;
-        }
-        case DeclKind::Init: {
-            // Init: 注册为函数
-            auto& init = static_cast<InitDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Function;
-            sym.name = "init";
-            sym.isPublic = true;
-            sym.returnType = getVoidType();
-            symbols_.define(sym);
-            // 处理函数体
-            symbols_.enterScope();
-            for (auto& stmt : init.body) {
-                if (stmt) processStmt(*stmt);
-            }
-            symbols_.leaveScope();
-            break;
-        }
-        case DeclKind::Deinit: {
-            // Deinit: 处理函数体
-            auto& deinit = static_cast<DeinitDecl&>(decl);
-            symbols_.enterScope();
-            for (auto& stmt : deinit.body) {
-                if (stmt) processStmt(*stmt);
-            }
-            symbols_.leaveScope();
-            break;
-        }
-        case DeclKind::Subscript: {
-            // Subscript: 注册为函数
-            auto& sub = static_cast<SubscriptDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Function;
-            sym.name = "subscript";
-            sym.isPublic = true;
-            if (sub.returnType) {
-                sym.returnType = resolveTypeRepr(*sub.returnType);
-            }
-            symbols_.define(sym);
-            break;
-        }
-        case DeclKind::While: {
-            auto& w = static_cast<WhileDecl&>(decl);
-            typeChecker_.enterLoop();
-            if (w.condition) {
-                TypePtr condType = inferExprType(*w.condition);
-                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
-                    error(w.condition->loc, "while condition must be of type 'Bool'");
-                }
-            }
-            symbols_.enterScope();
-            for (auto& s : w.body) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            typeChecker_.leaveLoop();
-            break;
-        }
-        case DeclKind::ForIn: {
-            auto& f = static_cast<ForInDecl&>(decl);
-            typeChecker_.enterLoop();
-            if (f.sequence) inferExprType(*f.sequence);
-            symbols_.enterScope();
-            for (auto& s : f.body) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            typeChecker_.leaveLoop();
-            break;
-        }
-        case DeclKind::RepeatWhile: {
-            auto& r = static_cast<RepeatWhileDecl&>(decl);
-            typeChecker_.enterLoop();
-            symbols_.enterScope();
-            for (auto& s : r.body) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            if (r.condition) {
-                TypePtr condType = inferExprType(*r.condition);
-                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
-                    error(r.condition->loc, "repeat-while condition must be of type 'Bool'");
-                }
-            }
-            typeChecker_.leaveLoop();
-            break;
-        }
-        case DeclKind::Switch: {
-            auto& sw = static_cast<SwitchDecl&>(decl);
-            typeChecker_.enterSwitch();
-            TypePtr subjectType;
-            if (sw.subject) subjectType = inferExprType(*sw.subject);
-
-            // 检查是否有 default 分支 / Check for default branch
-            bool hasDefault = false;
-            for (const auto& c : sw.cases) {
-                for (const auto& label : c.labels) {
-                    if (label.isDefault) hasDefault = true;
-                }
-            }
-
-            // 如果主体是枚举类型，检查穷举性
-            // If subject is enum type, check exhaustiveness
-            if (subjectType && subjectType->kind() == TypeKind::Enum && !hasDefault) {
-                // 检查是否所有枚举 case 都被覆盖
-                auto& enumType = static_cast<const EnumType&>(*subjectType);
-                std::set<std::string> coveredCases;
-                for (const auto& c : sw.cases) {
-                    for (const auto& label : c.labels) {
-                        if (label.expression && label.expression->exprKind == ExprKind::Identifier) {
-                            coveredCases.insert(static_cast<const IdentifierExpr&>(*label.expression).name);
-                        }
-                    }
-                }
-                for (const auto& ec : enumType.cases()) {
-                    if (coveredCases.find(ec.name) == coveredCases.end()) {
-                        warning(decl.loc, "switch on enum '" + enumType.name() +
-                                "' does not handle case '" + ec.name + "'");
-                    }
-                }
-            } else if (!hasDefault) {
-                // 非枚举类型且没有 default，发出警告
-                warning(decl.loc, "switch without default case may not be exhaustive");
-            }
-
-            for (auto& c : sw.cases) {
-                symbols_.enterScope();
-                for (auto& s : c.body) { if (s) processStmt(*s); }
-                symbols_.leaveScope();
-            }
-            typeChecker_.leaveSwitch();
-            break;
-        }
-        case DeclKind::DoCatch: {
-            auto& dc = static_cast<DoCatchDecl&>(decl);
-            symbols_.enterScope();
-            for (auto& s : dc.doBody) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            for (auto& c : dc.catches) {
-                symbols_.enterScope();
-                for (auto& s : c.body) { if (s) processStmt(*s); }
-                symbols_.leaveScope();
-            }
-            break;
-        }
-        case DeclKind::If: {
-            auto& ifDecl = static_cast<IfDecl&>(decl);
-            if (ifDecl.condition) {
-                TypePtr condType = inferExprType(*ifDecl.condition);
-                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
-                    error(ifDecl.condition->loc, "if condition must be of type 'Bool'");
-                }
-            }
-            symbols_.enterScope();
-            for (auto& s : ifDecl.thenBody) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            symbols_.enterScope();
-            for (auto& s : ifDecl.elseBody) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            break;
-        }
-        case DeclKind::Guard: {
-            auto& g = static_cast<GuardDecl&>(decl);
-            if (g.condition) {
-                TypePtr condType = inferExprType(*g.condition);
-                if (condType && condType->kind() != TypeKind::Bool && condType->kind() != TypeKind::Error) {
-                    error(g.condition->loc, "guard condition must be of type 'Bool'");
-                }
-            }
-            symbols_.enterScope();
-            for (auto& s : g.elseBody) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            break;
-        }
-        case DeclKind::Unsafe: {
-            auto& u = static_cast<UnsafeDecl&>(decl);
-            typeChecker_.enterUnsafe();
-            symbols_.enterScope();
-            for (auto& s : u.body) { if (s) processStmt(*s); }
-            symbols_.leaveScope();
-            typeChecker_.leaveUnsafe();
-            break;
-        }
-        case DeclKind::Asm: {
-            // 内联汇编必须在 unsafe 块内 / Inline assembly must be in unsafe block
-            if (!typeChecker_.isInUnsafe()) {
-                error(decl.loc, "inline assembly (asm) must be inside an unsafe block");
-            }
-            break;
-        }
-        case DeclKind::ExternBlock: {
-            // extern 块：处理所有外部声明 / extern block: process all external declarations
-            auto& eb = static_cast<ExternBlockDecl&>(decl);
-            for (auto& d : eb.declarations) {
-                if (d) processDecl(*d);
-            }
-            break;
-        }
-        case DeclKind::AssociatedType: {
-            // 关联类型声明：注册到符号表
-            auto& at = static_cast<AssociatedTypeDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Type;
-            sym.name = at.name;
-            sym.isPublic = true;
-            symbols_.define(sym);
-            break;
-        }
-        case DeclKind::Macro: {
-            // 宏声明：注册宏名称到符号表 / Macro declaration: register macro name
-            auto& macroDecl = static_cast<MacroDecl&>(decl);
-            Symbol sym;
-            sym.kind = SymbolKind::Function; // 宏作为函数类型注册
-            sym.name = macroDecl.name;
-            sym.isPublic = (decl.access == AccessLevel::Public);
-            sym.isInitialized = true;
-            symbols_.define(sym);
-            break;
-        }
-        case DeclKind::MacroExpansion: {
-            // 宏展开：在语义分析阶段记录，代码生成阶段展开
-            break;
-        }
-        default: break;
     }
 }
 
-void Sema::processVariableDecl(VariableDecl& decl) {
-    Symbol sym;
-    sym.kind = SymbolKind::Variable;
-    sym.isConstant = decl.isLet;
-    sym.line = decl.loc.line;
-    sym.column = decl.loc.column;
-    sym.access = decl.access;
-    sym.declaringFile = currentFilePath_;
-    sym.scopeDepth = symbols_.depth();
+// ─── Collection ────────────────────────────────────────────────────────────
+void Sema::registerBuiltins() {
+    auto addFn = [&](const char* name, std::vector<const Type*> params, const Type* ret) {
+        Symbol s;
+        s.kind = Symbol::Kind::Function;
+        s.type = types_.function(std::move(params), ret);
+        globals_.declare(name, s);
+    };
+    // Provided by the C runtime (src/runtime/runtime.c).
+    // `print` / `println` accept any printable value (规范 12.1), which the
+    // `Any` parameter expresses — the code generator formats each scalar type
+    // on its own.
+    addFn("print", { types_.anyType() }, types_.voidType());
+    addFn("println", { types_.anyType() }, types_.voidType());
+    addFn("panic", { types_.stringType() }, types_.voidType());
+}
 
-    if (decl.pattern && decl.pattern->patternKind == PatternKind::Identifier) {
-        auto* idPat = static_cast<IdentifierPattern*>(decl.pattern.get());
-        sym.name = idPat->name;
-    } else {
+void Sema::collectTypeDecl(Node* decl) {
+    auto* td = static_cast<TypeDecl*>(decl);
+    auto rec = std::make_unique<TypeRecord>();
+    rec->name = td->name;
+    rec->decl = td;
+    switch (td->kind) {
+        case NodeKind::StructDecl: rec->kind = TypeDeclKind::Struct; break;
+        case NodeKind::EnumDecl: rec->kind = TypeDeclKind::Enum; break;
+        case NodeKind::ClassDecl: rec->kind = TypeDeclKind::Class; break;
+        case NodeKind::ActorDecl: rec->kind = TypeDeclKind::Actor; break;
+        case NodeKind::ProtocolDecl: rec->kind = TypeDeclKind::Protocol; break;
+        default: rec->kind = TypeDeclKind::Struct; break;
+    }
+    rec->genericParams = td->genericParams;
+
+    TypeRecord* raw = rec.get();
+    typeIndex_[td->name] = raw;
+    // Own the record for the session.
+    ownedRecords_.push_back(std::move(rec));
+
+    // Annotate the declaration so the code generator can recover the record
+    // from the AST alone (IRGenerator never sees Sema's tables directly).
+    td->semaType = types_.named(raw, td->name);
+
+    Symbol s; s.kind = Symbol::Kind::Type; s.record = raw; s.decl = td;
+    globals_.declare(td->name, s);
+}
+
+const TypeRecord* Sema::findType(const std::string& name) const {
+    auto it = typeIndex_.find(name);
+    return it == typeIndex_.end() ? nullptr : it->second;
+}
+
+void Sema::addMember(TypeRecord& rec, Node* m) {
+    if (!m) return;
+    if (m->kind == NodeKind::VarDecl || m->kind == NodeKind::BlockStmt) {
+        // `var x: T` is a single member; `var x, y: T` desugars to a
+        // BlockStmt of VarDecls — register each binding as a property.
+        std::vector<VarDecl*> varDecls;
+        if (m->kind == NodeKind::VarDecl) {
+            varDecls.push_back(static_cast<VarDecl*>(m));
+        } else {
+            for (auto& sub : static_cast<BlockStmt*>(m)->statements) {
+                if (sub && sub->kind == NodeKind::VarDecl)
+                    varDecls.push_back(static_cast<VarDecl*>(sub.get()));
+            }
+        }
+        for (VarDecl* vd : varDecls) {
+            TypeRecord::Member mem;
+            mem.name = vd->name;
+            mem.isFunction = false;
+            mem.isLet = vd->isLet;
+            mem.isStatic = std::find(vd->modifiers.begin(), vd->modifiers.end(),
+                                     "static") != vd->modifiers.end();
+            mem.decl = vd;
+            if (vd->type) mem.type = resolveTypeRepr(vd->type.get(), &rec);
+            else if (vd->initializer) mem.type = checkExpr(vd->initializer.get(), &rec);
+            else mem.type = types_.unknownType();
+            rec.members.push_back(std::move(mem));
+        }
+    } else if (m->kind == NodeKind::FunctionDecl) {
+        auto* fn = static_cast<FunctionDecl*>(m);
+        TypeRecord::Member mem;
+        mem.name = fn->name;
+        mem.isFunction = true;
+        mem.decl = m;
+        mem.isStatic = std::find(fn->modifiers.begin(), fn->modifiers.end(),
+                                 "static") != fn->modifiers.end();
+        std::vector<const Type*> params;
+        for (auto& prm : fn->params) {
+            const Type* pt = resolveTypeRepr(prm.type.get(), &rec);
+            if (prm.isVariadic) pt = types_.array(pt);
+            prm.semaType = pt; // authoritative for lowering
+            params.push_back(pt);
+        }
+        const Type* ret = fn->returnType ? resolveTypeRepr(fn->returnType.get(), &rec)
+                                         : types_.voidType();
+        if (fn->returnType) fn->returnType->semaType = ret;
+        mem.type = types_.function(std::move(params), ret);
+        if (rec.isProtocol()) {
+            // A default implementation (a body present) is recorded on the
+            // protocol so conforming types can inherit it; a pure requirement
+            // (no body) is only a requirement to be satisfied elsewhere.
+            fn->isDefaultImpl = !fn->body.empty();
+            rec.requirements.push_back(mem);
+        } else {
+            rec.members.push_back(std::move(mem));
+        }
+    } else if (m->kind == NodeKind::InitDecl) {
+        auto* init = static_cast<InitDecl*>(m);
+        TypeRecord::Member mem;
+        mem.name = "init";
+        mem.isFunction = true;
+        mem.decl = m;
+        std::vector<const Type*> params;
+        for (auto& prm : init->params) {
+            prm.semaType = resolveTypeRepr(prm.type.get(), &rec);
+            params.push_back(prm.semaType);
+        }
+        mem.type = types_.function(std::move(params), types_.named(&rec, rec.name));
+        rec.members.push_back(std::move(mem));
+    } else if (m->kind == NodeKind::DeinitDecl) {
+        TypeRecord::Member mem;
+        mem.name = "deinit"; mem.isFunction = true; mem.decl = m;
+        mem.type = types_.function({}, types_.voidType());
+        rec.members.push_back(std::move(mem));
+    } else if (m->kind == NodeKind::EnumCaseDecl) {
+        auto* ec = static_cast<EnumCaseDecl*>(m);
+        TypeRecord::EnumCaseInfo ci;
+        ci.name = ec->name;
+        for (auto& at : ec->associatedTypes) {
+            ci.associated.push_back(resolveTypeRepr(at.get(), &rec));
+        }
+        rec.cases.push_back(std::move(ci));
+        // Enum cases are also accessible as static members `Type.case`.
+        Symbol s; s.kind = Symbol::Kind::EnumCase; s.record = &rec; s.decl = m;
+        globals_.declare(rec.name + "." + ec->name, s);
+    } else if (m->kind == NodeKind::AssociatedTypeDecl) {
+        auto* at = static_cast<AssociatedTypeDecl*>(m);
+        rec.associatedTypes.push_back(at->name);
+    }
+}
+
+void Sema::collectMembers(TypeRecord& rec, TypeDecl* td) {
+    for (auto& m : td->members) addMember(rec, m.get());
+}
+
+// Extension members are folded into the extended type's member list so that
+// lookups and code generation see one flat surface (规范 2.6). The AST of the
+// extension keeps owning each member; only a pointer is shared here, so no
+// ownership has to move.
+void Sema::mergeExtensions(const NodeList& decls) {
+    for (auto& d : decls) {
+        if (!d || d->kind != NodeKind::ExtensionDecl) continue;
+        auto* ext = static_cast<ExtensionDecl*>(d.get());
+        // Use `findType` (not `typeIndex_[name]`) so an unknown extended type
+        // such as a primitive (`extension Int`) is NOT inserted as a null
+        // entry — a later pass iterates `typeIndex_` and would dereference it.
+        TypeRecord* target = const_cast<TypeRecord*>(findType(ext->name));
+        if (!target || !target->decl) continue;
+        auto* td = static_cast<TypeDecl*>(target->decl);
+        // A protocol listed in the extension's inheritance is a conformance.
+        for (auto& base : ext->inherited) {
+            if (!base || base->kind != NodeKind::NamedType) continue;
+            const TypeRecord* br = findType(static_cast<NamedType*>(base.get())->name);
+            if (br && br->isProtocol() &&
+                std::find(target->protocols.begin(), target->protocols.end(),
+                          br) == target->protocols.end())
+                target->protocols.push_back(br);
+        }
+        for (auto& m : ext->members) {
+            if (!m) continue;
+            td->members.push_back(std::move(m)); // ownership moves to the type
+        }
+        // Re-collect so record->members mirrors td->members (incl. extensions).
+        target->members.clear();
+        target->cases.clear();
+        collectMembers(*target, td);
+    }
+}
+
+// A default implementation declared on a protocol is inherited by every type
+// that conforms to it, unless the type already provides that member (规范 4.5).
+void Sema::mergeDefaultImplementations() {
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl || rec->isProtocol()) continue;
+        auto* td = static_cast<TypeDecl*>(rec->decl);
+        for (const TypeRecord* proto : rec->protocols) {
+            if (!proto) continue;
+            for (auto& req : proto->requirements) {
+                if (!req.isFunction || !req.decl) continue;
+                auto* fd = static_cast<FunctionDecl*>(req.decl);
+                if (fd->body.empty()) continue;           // pure requirement
+                if (lookupMember(rec, req.name, false)) continue; // type has it
+                addMember(*rec, fd); // share the declaration; proto owns it
+            }
+        }
+    }
+}
+
+// `typealias ID = Int` — remember what the name stands for. An alias is
+// transparent rather than a distinct type, so it is expanded during name
+// resolution and never reaches lowering. Aliases are recorded in declaration
+// order, so one may refer to types (or other aliases) declared before it.
+void Sema::collectTypeAlias(TypealiasDecl* ta) {
+    if (!ta || ta->name.empty() || !ta->underlying) return;
+    const Type* target = resolveTypeRepr(ta->underlying.get(), nullptr);
+    typeAliases_[ta->name] = target;
+    if (ta->underlying) ta->underlying->semaType = target;
+}
+
+void Sema::collectFunction(FunctionDecl* fn, const TypeRecord* owner) {
+    Symbol s;
+    s.kind = Symbol::Kind::Function;
+    s.function = fn;
+    s.decl = fn;
+    std::vector<const Type*> params;
+    TypeContext& tc = types_;
+    for (auto& prm : fn->params) {
+        const Type* pt = resolveTypeRepr(prm.type.get(), owner);
+        if (prm.isVariadic) pt = tc.array(pt);
+        prm.semaType = pt; // authoritative for lowering
+        params.push_back(pt);
+    }
+    const Type* ret = fn->returnType ? resolveTypeRepr(fn->returnType.get(), owner)
+                                     : tc.voidType();
+    // Record the resolved return type on the node for the code generator.
+    if (fn->returnType) fn->returnType->semaType = ret;
+    s.type = tc.function(std::move(params), ret);
+    globals_.declare(fn->name, s);
+}
+
+void Sema::collectGlobalVar(VarDecl* vd) {
+    Symbol s;
+    s.kind = Symbol::Kind::Variable;
+    s.isLet = vd->isLet;
+    s.isVar = !vd->isLet;
+    s.isWeak = vd->isWeak;
+    s.decl = vd;
+    globals_.declare(vd->name, s);
+}
+
+// ─── Type resolution (TypeRepr → Type) ─────────────────────────────────────
+const Type* Sema::resolveTypeReprNoContext(Node* repr) {
+    return resolveTypeRepr(repr, nullptr);
+}
+
+const Type* Sema::resolveTypeRepr(Node* repr, const TypeRecord* context) {
+    if (!repr) return types_.unknownType();
+    // Record the resolved type on the node: the code generator asks for a
+    // declaration's type independently of that declaration's own semaType, and
+    // the node is always available. The value is recomputed each time because a
+    // generic body resolves differently per instantiation.
+    repr->semaType = resolveTypeReprUncached(repr, context);
+    return repr->semaType;
+}
+
+const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context) {
+    if (!repr) return types_.unknownType();
+    switch (repr->kind) {
+        case NodeKind::NamedType: {
+            auto* nt = static_cast<NamedType*>(repr);
+            const std::string& name = nt->name;
+            // A type parameter of the instantiation being checked stands for
+            // the concrete type supplied at the call site. This must precede the
+            // builtin and named lookups, otherwise `T` would never resolve.
+            if (auto bt = genericBindings_.find(name);
+                bt != genericBindings_.end() && bt->second)
+                return bt->second;
+            // A `typealias` names an existing type rather than a new one.
+            if (auto ait = typeAliases_.find(name); ait != typeAliases_.end())
+                return ait->second;
+            TypeKind bk;
+            if (builtinTypeFromName(name, bk)) {
+                // Generic stdlib names
+                if (name == "Array") {
+                    const Type* e = nt->genericArgs.empty()
+                        ? types_.unknownType()
+                        : resolveTypeRepr(nt->genericArgs[0].get(), context);
+                    return types_.array(e);
+                }
+                if (name == "Set") {
+                    const Type* e = nt->genericArgs.empty()
+                        ? types_.unknownType()
+                        : resolveTypeRepr(nt->genericArgs[0].get(), context);
+                    return types_.set(e);
+                }
+                if (name == "Dictionary") {
+                    const Type* k = nt->genericArgs.size() > 0
+                        ? resolveTypeRepr(nt->genericArgs[0].get(), context)
+                        : types_.unknownType();
+                    const Type* v = nt->genericArgs.size() > 1
+                        ? resolveTypeRepr(nt->genericArgs[1].get(), context)
+                        : types_.unknownType();
+                    return types_.dict(k, v);
+                }
+                if (name == "Optional") {
+                    const Type* e = nt->genericArgs.empty()
+                        ? types_.unknownType()
+                        : resolveTypeRepr(nt->genericArgs[0].get(), context);
+                    return types_.optional(e);
+                }
+                if (name == "Owned" || name == "Unmanaged") {
+                    const Type* e = nt->genericArgs.empty()
+                        ? types_.unknownType()
+                        : resolveTypeRepr(nt->genericArgs[0].get(), context);
+                    return types_.ref(RefKind::Owned, e);
+                }
+                return types_.primitive(bk);
+            }
+            // A type parameter resolves to whatever concrete type the current
+            // instantiation supplies; when none is bound (the generic body is
+            // being checked on its own) it stays opaque.
+            if (auto bt = genericBindings_.find(name);
+                bt != genericBindings_.end() && bt->second)
+                return bt->second;
+            const TypeRecord* rec = findType(name);
+            if (rec) {
+                std::vector<const Type*> args;
+                for (auto& a : nt->genericArgs) args.push_back(resolveTypeRepr(a.get(), context));
+                return types_.named(rec, name, std::move(args));
+            }
+            return types_.unknownType();
+        }
+        case NodeKind::OptionalType:
+            return types_.optional(resolveTypeRepr(
+                static_cast<OptionalType*>(repr)->wrapped.get(), context));
+        case NodeKind::ArrayType:
+            return types_.array(resolveTypeRepr(
+                static_cast<ArrayType*>(repr)->element.get(), context));
+        case NodeKind::DictType: {
+            auto* d = static_cast<DictType*>(repr);
+            return types_.dict(resolveTypeRepr(d->key.get(), context),
+                               resolveTypeRepr(d->value.get(), context));
+        }
+        case NodeKind::TupleType: {
+            auto* t = static_cast<TupleType*>(repr);
+            std::vector<const Type*> elems;
+            for (auto& e : t->elements) elems.push_back(resolveTypeRepr(e.get(), context));
+            return types_.tuple(std::move(elems), t->labels);
+        }
+        case NodeKind::FuncType: {
+            auto* f = static_cast<FuncType*>(repr);
+            std::vector<const Type*> params;
+            for (auto& e : f->params) params.push_back(resolveTypeRepr(e.get(), context));
+            return types_.function(std::move(params), resolveTypeRepr(f->ret.get(), context));
+        }
+        case NodeKind::RefType: {
+            auto* r = static_cast<RefType*>(repr);
+            RefKind rk = RefKind::Shared;
+            if (r->refKind == "mut") rk = RefKind::Mut;
+            else if (r->refKind == "weak") rk = RefKind::Weak;
+            else if (r->refKind == "unowned") rk = RefKind::Unowned;
+            else if (r->refKind == "owned") rk = RefKind::Owned;
+            return types_.ref(rk, resolveTypeRepr(r->pointee.get(), context));
+        }
+        case NodeKind::InoutType:
+            return types_.ref(RefKind::Mut,
+                resolveTypeRepr(static_cast<InoutType*>(repr)->pointee.get(), context));
+        case NodeKind::NeverType:
+            return types_.neverType();
+        case NodeKind::PlaceholderType:
+            return types_.unknownType();
+        case NodeKind::MetatypeType: {
+            auto* m = static_cast<MetatypeType*>(repr);
+            return types_.metatype(resolveTypeRepr(m->base.get(), context), !m->isMeta);
+        }
+        default:
+            return types_.unknownType();
+    }
+}
+
+// ─── Assignability ─────────────────────────────────────────────────────────
+bool Sema::isWideningNumeric(const Type* to, const Type* from) const {
+    if (!to || !from) return false;
+    auto floatRank = [](TypeKind k) -> int {
+        switch (k) {
+            case TypeKind::Float16: return 100;
+            case TypeKind::Float32: return 101;
+            case TypeKind::Float64: return 102;
+            case TypeKind::Float128: return 103;
+            default: return 0;
+        }
+    };
+    auto intWidth = [](TypeKind k) -> int {
+        switch (k) {
+            case TypeKind::Int8: case TypeKind::UInt8: return 8;
+            case TypeKind::Int16: case TypeKind::UInt16: return 16;
+            case TypeKind::Int32: case TypeKind::UInt32: return 32;
+            case TypeKind::Int64: case TypeKind::UInt64:
+            case TypeKind::Int: case TypeKind::UInt:
+            case TypeKind::ISize: case TypeKind::USize: return 64;
+            default: return 0;
+        }
+    };
+    auto isSigned = [](TypeKind k) -> bool {
+        return k == TypeKind::Int8 || k == TypeKind::Int16 || k == TypeKind::Int32 ||
+               k == TypeKind::Int64 || k == TypeKind::Int || k == TypeKind::ISize;
+    };
+    const int toF = floatRank(to->kind), fromF = floatRank(from->kind);
+    const int toI = intWidth(to->kind), fromI = intWidth(from->kind);
+    if (toF && fromF) return toF >= fromF;          // float -> float
+    if (toF && fromI) return true;                 // integer -> float
+    if (toI && fromI)                              // integer -> integer
+        return isSigned(to->kind) == isSigned(from->kind) && toI >= fromI;
+    return false;
+}
+
+bool Sema::isAssignable(const Type* to, const Type* from) {
+    if (!to || !from) return true;
+    if (to->kind == TypeKind::Unknown || from->kind == TypeKind::Unknown) return true;
+    if (to->kind == TypeKind::Any || to->kind == TypeKind::AnyObject) return true;
+    if (from->kind == TypeKind::Never) return true;
+    if (isIdentical(to, from)) return true;
+
+    // T -> T?
+    if (to->kind == TypeKind::Optional && from->kind != TypeKind::Optional)
+        return isAssignable(to->element, from);
+    // nil-ish: T? -> T? handled above; a bare Optional to Optional of supertype
+    if (to->kind == TypeKind::Optional && from->kind == TypeKind::Optional)
+        return isAssignable(to->element, from->element);
+
+    // Collections
+    if (to->kind == TypeKind::Array && from->kind == TypeKind::Array)
+        return isAssignable(to->element, from->element);
+    if (to->kind == TypeKind::Set && from->kind == TypeKind::Set)
+        return isAssignable(to->element, from->element);
+    if (to->kind == TypeKind::Dict && from->kind == TypeKind::Dict)
+        return isAssignable(to->key, from->key) && isAssignable(to->value, from->value);
+
+    // Tuples
+    if (to->kind == TypeKind::Tuple && from->kind == TypeKind::Tuple) {
+        if (to->elements.size() != from->elements.size()) return false;
+        for (size_t i = 0; i < to->elements.size(); ++i)
+            if (!isAssignable(to->elements[i], from->elements[i])) return false;
+        return true;
+    }
+
+    // Functions / closures: same arity + compatible return.
+    auto isFn = [](const Type* t) {
+        return t->kind == TypeKind::Function || t->kind == TypeKind::Closure;
+    };
+    if (isFn(to) && isFn(from)) {
+        if (to->elements.size() != from->elements.size()) return false;
+        for (size_t i = 0; i < to->elements.size(); ++i)
+            if (!isAssignable(from->elements[i], to->elements[i])) return false; // contravariant
+        return isAssignable(to->ret, from->ret);
+    }
+
+    // Numeric widening
+    if (isWideningNumeric(to, from)) return true;
+
+    // Named subtyping: class -> superclass, T -> protocol it conforms to.
+    if (to->kind == TypeKind::Named && from->kind == TypeKind::Named) {
+        const TypeRecord* fr = from->record;
+        const TypeRecord* tr = to->record;
+        if (fr && tr) {
+            // walk superclass chain
+            for (const TypeRecord* r = fr; r; r = r->superclass) {
+                if (r == tr) return true;
+                for (const TypeRecord* p : r->protocols)
+                    if (p == tr) return true;
+            }
+        }
+    }
+
+    // Metatype / Ref erasure
+    if (to->kind == TypeKind::Ref && from->kind == TypeKind::Ref)
+        return to->refKind == from->refKind && isAssignable(to->element, from->element);
+    if (to->kind == TypeKind::Metatype && from->kind == TypeKind::Metatype)
+        return isAssignable(to->element, from->element);
+
+    return false;
+}
+
+static bool isFloatType(const Type* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeKind::Float16: case TypeKind::Float32:
+        case TypeKind::Float64: case TypeKind::Float128:
+            return true;
+        default: return false;
+    }
+}
+
+void Sema::requireAssignable(const Type* to, const Type* from, Node* at,
+                             const std::string& contextDesc) {
+    if (isAssignable(to, from)) return;
+    // Numeric literals adapt to the contextual type: an integer literal may
+    // become any integer/float type, a float literal any float type.
+    if (at && to) {
+        if (at->kind == NodeKind::IntLitExpr && isNumeric(to)) return;
+        if (at->kind == NodeKind::FloatLitExpr && isFloatType(to)) return;
+    }
+    hadError_ = true;
+    diags_.reportError(contextDesc + ": cannot convert value of type '" +
+                       typeToString(from) + "' to '" + typeToString(to) + "'",
+                       rangeOf(at));
+}
+
+// ─── Ownership ─────────────────────────────────────────────────────────────
+void Sema::markMoved(Node* nameExpr, const std::string& name) {
+    if (const Symbol* cs = locals_.lookup(name)) {
+        const_cast<Symbol*>(cs)->moved = true;
         return;
     }
-
-    if (decl.typeAnnotation) {
-        sym.type = resolveTypeRepr(*decl.typeAnnotation);
+    if (const Symbol* cs = globals_.lookup(name)) {
+        const_cast<Symbol*>(cs)->moved = true;
+        return;
     }
+    (void)nameExpr;
+}
 
-    if (decl.initializer) {
-        TypePtr initType = inferExprType(*decl.initializer);
-        if (initType) {
-            if (!sym.type) {
-                sym.type = initType;
-            } else if (initType->kind() != TypeKind::Error &&
-                       !initType->canImplicitlyConvertTo(*sym.type)) {
-                error(decl.loc, "type mismatch: cannot convert " +
-                      initType->name() + " to " + sym.type->name());
-            }
-        }
-        sym.isInitialized = true;
-    }
-
-    if (!sym.type) {
-        error(decl.loc, "cannot infer type for variable '" + sym.name + "'");
-        sym.type = getErrorType();
-    }
-
-    if (!symbols_.define(sym)) {
-        error(decl.loc, "variable '" + sym.name + "' is already defined in this scope");
+void Sema::checkNotMoved(Node* nameExpr, const std::string& name) {
+    const Symbol* s = locals_.lookup(name);
+    if (!s) s = globals_.lookup(name);
+    if (s && s->moved) {
+        hadError_ = true;
+        diags_.reportError("use of moved value '" + name + "'", rangeOf(nameExpr));
     }
 }
 
-void Sema::processFunctionDecl(FunctionDecl& decl) {
-    // 处理属性 / Process attributes
-    bool isMain = false;
-    bool isCDecl = false;
-    bool isNoMangle = false;
-    for (const auto& attr : decl.attributes) {
-        // 属性名可能包含 @ 前缀 / Attribute name may include @ prefix
-        std::string name = attr.name;
-        if (!name.empty() && name[0] == '@') name = name.substr(1);
-        if (name == "main") isMain = true;
-        if (name == "_cdecl") isCDecl = true;
-        if (name == "no_mangle") isNoMangle = true;
-    }
-    // 调试：检查属性是否被检测到
-
-    // @main 函数特殊处理 / @main function special handling
-    if (isMain) {
-        // @main 函数必须无参数，返回 Int 或 Void
-        if (!decl.params.empty()) {
-            warning(decl.loc, "@main function should have no parameters");
-        }
-        // 重命名为 main
-        decl.name = "main";
-    }
-
-    Symbol sym;
-    sym.kind = SymbolKind::Function;
-    sym.name = decl.name;
-    sym.line = decl.loc.line;
-    sym.column = decl.loc.column;
-    sym.access = decl.access;
-    sym.isPublic = (decl.access == AccessLevel::Public) || isMain || isCDecl;
-    sym.declaringFile = currentFilePath_;
-    sym.scopeDepth = symbols_.depth();
-
-    // 命名规范检查 / Naming convention check
-    checkNamingConvention(decl.name, false, decl.loc);
-
-    // 进入临时作用域以注册泛型参数 / Enter temporary scope for generic params
-    symbols_.enterScope();
-    for (const auto& gp : decl.genericParams) {
-        Symbol gs;
-        gs.kind = SymbolKind::Type;
-        gs.name = gp.name;
-        gs.type = getAnyType();
-        symbols_.define(gs);
-
-        // 验证约束类型存在 / Verify constraint types exist
-        for (const auto& constraint : gp.constraints) {
-            if (constraint && constraint->typeReprKind == TypeReprKind::Named) {
-                auto& ntr = static_cast<const NamedTypeRepr&>(*constraint);
-                Symbol* constraintSym = symbols_.lookup(ntr.name);
-                if (!constraintSym) {
-                    warning(decl.loc, "generic constraint type '" + ntr.name + "' not found");
-                }
-            }
+// ─── Members & call resolution ─────────────────────────────────────────────
+const TypeRecord::Member* Sema::lookupMethod(const TypeRecord* rec, const std::string& name,
+                                             size_t arity) const {
+    if (!rec) return nullptr;
+    const TypeRecord::Member* fallback = nullptr;
+    for (const auto& m : rec->members) {
+        if (m.isFunction && m.name == name) {
+            if (m.type && m.type->elements.size() == arity) return &m;
+            if (!fallback) fallback = &m;
         }
     }
+    return fallback;
+}
 
-    // 验证 where 子句约束类型存在 / Verify where clause constraint types exist
-    for (const auto& wc : decl.whereConstraints) {
-        // 检查类型参数名是否在泛型参数列表中
-        bool validTypeParam = false;
-        for (const auto& gp : decl.genericParams) {
-            if (gp.name == wc.typeName) { validTypeParam = true; break; }
+const TypeRecord::Member* Sema::lookupMember(const TypeRecord* rec, const std::string& name,
+                                             bool wantFunction) const {
+    if (!rec) return nullptr;
+    for (const auto& m : rec->members) {
+        if (m.name == name && m.isFunction == wantFunction) return &m;
+    }
+    return nullptr;
+}
+
+bool Sema::conformsTo(const TypeRecord* rec, const TypeRecord* proto) const {
+    if (!rec || !proto) return false;
+    if (rec == proto) return true;
+    for (const TypeRecord* r = rec; r; r = r->superclass) {
+        for (const TypeRecord* p : r->protocols) if (p == proto) return true;
+    }
+    return false;
+}
+
+// True when `name` is a plain decimal index, as used by tuple element access.
+static bool parseTupleIndex(const std::string& name, size_t& out) {
+    if (name.empty()) return false;
+    size_t v = 0;
+    for (char c : name) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + static_cast<size_t>(c - '0');
+    }
+    out = v;
+    return true;
+}
+
+const Type* Sema::resolveMemberType(const Type* t, const std::string& name, Node* at,
+                                    const TypeRecord* context) {
+    (void)context;
+    if (!t) return types_.unknownType();
+    if (t->kind == TypeKind::Optional) {
+        // Implicit optional promotion for member access.
+        return resolveMemberType(t->element, name, at, context);
+    }
+    if (t->kind == TypeKind::Named && t->record) {
+        const TypeRecord::Member* m = lookupMethod(t->record, name, 0);
+        if (m && m->isFunction) return m->type;
+        m = lookupMember(t->record, name, false);
+        if (m) return m->type;
+        // Enum case access: `Type.case`
+        for (const auto& c : t->record->cases) {
+            if (c.name == name) return types_.named(t->record, c.name);
         }
-        if (!validTypeParam) {
-            warning(decl.loc, "where clause type parameter '" + wc.typeName + "' is not a generic parameter");
+        return types_.unknownType();
+    }
+    // Floating-point values carry the arithmetic helpers every numeric type
+    // shares (规范 12.1): `squared()` is `self * self` and `squareRoot()` is
+    // the IEEE-754 square root.
+    if (isFloatType(t)) {
+        if (name == "squareRoot" || name == "squared" || name == "abs")
+            return types_.function({}, t);
+        if (name == "isNaN" || name == "isInfinite")
+            return types_.function({}, types_.boolType());
+    }
+    // Integers get the same arithmetic helpers, so a numeric generic body can
+    // call them without a constraint.
+    if (t && (t->kind == TypeKind::Int || t->kind == TypeKind::UInt ||
+              t->kind == TypeKind::Int8 || t->kind == TypeKind::Int16 ||
+              t->kind == TypeKind::Int32 || t->kind == TypeKind::Int64 ||
+              t->kind == TypeKind::UInt8 || t->kind == TypeKind::UInt16 ||
+              t->kind == TypeKind::UInt32 || t->kind == TypeKind::UInt64)) {
+        if (name == "squared") return types_.function({}, t);
+        if (name == "abs") return types_.function({}, t);
+    }
+    if (t->kind == TypeKind::String) {
+        // `count` counts Unicode scalars, `length` counts UTF-8 bytes; both
+        // are backed by the runtime string ABI.
+        if (name == "count") return types_.intType();
+        if (name == "length") return types_.intType();
+        if (name == "isEmpty") return types_.boolType();
+        if (name == "hasPrefix" || name == "hasSuffix" || name == "contains")
+            return types_.function({ types_.stringType() }, types_.boolType());
+        if (name == "uppercased" || name == "lowercased")
+            return types_.function({}, types_.stringType());
+    }
+    if (t->kind == TypeKind::Array) {
+        const Type* elem = t->element ? t->element : types_.unknownType();
+        if (name == "count") return types_.intType();
+        if (name == "isEmpty") return types_.boolType();
+        if (name == "first" || name == "last") return types_.optional(elem);
+        // `append` yields the updated array so `a = a.append(x)` works under
+        // value semantics (the runtime may have to grow the buffer).
+        if (name == "append") return types_.function({ elem }, t);
+        if (name == "removeAt" || name == "removeAll")
+            return types_.function({ types_.intType() }, t);
+        if (name == "contains")
+            return types_.function({ elem }, types_.boolType());
+    }
+    if (t->kind == TypeKind::Dict) {
+        const Type* k = t->key ? t->key : types_.unknownType();
+        const Type* v = t->value ? t->value : types_.unknownType();
+        if (name == "count") return types_.intType();
+        if (name == "isEmpty") return types_.boolType();
+        // Subscript assignment `d[k] = v` desugars to these two, so they take
+        // and return the value type rather than a pointer.
+        if (name == "set" || name == "update")
+            return types_.function({ k, v }, types_.voidType());
+        if (name == "get") return types_.function({ k }, types_.optional(v));
+        if (name == "removeValue") return types_.function({ k }, types_.optional(v));
+        if (name == "containsKey") return types_.function({ k }, types_.boolType());
+        if (name == "keys" || name == "values")
+            return types_.function({}, types_.array(k));
+    }
+    if (t->kind == TypeKind::Set) {
+        const Type* e = t->element ? t->element : types_.unknownType();
+        if (name == "count") return types_.intType();
+        if (name == "isEmpty") return types_.boolType();
+        // A set is a dictionary whose values are unit-sized; the runtime
+        // implements it with val_size == 0 and ignores the value entirely.
+        if (name == "insert" || name == "remove")
+            return types_.function({ e }, types_.boolType());
+        if (name == "contains") return types_.function({ e }, types_.boolType());
+    }
+    // Unknown member → report once via Unknown so we do not cascade.
+    return types_.unknownType();
+}
+
+const Type* Sema::resolveCallType(const Type* calleeType, Node* at,
+                                  const TypeRecord* context, size_t argCount) {
+    (void)at; (void)context;
+    if (!calleeType) return types_.unknownType();
+    if (calleeType->kind == TypeKind::Function || calleeType->kind == TypeKind::Closure) {
+        (void)argCount;
+        return calleeType->ret ? calleeType->ret : types_.unknownType();
+    }
+    if (calleeType->kind == TypeKind::Optional && calleeType->element &&
+        (calleeType->element->kind == TypeKind::Function ||
+         calleeType->element->kind == TypeKind::Closure)) {
+        return calleeType->element->ret ? calleeType->element->ret : types_.unknownType();
+    }
+    return types_.unknownType();
+}
+
+// ─── Unresolved name helper ────────────────────────────────────────────────
+const Type* Sema::reportUnresolved(Node* identExpr, const std::string& name) {
+    hadError_ = true;
+    diags_.reportError("cannot find '" + name + "' in scope", rangeOf(identExpr));
+    return types_.unknownType();
+}
+
+// ─── Function / global bodies ──────────────────────────────────────────────
+void Sema::checkFunctionBody(FunctionDecl* fn, const TypeRecord* owner) {
+    if (fn->isForeign) return; // external declaration: no body to check
+    currentType_ = owner;
+    currentThrows_ = fn->isThrows;
+    const Type* ret = fn->returnType ? resolveTypeRepr(fn->returnType.get(), owner)
+                                     : types_.voidType();
+    currentReturn_ = ret;
+
+    locals_.pushScope();
+    std::vector<std::string> savedGeneric = genericParams_;
+    genericParams_ = fn->genericParams;
+
+    if (owner) {
+        Symbol self;
+        self.kind = Symbol::Kind::Variable;
+        self.type = types_.named(owner, owner->name);
+        self.decl = fn;
+        locals_.declare("self", self);
+    }
+    for (auto& prm : fn->params) {
+        Symbol s;
+        s.kind = Symbol::Kind::Parameter;
+        s.type = resolveTypeRepr(prm.type.get(), owner);
+        if (prm.isVariadic) s.type = types_.array(s.type);
+        s.decl = fn;
+        locals_.declare(prm.internalName, s);
+        if (prm.defaultValue) {
+            const Type* dt = checkExpr(prm.defaultValue.get(), owner);
+            requireAssignable(s.type, dt, prm.defaultValue.get(), "default argument");
         }
-        // 检查约束类型是否存在
-        for (const auto& constraint : wc.constraints) {
-            if (constraint && constraint->typeReprKind == TypeReprKind::Named) {
-                auto& ntr = static_cast<const NamedTypeRepr&>(*constraint);
-                Symbol* constraintSym = symbols_.lookup(ntr.name);
-                if (!constraintSym) {
-                    warning(decl.loc, "where clause constraint type '" + ntr.name + "' not found");
+    }
+
+    checkStatements(fn->body, owner, ret, fn->isThrows);
+
+    // Every non-Void function must return on all paths. Protocol requirements
+    // and other declaration-only members have an empty body and are exempt.
+    if (ret && ret->kind != TypeKind::Void && ret->kind != TypeKind::Unknown &&
+        !fn->body.empty() && !blockAlwaysTransfers(fn->body)) {
+        hadError_ = true;
+        diags_.reportError("missing return in function '" + fn->name +
+                           "' (expected '" + typeToString(ret) + "')", rangeOf(fn));
+    }
+
+    genericParams_ = savedGeneric;
+    locals_.popScope();
+    currentType_ = nullptr;
+    currentReturn_ = nullptr;
+    currentThrows_ = false;
+}
+
+void Sema::checkGlobalVarBody(VarDecl* vd) {
+    const Type* declared = vd->type ? resolveTypeRepr(vd->type.get(), nullptr) : nullptr;
+    // `let c: Char = "A"` —— 单标量字符串字面量在 Char 上下文里是一个字符，
+    // 而不是 String（规范 1.5）。
+    const Type* init = nullptr;
+    if (vd->initializer) {
+        const Type* dt = declared ? declared : nullptr;
+        init = (dt && dt->kind == TypeKind::Char)
+            ? checkAsChar(vd->initializer.get(), nullptr)
+            : checkExpr(vd->initializer.get(), nullptr);
+    }
+    if (declared && init)
+        requireAssignable(declared, init, vd->initializer.get(), "variable initializer");
+    if (!declared && init) {
+        if (const Symbol* cs = globals_.lookup(vd->name))
+            const_cast<Symbol*>(cs)->type = init;
+    }
+    // 顶层 `let x: Int` 同样允许延迟初始化。
+    if (!vd->name.empty() && !vd->initializer && declared)
+        pendingInit_.insert(vd->name);
+}
+
+// ─── Statements ────────────────────────────────────────────────────────────
+void Sema::checkStatements(const NodeList& stmts, const TypeRecord* context,
+                           const Type* fnReturnType, bool isThrowing) {
+    for (auto& s : stmts) checkStatement(s.get(), context, fnReturnType, isThrowing);
+}
+
+// Declare a binding introduced by a condition / for-in pattern.
+static const Type* declareLocal(Sema& /*unused*/, ScopedTable<Symbol>& locals,
+                                const std::string& name, const Type* type, Node* decl,
+                                bool isLet) {
+    Symbol s;
+    s.kind = Symbol::Kind::Variable;
+    s.type = type;
+    s.isLet = isLet;
+    s.decl = decl;
+    locals.declare(name, s);
+    return type;
+}
+
+void Sema::checkStatement(Node* stmt, const TypeRecord* context,
+                          const Type* fnReturnType, bool isThrowing) {
+    if (!stmt) return;
+    switch (stmt->kind) {
+        case NodeKind::VarDecl: {
+            auto* vd = static_cast<VarDecl*>(stmt);
+            const Type* declared = vd->type ? resolveTypeRepr(vd->type.get(), context) : nullptr;
+            // 元组解构：`let (a, b) = (1, 2)`。初始化器必须是元组，各绑定名
+            // 依次取其分量类型；个数不匹配是错误。
+            if (!vd->tupleNames.empty()) {
+                if (!vd->initializer) {
+                    hadError_ = true;
+                    diags_.reportError("tuple pattern '" + vd->name +
+                                           "' needs an initialiser",
+                                       rangeOf(vd));
                 } else {
-                    // 验证约束类型是协议或类 / Verify constraint is a protocol or class
-                    if (constraintSym->kind != SymbolKind::Type) {
-                        warning(decl.loc, "where clause constraint '" + ntr.name + "' is not a type");
-                    }
-                }
-            }
-        }
-    }
-
-    // 解析参数类型（泛型参数在此作用域内可用）
-    // Resolve parameter types (generic params available in this scope)
-    for (const auto& param : decl.params) {
-        if (param.type) {
-            sym.paramTypes.push_back(resolveTypeRepr(*param.type));
-        } else {
-            sym.paramTypes.push_back(getErrorType());
-        }
-    }
-
-    if (decl.returnType) {
-        sym.returnType = resolveTypeRepr(*decl.returnType);
-    } else {
-        sym.returnType = getVoidType();
-    }
-
-    // 离开临时作用域 / Leave temporary scope
-    symbols_.leaveScope();
-
-    sym.type = std::make_shared<FunctionType>(
-        std::vector<FunctionType::Param>(), sym.returnType, decl.isAsync, decl.isThrows);
-
-    // 函数已在预注册阶段定义，跳过重复定义
-    // Function already defined in pre-registration, skip duplicate
-    symbols_.define(sym); // 允许更新（不报错）
-
-    symbols_.enterScope();
-
-    // 注册泛型类型参数 / Register generic type parameters
-    for (const auto& gp : decl.genericParams) {
-        Symbol gs;
-        gs.kind = SymbolKind::Type;
-        gs.name = gp.name;
-        gs.type = getAnyType(); // 泛型参数用 Any 类型表示
-        symbols_.define(gs);
-    }
-
-    // 设置函数上下文 / Set function context
-    TypePtr prevReturnType = currentReturnType_;
-    currentReturnType_ = sym.returnType;
-    typeChecker_.setInThrowsFunction(decl.isThrows);
-    typeChecker_.setInAsyncFunction(decl.isAsync);
-
-    for (const auto& param : decl.params) {
-        Symbol ps;
-        ps.kind = SymbolKind::Variable;
-        ps.name = param.internalName;
-        ps.isConstant = true;
-        if (param.type) ps.type = resolveTypeRepr(*param.type);
-        ps.isInitialized = true;
-        symbols_.define(ps);
-    }
-
-    for (auto& stmt : decl.body) {
-        if (stmt) processStmt(*stmt);
-    }
-
-    // Restore previous return type
-    currentReturnType_ = prevReturnType;
-
-    symbols_.leaveScope();
-}
-
-void Sema::processStructDecl(StructDecl& decl) {
-    // 类型已在预注册阶段定义，跳过重复定义
-    std::string prevTypeName = currentTypeName_;
-    currentTypeName_ = decl.name;
-
-    symbols_.enterScope();
-    for (auto& m : decl.members) {
-        if (m) processDecl(*m);
-    }
-    symbols_.leaveScope();
-
-    // 协议符合性检查 / Protocol conformance checking
-    for (const auto& proto : decl.conformsTo) {
-        if (!proto) continue;
-        std::string protoName;
-        if (proto->typeReprKind == TypeReprKind::Named) {
-            protoName = static_cast<const NamedTypeRepr&>(*proto).name;
-        }
-        if (protoName.empty()) continue;
-
-        // 查找协议定义 / Find protocol definition
-        Symbol* protoSym = symbols_.lookup(protoName);
-        if (!protoSym || protoSym->kind != SymbolKind::Type) {
-            warning(decl.loc, "protocol '" + protoName + "' not found");
-            continue;
-        }
-
-        // 收集协议要求的方法名、属性名、subscript / Collect required methods, properties, subscripts
-        std::set<std::string> requiredMethods;
-        std::set<std::string> requiredProperties;
-        bool requiresSubscript = false;
-        bool requiresInit = false;
-        if (currentCu_) {
-            for (const auto& d : currentCu_->declarations) {
-                if (d && d->declKind == DeclKind::Protocol) {
-                    auto& pd = static_cast<const ProtocolDecl&>(*d);
-                    if (pd.name == protoName) {
-                        for (const auto& member : pd.members) {
-                            if (!member) continue;
-                            if (member->declKind == DeclKind::Function) {
-                                auto& fd = static_cast<const FunctionDecl&>(*member);
-                                requiredMethods.insert(fd.name);
-                            } else if (member->declKind == DeclKind::Variable) {
-                                auto& vd = static_cast<const VariableDecl&>(*member);
-                                if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
-                                    requiredProperties.insert(static_cast<const IdentifierPattern*>(vd.pattern.get())->name);
-                                }
-                            } else if (member->declKind == DeclKind::Subscript) {
-                                requiresSubscript = true;
-                            } else if (member->declKind == DeclKind::Init) {
-                                requiresInit = true;
-                            }
+                    const Type* it = checkExpr(vd->initializer.get(), context);
+                    if (it && it->kind == TypeKind::Tuple) {
+                        if (it->elements.size() != vd->tupleNames.size()) {
+                            hadError_ = true;
+                            diags_.reportError(
+                                "tuple pattern expects " +
+                                    std::to_string(vd->tupleNames.size()) +
+                                    " values, found " +
+                                    std::to_string(it->elements.size()),
+                                rangeOf(vd));
                         }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 检查当前类型是否实现了所有要求的方法
-        for (const auto& methodName : requiredMethods) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Function) {
-                    auto& fd = static_cast<const FunctionDecl&>(*member);
-                    if (fd.name == methodName) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if (!found) {
-                error(decl.loc, "type '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
-            }
-        }
-
-        // 检查当前类型是否实现了所有要求的属性
-        for (const auto& propName : requiredProperties) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Variable) {
-                    auto& vd = static_cast<const VariableDecl&>(*member);
-                    if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
-                        if (static_cast<const IdentifierPattern*>(vd.pattern.get())->name == propName) {
-                            found = true;
-                            break;
+                        for (size_t i = 0; i < vd->tupleNames.size(); ++i) {
+                            const Type* et = i < it->elements.size()
+                                                 ? it->elements[i]
+                                                 : types_.unknownType();
+                            Symbol s;
+                            s.kind = Symbol::Kind::Variable;
+                            s.type = et;
+                            s.isLet = vd->isLet;
+                            locals_.declare(vd->tupleNames[i], s);
                         }
-                    }
-                }
-            }
-            if (!found) {
-                error(decl.loc, "type '" + decl.name + "' does not implement required property '" + propName + "' from protocol '" + protoName + "'");
-            }
-        }
-
-        // 检查 subscript
-        if (requiresSubscript) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Subscript) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                error(decl.loc, "type '" + decl.name + "' does not implement required subscript from protocol '" + protoName + "'");
-            }
-        }
-
-        // 检查 init
-        if (requiresInit) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Init) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                error(decl.loc, "type '" + decl.name + "' does not implement required init from protocol '" + protoName + "'");
-            }
-        }
-    }
-
-    currentTypeName_ = prevTypeName;
-}
-
-void Sema::processClassDecl(ClassDecl& decl) {
-    // 类型已在预注册阶段定义，跳过重复定义
-    std::string prevTypeName = currentTypeName_;
-    std::string prevSuperclass = currentSuperclassName_;
-    currentTypeName_ = decl.name;
-
-    // 设置父类名称 / Set superclass name
-    if (decl.superclass) {
-        auto& ntr = static_cast<const NamedTypeRepr&>(*decl.superclass);
-        currentSuperclassName_ = ntr.name;
-        classParent_[decl.name] = ntr.name;
-    } else {
-        currentSuperclassName_.clear();
-    }
-
-    symbols_.enterScope();
-    for (auto& m : decl.members) {
-        if (!m) continue;
-
-        // override/final 检查 / override/final checking
-        if (m->declKind == DeclKind::Function) {
-            auto& fd = static_cast<FunctionDecl&>(*m);
-            if (fd.isOverride) {
-                // 检查父类是否有该方法 / Check parent class has this method
-                bool foundInParent = false;
-                std::string parentName = currentSuperclassName_;
-                while (!parentName.empty()) {
-                    auto parentIt = classMethods_.find(parentName);
-                    if (parentIt != classMethods_.end()) {
-                        if (parentIt->second.count(fd.name)) {
-                            foundInParent = true;
-                            break;
-                        }
-                    }
-                    auto ppIt = classParent_.find(parentName);
-                    if (ppIt != classParent_.end()) {
-                        parentName = ppIt->second;
                     } else {
-                        break;
+                        hadError_ = true;
+                        diags_.reportError(
+                            "cannot destructure a value of type '" + typeToString(it) +
+                                "' with a tuple pattern",
+                            rangeOf(vd->initializer.get()));
                     }
                 }
-                if (!foundInParent) {
-                    error(fd.loc, "'" + fd.name + "' marked as 'override' but not found in parent class");
-                }
-            }
-            if (fd.isFinal) {
-                // 检查 final 方法不被子类重写（在子类处理时检查）
-            }
-            // 检查父类的 final 方法不被重写 / Check parent's final methods are not overridden
-            std::string parentName = currentSuperclassName_;
-            while (!parentName.empty()) {
-                auto parentIt = classMethods_.find(parentName);
-                if (parentIt != classMethods_.end()) {
-                    auto methodIt = parentIt->second.find(fd.name);
-                    if (methodIt != parentIt->second.end() && methodIt->second) {
-                        error(fd.loc, "'" + fd.name + "' is final in parent class '" + parentName + "' and cannot be overridden");
-                    }
-                }
-                auto ppIt = classParent_.find(parentName);
-                if (ppIt != classParent_.end()) {
-                    parentName = ppIt->second;
-                } else {
-                    break;
-                }
-            }
-            // 记录方法 / Record method
-            classMethods_[decl.name][fd.name] = fd.isFinal;
-        } else if (m->declKind == DeclKind::Init) {
-            auto& id = static_cast<InitDecl&>(*m);
-            // required init 检查 / required init checking
-            if (id.isRequired) {
-                classMethods_[decl.name]["init.required"] = false;
-            }
-            // convenience init 检查 / convenience init checking
-            if (id.isConvenience) {
-                // convenience init 必须调用 self.init 或 super.init
-                // 递归检查所有语句（包括嵌套块）
-                bool callsSelfInit = false;
-                std::function<void(const std::vector<StmtPtr>&)> checkStmts;
-                checkStmts = [&](const std::vector<StmtPtr>& stmts) {
-                    for (const auto& stmt : stmts) {
-                        if (!stmt) continue;
-                        if (stmt->stmtKind == StmtKind::Expression) {
-                            auto& es = static_cast<const ExpressionStmt&>(*stmt);
-                            if (es.expression && es.expression->exprKind == ExprKind::Call) {
-                                auto& call = static_cast<const CallExpr&>(*es.expression);
-                                if (call.callee->exprKind == ExprKind::MemberAccess) {
-                                    auto& ma = static_cast<const MemberAccessExpr&>(*call.callee);
-                                    if (ma.member == "init" &&
-                                        (ma.base->exprKind == ExprKind::SelfRef ||
-                                         ma.base->exprKind == ExprKind::SuperRef)) {
-                                        callsSelfInit = true;
-                                    }
-                                }
-                            }
-                        } else if (stmt->stmtKind == StmtKind::DeclStmt) {
-                            auto& ds = static_cast<const DeclStmt&>(*stmt);
-                            if (ds.decl) {
-                                // 检查嵌套控制流
-                                if (ds.decl->declKind == DeclKind::If) {
-                                    auto& ifDecl = static_cast<const IfDecl&>(*ds.decl);
-                                    checkStmts(ifDecl.thenBody);
-                                    checkStmts(ifDecl.elseBody);
-                                } else if (ds.decl->declKind == DeclKind::DoCatch) {
-                                    auto& dc = static_cast<const DoCatchDecl&>(*ds.decl);
-                                    checkStmts(dc.doBody);
-                                    for (const auto& c : dc.catches) {
-                                        checkStmts(c.body);
-                                    }
-                                } else if (ds.decl->declKind == DeclKind::While) {
-                                    auto& wh = static_cast<const WhileDecl&>(*ds.decl);
-                                    checkStmts(wh.body);
-                                } else if (ds.decl->declKind == DeclKind::ForIn) {
-                                    auto& fi = static_cast<const ForInDecl&>(*ds.decl);
-                                    checkStmts(fi.body);
-                                }
-                            }
-                        } else if (stmt->stmtKind == StmtKind::Compound) {
-                            auto& cs = static_cast<const CompoundStmt&>(*stmt);
-                            checkStmts(cs.statements);
-                        }
-                    }
-                };
-                checkStmts(id.body);
-                if (!callsSelfInit && !id.body.empty()) {
-                    error(id.loc, "convenience init must delegate to another init via self.init() or super.init()");
-                }
-            }
-        }
-
-        processDecl(*m);
-    }
-    symbols_.leaveScope();
-
-    // 检查父类的 required init 是否被实现 / Check parent's required inits are implemented
-    if (!currentSuperclassName_.empty()) {
-        std::string parentName = currentSuperclassName_;
-        while (!parentName.empty()) {
-            auto parentIt = classMethods_.find(parentName);
-            if (parentIt != classMethods_.end()) {
-                if (parentIt->second.count("init.required")) {
-                    // 检查当前类是否有 required init
-                    bool hasRequiredInit = false;
-                    for (const auto& m : decl.members) {
-                        if (m && m->declKind == DeclKind::Init) {
-                            auto& id = static_cast<const InitDecl&>(*m);
-                            if (id.isRequired) {
-                                hasRequiredInit = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!hasRequiredInit) {
-                        error(decl.loc, "class '" + decl.name + "' must implement required init from parent class '" + parentName + "'");
-                    }
-                }
-            }
-            auto ppIt = classParent_.find(parentName);
-            if (ppIt != classParent_.end()) {
-                parentName = ppIt->second;
-            } else {
+                vd->semaType = vd->initializer ? vd->initializer->semaType
+                                              : types_.unknownType();
                 break;
             }
-        }
-    }
-
-    // 协议符合性检查 / Protocol conformance checking
-    for (const auto& proto : decl.conformsTo) {
-        if (!proto) continue;
-        std::string protoName;
-        if (proto->typeReprKind == TypeReprKind::Named) {
-            protoName = static_cast<const NamedTypeRepr&>(*proto).name;
-        }
-        if (protoName.empty()) continue;
-
-        Symbol* protoSym = symbols_.lookup(protoName);
-        if (!protoSym || protoSym->kind != SymbolKind::Type) {
-            warning(decl.loc, "protocol '" + protoName + "' not found");
-            continue;
-        }
-
-        // 收集协议要求的方法、属性、subscript、init
-        std::set<std::string> requiredMethods;
-        std::set<std::string> requiredProperties;
-        bool requiresSubscript = false;
-        bool requiresInit = false;
-        if (currentCu_) {
-            for (const auto& d : currentCu_->declarations) {
-                if (d && d->declKind == DeclKind::Protocol) {
-                    auto& pd = static_cast<const ProtocolDecl&>(*d);
-                    if (pd.name == protoName) {
-                        for (const auto& member : pd.members) {
-                            if (!member) continue;
-                            if (member->declKind == DeclKind::Function) {
-                                requiredMethods.insert(static_cast<const FunctionDecl&>(*member).name);
-                            } else if (member->declKind == DeclKind::Variable) {
-                                auto& vd = static_cast<const VariableDecl&>(*member);
-                                if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
-                                    requiredProperties.insert(static_cast<const IdentifierPattern*>(vd.pattern.get())->name);
-                                }
-                            } else if (member->declKind == DeclKind::Subscript) {
-                                requiresSubscript = true;
-                            } else if (member->declKind == DeclKind::Init) {
-                                requiresInit = true;
-                            }
-                        }
-                        break;
-                    }
-                }
+            const Type* init = nullptr;
+            if (vd->initializer) {
+                const Type* dt = declared ? declared : nullptr;
+                init = (dt && dt->kind == TypeKind::Char)
+                    ? checkAsChar(vd->initializer.get(), context)
+                    : checkExpr(vd->initializer.get(), context);
+                // `let s: Set<Int> = {1, 2}` — the empty (or bare) literal has
+                // nothing to infer from, so the annotation supplies the element.
+                if (dt && dt->kind == TypeKind::Set &&
+                    vd->initializer->kind == NodeKind::SetLitExpr)
+                    vd->initializer->semaType = dt;
             }
-        }
-
-        // 检查方法
-        for (const auto& methodName : requiredMethods) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Function) {
-                    if (static_cast<const FunctionDecl&>(*member).name == methodName) {
-                        found = true;
-                        break;
-                    }
-                }
+            if (declared && init)
+                requireAssignable(declared, init, vd->initializer.get(), "variable initializer");
+            const Type* type = declared ? declared : (init ? init : types_.unknownType());
+            vd->semaType = type; // annotated for the code generator
+            // Propagate an explicit annotation onto an empty collection literal
+            // (`let a: [Int] = []`, `let d: [Int: Int] = [:]`). Such a literal
+            // carries no elements to infer from, so without this it would stay
+            // `Array<Unknown>` / `Dictionary<Unknown, Unknown>` and lowering
+            // would pick the wrong element stride.
+            if (declared && vd->initializer) {
+                Node* init = vd->initializer.get();
+                bool emptyArray = init->kind == NodeKind::ArrayLitExpr &&
+                                  static_cast<ArrayLitExpr*>(init)->elements.empty();
+                bool emptyDict = init->kind == NodeKind::DictLitExpr &&
+                                 static_cast<DictLitExpr*>(init)->keys.empty();
+                if (!init->semaType || emptyArray || emptyDict)
+                    init->semaType = declared;
             }
-            if (!found) {
-                error(decl.loc, "class '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
+            // Computed property accessors, if present, are checked as a body.
+            // Accessor bodies are checked in the owner's context so that
+            // `self` and the owner's members resolve.
+            for (auto& acc : vd->accessors) {
+                if (!acc || acc->kind != NodeKind::AccessorDecl) continue;
+                auto* ad = static_cast<AccessorDecl*>(acc.get());
+                // A getter returns the property type; the others return Void.
+                const Type* accRet = ad->kind == AccessorDecl::Kind::Getter
+                    ? type : types_.voidType();
+                checkStatements(ad->body, context, accRet, isThrowing);
             }
-        }
-
-        // 检查属性
-        for (const auto& propName : requiredProperties) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Variable) {
-                    auto& vd = static_cast<const VariableDecl&>(*member);
-                    if (vd.pattern && vd.pattern->patternKind == PatternKind::Identifier) {
-                        if (static_cast<const IdentifierPattern*>(vd.pattern.get())->name == propName) {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!found) {
-                error(decl.loc, "class '" + decl.name + "' does not implement required property '" + propName + "' from protocol '" + protoName + "'");
-            }
-        }
-
-        // 检查 subscript
-        if (requiresSubscript) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Subscript) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                error(decl.loc, "class '" + decl.name + "' does not implement required subscript from protocol '" + protoName + "'");
-            }
-        }
-
-        // 检查 init
-        if (requiresInit) {
-            bool found = false;
-            for (const auto& member : decl.members) {
-                if (member && member->declKind == DeclKind::Init) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                error(decl.loc, "class '" + decl.name + "' does not implement required init from protocol '" + protoName + "'");
-            }
-        }
-    }
-
-    currentTypeName_ = prevTypeName;
-    currentSuperclassName_ = prevSuperclass;
-}
-
-void Sema::processEnumDecl(EnumDecl& decl) {
-    // 类型已在预注册阶段定义，跳过重复定义
-    // 注册枚举 case
-    bool isPublic = (decl.access == AccessLevel::Public);
-    for (auto& c : decl.cases) {
-        if (c) {
-            Symbol cs;
-            cs.kind = SymbolKind::EnumCase;
-            cs.name = c->name;
-            cs.isPublic = isPublic;
-            symbols_.define(cs);
-        }
-    }
-
-    // 协议符合性检查 / Protocol conformance checking
-    for (const auto& proto : decl.conformsTo) {
-        if (!proto) continue;
-        std::string protoName;
-        if (proto->typeReprKind == TypeReprKind::Named) {
-            protoName = static_cast<const NamedTypeRepr&>(*proto).name;
-        }
-        if (protoName.empty()) continue;
-
-        Symbol* protoSym = symbols_.lookup(protoName);
-        if (!protoSym || protoSym->kind != SymbolKind::Type) {
-            warning(decl.loc, "protocol '" + protoName + "' not found");
-            continue;
-        }
-
-        std::set<std::string> requiredMethods;
-        if (currentCu_) {
-            for (const auto& d : currentCu_->declarations) {
-                if (d && d->declKind == DeclKind::Protocol) {
-                    auto& pd = static_cast<const ProtocolDecl&>(*d);
-                    if (pd.name == protoName) {
-                        for (const auto& member : pd.members) {
-                            if (member && member->declKind == DeclKind::Function) {
-                                requiredMethods.insert(static_cast<const FunctionDecl&>(*member).name);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 收集枚举上定义的方法 / Collect methods defined on enum
-        std::set<std::string> enumMethods;
-        // 枚举没有 members 字段，方法通过 extension 定义
-        // 检查编译单元中是否有扩展该枚举的方法
-        if (currentCu_) {
-            for (const auto& d : currentCu_->declarations) {
-                if (d && d->declKind == DeclKind::Extension) {
-                    auto& ext = static_cast<const ExtensionDecl&>(*d);
-                    if (ext.extendedType && ext.extendedType->typeReprKind == TypeReprKind::Named) {
-                        auto& extName = static_cast<const NamedTypeRepr&>(*ext.extendedType);
-                        if (extName.name == decl.name) {
-                            for (const auto& member : ext.members) {
-                                if (member && member->declKind == DeclKind::Function) {
-                                    enumMethods.insert(static_cast<const FunctionDecl&>(*member).name);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (const auto& methodName : requiredMethods) {
-            bool found = false;
-            if (enumMethods.count(methodName)) {
-                found = true;
-            }
-            if (!found) {
-                warning(decl.loc, "enum '" + decl.name + "' does not implement required method '" + methodName + "' from protocol '" + protoName + "'");
-            }
-        }
-    }
-}
-
-void Sema::processStmt(Stmt& stmt) {
-    switch (stmt.stmtKind) {
-        case StmtKind::Expression:
-            processExprStmt(static_cast<ExpressionStmt&>(stmt));
+            declareLocal(*this, locals_, vd->name, type, vd, vd->isLet);
+            // `let x: Int`（无初始化器）进入待初始化状态：首次赋值即初始化，
+            // 之后不可再赋值（规范 1.3 允许延迟初始化）。
+            if (!vd->name.empty() && !vd->initializer && declared)
+                pendingInit_.insert(vd->name);
             break;
-        case StmtKind::Return:
-            processReturnStmt(static_cast<ReturnStmt&>(stmt));
+        }
+        case NodeKind::BlockStmt: {
+            // `let a = 1, b = 2` desugars to a BlockStmt of VarDecls.
+            auto* b = static_cast<BlockStmt*>(stmt);
+            checkStatements(b->statements, context, fnReturnType, isThrowing);
             break;
-        case StmtKind::Break:
-            if (!typeChecker_.isInLoop() && !typeChecker_.isInSwitch()) {
-                error(stmt.loc, "'break' must be inside a loop or switch");
-            }
+        }
+        case NodeKind::ExprStmt:
+            checkExpr(static_cast<ExprStmt*>(stmt)->expr.get(), context);
             break;
-        case StmtKind::Continue:
-            if (!typeChecker_.isInLoop()) {
-                error(stmt.loc, "'continue' must be inside a loop");
-            }
-            break;
-        case StmtKind::Fallthrough:
-            if (!typeChecker_.isInSwitch()) {
-                error(stmt.loc, "'fallthrough' must be inside a switch case");
-            }
-            break;
-        case StmtKind::Throw: {
-            if (!typeChecker_.isInThrowsFunction()) {
-                error(stmt.loc, "'throw' must be inside a function marked 'throws'");
-            }
-            // 检查 thrown 类型是否符合 Error 协议
-            auto& throwStmt = static_cast<const ThrowStmt&>(stmt);
-            if (throwStmt.value) {
-                TypePtr thrownType = inferExprType(*throwStmt.value);
-                if (thrownType) {
-                    // 检查是否是 Error 类型或其子类
-                    bool isErrorType = false;
-                    if (thrownType->kind() == TypeKind::Error) {
-                        isErrorType = true;
-                    } else if (thrownType->kind() == TypeKind::Class || thrownType->kind() == TypeKind::Struct) {
-                        // 检查类型名是否包含 "Error"
-                        std::string typeName = thrownType->name();
-                        if (typeName.find("Error") != std::string::npos) {
-                            isErrorType = true;
-                        }
-                    }
-                    if (!isErrorType && thrownType->kind() != TypeKind::Any) {
-                        warning(stmt.loc, "thrown type '" + thrownType->name() + "' may not conform to Error protocol");
-                    }
-                }
+        case NodeKind::ReturnStmt: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) {
+                // A `Char`-returning function reads a one-scalar string literal
+                // as a character.
+                const Type* vt =
+                    (fnReturnType && fnReturnType->kind == TypeKind::Char)
+                        ? checkAsChar(r->value.get(), context)
+                        : checkExpr(r->value.get(), context);
+                if (fnReturnType)
+                    requireAssignable(fnReturnType, vt, r->value.get(), "return");
             }
             break;
         }
-        case StmtKind::VariableDecl: {
-            auto& vs = static_cast<VariableDeclStmt&>(stmt);
-            if (vs.varDecl) processVariableDecl(static_cast<VariableDecl&>(*vs.varDecl));
-            break;
-        }
-        case StmtKind::DeclStmt: {
-            auto& ds = static_cast<DeclStmt&>(stmt);
-            if (ds.decl) processDecl(*ds.decl);
-            break;
-        }
-        case StmtKind::Compound: {
-            auto& cs = static_cast<CompoundStmt&>(stmt);
-            symbols_.enterScope();
-            for (auto& s : cs.statements) {
-                if (s) processStmt(*s);
-            }
-            symbols_.leaveScope();
-            break;
-        }
-        default: break;
-    }
-}
-
-void Sema::processReturnStmt(ReturnStmt& stmt) {
-    if (stmt.value) {
-        TypePtr returnType = inferExprType(*stmt.value);
-        if (returnType && currentReturnType_) {
-            // 泛型参数返回类型跳过检查 / Skip check for generic return types
-            if (returnType->kind() == TypeKind::Any) return;
-            if (currentReturnType_->kind() == TypeKind::Any) return;
-            typeChecker_.checkReturnType(*currentReturnType_, *returnType, stmt.loc);
-        }
-    } else if (currentReturnType_ && currentReturnType_->kind() != TypeKind::Void) {
-        error(stmt.loc, "non-void function must return a value");
-    }
-}
-
-void Sema::processExprStmt(ExpressionStmt& stmt) {
-    if (stmt.expression) inferExprType(*stmt.expression);
-}
-
-TypePtr Sema::inferExprType(Expr& expr) {
-    switch (expr.exprKind) {
-        case ExprKind::IntegerLiteral:
-            return getIntType(64);
-        case ExprKind::FloatLiteral:
-            return getDoubleType();
-        case ExprKind::StringLiteral:
-            return getStringType();
-        case ExprKind::BoolLiteral:
-            return getBoolType();
-        case ExprKind::NilLiteral:
-            // nil 可以赋值给任何 Optional 类型
-            // nil can be assigned to any Optional type
-            // 返回 ErrorType 作为特殊标记，在类型检查时允许赋值给 Optional
-            return getErrorType();
-        case ExprKind::Identifier: {
-            auto& id = static_cast<IdentifierExpr&>(expr);
-            Symbol* sym = symbols_.lookup(id.name);
-            if (!sym) {
-                error(expr.loc, "undeclared identifier '" + id.name + "'");
-                return getErrorType();
-            }
-            // 移动语义检查 / Move semantics check
-            if (movedVariables_.count(id.name) > 0) {
-                error(expr.loc, "variable '" + id.name + "' has been moved and cannot be used");
-                return getErrorType();
-            }
-            // 访问控制检查 / Access control check
-            if (!symbols_.isAccessible(*sym)) {
-                std::string accessName;
-                switch (sym->access) {
-                    case AccessLevel::Private: accessName = "private"; break;
-                    case AccessLevel::FilePrivate: accessName = "fileprivate"; break;
-                    case AccessLevel::Internal: accessName = "internal"; break;
-                    default: accessName = "private"; break;
-                }
-                error(expr.loc, "'" + id.name + "' is " + accessName + " and cannot be accessed here");
-            }
-            return sym->type;
-        }
-        case ExprKind::Binary: {
-            auto& bin = static_cast<BinaryExpr&>(expr);
-            TypePtr lt = inferExprType(*bin.left);
-            TypePtr rt = inferExprType(*bin.right);
-            if (!lt || !rt) return getErrorType();
-            if (bin.op == TokenKind::Equal || bin.op == TokenKind::NotEqual ||
-                bin.op == TokenKind::Less || bin.op == TokenKind::Greater ||
-                bin.op == TokenKind::LessEqual || bin.op == TokenKind::GreaterEqual ||
-                bin.op == TokenKind::AmpAmp || bin.op == TokenKind::PipePipe) {
-                return getBoolType();
-            }
-            return lt;
-        }
-        case ExprKind::Call: {
-            auto& call = static_cast<CallExpr&>(expr);
-
-            // Actor 隔离检查：调用 actor 方法需要 await
-            // Actor isolation check: calling actor methods requires await
-            if (call.callee->exprKind == ExprKind::MemberAccess) {
-                auto& ma = static_cast<MemberAccessExpr&>(*call.callee);
-                TypePtr baseType = inferExprType(*ma.base);
-                if (baseType && baseType->kind() == TypeKind::Actor) {
-                    // 检查调用是否被 await 包裹
-                    if (!isInAwaitExpr_) {
-                        error(expr.loc, "calling actor method '" + ma.member + "' requires 'await'");
-                    }
-                }
-            }
-
-            if (call.callee->exprKind == ExprKind::Identifier) {
-                auto& id = static_cast<IdentifierExpr&>(*call.callee);
-                Symbol* sym = symbols_.lookup(id.name);
-                if (!sym) {
-                    error(expr.loc, "undeclared function '" + id.name + "'");
-                    return getErrorType();
-                }
-                if (sym->kind != SymbolKind::Function) {
-                    error(expr.loc, "'" + id.name + "' is not a function");
-                    return getErrorType();
-                }
-                // Check argument count
-                if (call.args.size() != sym->paramTypes.size()) {
-                    error(expr.loc, "function '" + id.name + "' expects " +
-                          std::to_string(sym->paramTypes.size()) + " arguments, got " +
-                          std::to_string(call.args.size()));
+        case NodeKind::IfStmt: {
+            auto* ifs = static_cast<IfStmt*>(stmt);
+            locals_.pushScope();
+            if (ifs->condition) {
+                if (ifs->condition->kind == NodeKind::VarDecl) {
+                    // `if let x = opt` — declare the unwrapped binding.
+                    auto* vd = static_cast<VarDecl*>(ifs->condition.get());
+                    const Type* init = vd->initializer
+                        ? checkExpr(vd->initializer.get(), context) : types_.unknownType();
+                    const Type* bound = (init && init->kind == TypeKind::Optional)
+                        ? init->element : init;
+                    declareLocal(*this, locals_, vd->name, bound, vd, true);
                 } else {
-                    // Check argument types
-                    for (size_t i = 0; i < call.args.size(); i++) {
-                        TypePtr argType = inferExprType(*call.args[i].value);
-                        if (argType && sym->paramTypes[i] &&
-                            argType->kind() != TypeKind::Error &&
-                            sym->paramTypes[i]->kind() != TypeKind::Error &&
-                            !argType->canImplicitlyConvertTo(*sym->paramTypes[i])) {
-                            error(call.args[i].value->loc,
-                                  "argument type " + argType->name() +
-                                  " does not match parameter type " + sym->paramTypes[i]->name());
-                        }
-                    }
-                }
-                return sym->returnType;
-            }
-            return nullptr;
-        }
-        case ExprKind::Unary: {
-            auto& u = static_cast<UnaryExpr&>(expr);
-            TypePtr ot = inferExprType(*u.operand);
-            if (!ot) return getErrorType();
-            if (u.op == TokenKind::Bang) return getBoolType();
-            return ot;
-        }
-        case ExprKind::MemberAccess: {
-            auto& ma = static_cast<MemberAccessExpr&>(expr);
-            TypePtr baseType = inferExprType(*ma.base);
-            if (!baseType) return nullptr;
-
-            // 首先在当前作用域查找 / First look up in current scope
-            Symbol* sym = symbols_.lookup(ma.member);
-            if (sym) return sym->type;
-
-            // 基于基类型查找成员 / Look up member based on base type
-            // 如果基类型是命名类型，查找其成员
-            if (baseType->kind() == TypeKind::Struct ||
-                baseType->kind() == TypeKind::Class ||
-                baseType->kind() == TypeKind::Enum) {
-                // 在符号表中查找类型成员 / Look up type member in symbol table
-                std::string typeName = baseType->name();
-                Symbol* typeSym = symbols_.lookup(typeName);
-                if (typeSym) {
-                    // 查找成员函数 / Look up member function
-                    std::string memberFuncName = typeName + "." + ma.member;
-                    Symbol* memberSym = symbols_.lookup(memberFuncName);
-                    if (memberSym) return memberSym->type;
+                    const Type* ct = checkExpr(ifs->condition.get(), context);
+                    if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown)
+                        hadError_ = true, diags_.reportError(
+                            "condition must be Bool, found '" + typeToString(ct) + "'",
+                            rangeOf(ifs->condition.get()));
                 }
             }
-
-            // 如果基类型是字符串，返回字符串方法的类型
-            // If base type is String, return String method type
-            if (baseType->kind() == TypeKind::String) {
-                // 字符串方法如 count, isEmpty 等返回 Int 或 Bool
-                if (ma.member == "count" || ma.member == "length") return getIntType();
-                if (ma.member == "isEmpty") return getBoolType();
-                if (ma.member == "uppercased" || ma.member == "lowercased") return getStringType();
+            checkStatements(ifs->thenBody, context, fnReturnType, isThrowing);
+            if (ifs->elseBranch) checkStatement(ifs->elseBranch.get(), context, fnReturnType, isThrowing);
+            locals_.popScope();
+            break;
+        }
+        case NodeKind::IfExpr: {
+            auto* e = static_cast<IfExpr*>(stmt);
+            if (e->condition && e->condition->kind != NodeKind::VarDecl) {
+                const Type* ct = checkExpr(e->condition.get(), context);
+                if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown)
+                    diags_.reportError("condition must be Bool", rangeOf(e->condition.get()));
+            } else if (e->condition) {
+                checkStatement(e->condition.get(), context, fnReturnType, isThrowing);
             }
-
-            // 如果基类型是数组，返回数组属性类型
-            // If base type is Array, return Array property type
-            if (baseType->kind() == TypeKind::Array) {
-                if (ma.member == "count" || ma.member == "size") return getIntType();
-                if (ma.member == "isEmpty") return getBoolType();
+            checkStatements(e->thenBody, context, fnReturnType, isThrowing);
+            if (e->elseBranch) checkStatement(e->elseBranch.get(), context, fnReturnType, isThrowing);
+            break;
+        }
+        case NodeKind::GuardStmt: {
+            auto* g = static_cast<GuardStmt*>(stmt);
+            if (g->condition && g->condition->kind == NodeKind::VarDecl) {
+                auto* vd = static_cast<VarDecl*>(g->condition.get());
+                const Type* init = vd->initializer ? checkExpr(vd->initializer.get(), context)
+                                                   : types_.unknownType();
+                const Type* bound = (init && init->kind == TypeKind::Optional) ? init->element : init;
+                declareLocal(*this, locals_, vd->name, bound, vd, true);
+            } else if (g->condition) {
+                const Type* ct = checkExpr(g->condition.get(), context);
+                if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown)
+                    diags_.reportError("condition must be Bool", rangeOf(g->condition.get()));
             }
-
-            return nullptr;
+            checkStatements(g->elseBody, context, fnReturnType, isThrowing);
+            break;
         }
-        case ExprKind::Subscript: {
-            auto& sub = static_cast<SubscriptExpr&>(expr);
-            TypePtr baseType = inferExprType(*sub.base);
-            if (!baseType) return nullptr;
-            // Array subscript returns element type
-            if (baseType->kind() == TypeKind::Array) {
-                return std::static_pointer_cast<ArrayType>(baseType)->elementType();
+        case NodeKind::WhileStmt: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            if (w->condition && w->condition->kind == NodeKind::VarDecl) {
+                checkStatement(w->condition.get(), context, fnReturnType, isThrowing);
+            } else if (w->condition) {
+                const Type* ct = checkExpr(w->condition.get(), context);
+                if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown)
+                    diags_.reportError("while condition must be Bool", rangeOf(w->condition.get()));
             }
-            // Dictionary subscript returns value type
-            if (baseType->kind() == TypeKind::Dictionary) {
-                return std::static_pointer_cast<DictType>(baseType)->valueType();
+            locals_.pushScope();
+            checkStatements(w->body, context, fnReturnType, isThrowing);
+            locals_.popScope();
+            break;
+        }
+        case NodeKind::RepeatWhileStmt: {
+            auto* r = static_cast<RepeatWhileStmt*>(stmt);
+            locals_.pushScope();
+            checkStatements(r->body, context, fnReturnType, isThrowing);
+            locals_.popScope();
+            if (r->condition) {
+                const Type* ct = checkExpr(r->condition.get(), context);
+                if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown)
+                    diags_.reportError("while condition must be Bool", rangeOf(r->condition.get()));
             }
-            return nullptr;
+            break;
         }
-        case ExprKind::OptionalChain: {
-            auto& oc = static_cast<OptionalChainExpr&>(expr);
-            TypePtr innerType = inferExprType(*oc.subExpr);
-            if (!innerType) return nullptr;
-            // Optional chain wraps result in Optional
-            return std::make_shared<OptionalType>(innerType);
-        }
-        case ExprKind::ForceUnwrap: {
-            auto& fu = static_cast<ForceUnwrapExpr&>(expr);
-            TypePtr innerType = inferExprType(*fu.subExpr);
-            if (!innerType) return nullptr;
-            // Force unwrap removes Optional
-            if (innerType->kind() == TypeKind::Optional) {
-                return std::static_pointer_cast<OptionalType>(innerType)->baseType();
-            }
-            return innerType;
-        }
-        case ExprKind::TypeCast: {
-            auto& tc = static_cast<TypeCastExpr&>(expr);
-            return resolveTypeRepr(*tc.targetType);
-        }
-        case ExprKind::TypeCheck:
-            return getBoolType(); // is Type always returns Bool
-        case ExprKind::Try: {
-            auto& te = static_cast<TryExpr&>(expr);
-            TypePtr innerType = inferExprType(*te.subExpr);
-            if (!innerType) return nullptr;
-            // try? wraps in Optional, try! unwraps, try passes through
-            if (te.isOptional) return std::make_shared<OptionalType>(innerType);
-            return innerType;
-        }
-        case ExprKind::Await: {
-            auto& ae = static_cast<AwaitExpr&>(expr);
-            bool prevAwait = isInAwaitExpr_;
-            isInAwaitExpr_ = true;
-            TypePtr result = inferExprType(*ae.subExpr);
-            isInAwaitExpr_ = prevAwait;
-            return result;
-        }
-        case ExprKind::Move: {
-            auto& me = static_cast<MoveExpr&>(expr);
-            // 标记变量为已移动 / Mark variable as moved
-            if (me.subExpr->exprKind == ExprKind::Identifier) {
-                auto& id = static_cast<IdentifierExpr&>(*me.subExpr);
-                movedVariables_.insert(id.name);
-            }
-            return inferExprType(*me.subExpr);
-        }
-        case ExprKind::ArrayLiteral: {
-            auto& arr = static_cast<const ArrayLiteralExpr&>(expr);
-            // 从第一个元素推断类型 / Infer type from first element
-            TypePtr elemType = getAnyType();
-            if (!arr.elements.empty()) {
-                TypePtr firstType = inferExprType(*arr.elements[0]);
-                if (firstType) elemType = firstType;
-            }
-            return std::make_shared<ArrayType>(elemType);
-        }
-        case ExprKind::DictLiteral: {
-            auto& dict = static_cast<const DictLiteralExpr&>(expr);
-            TypePtr keyType = getAnyType();
-            TypePtr valType = getAnyType();
-            if (!dict.entries.empty()) {
-                TypePtr k = inferExprType(*dict.entries[0].key);
-                TypePtr v = inferExprType(*dict.entries[0].value);
-                if (k) keyType = k;
-                if (v) valType = v;
-            }
-            return std::make_shared<DictType>(keyType, valType);
-        }
-        case ExprKind::SetLiteral: {
-            auto& set = static_cast<const SetLiteralExpr&>(expr);
-            TypePtr elemType = getAnyType();
-            if (!set.elements.empty()) {
-                TypePtr firstType = inferExprType(*set.elements[0]);
-                if (firstType) elemType = firstType;
-            }
-            return std::make_shared<SetType>(elemType);
-        }
-        case ExprKind::Tuple: {
-            auto& tuple = static_cast<const TupleExpr&>(expr);
-            std::vector<TupleType::Element> elems;
-            for (const auto& e : tuple.elements) {
-                TupleType::Element te;
-                te.label = e.label;
-                te.type = e.value ? inferExprType(*e.value) : getAnyType();
-                elems.push_back(te);
-            }
-            return std::make_shared<TupleType>(std::move(elems));
-        }
-        case ExprKind::Closure: {
-            // 闭包类型推断：从返回类型或 body 推断
-            auto& closure = static_cast<const ClosureExpr&>(expr);
-            // 如果有显式返回类型，使用它
-            if (closure.returnType) {
-                return resolveTypeRepr(*closure.returnType);
-            }
-            // 从 body 推断返回类型
-            if (!closure.body.empty()) {
-                // 查找 return 语句并推断其类型
-                for (const auto& stmt : closure.body) {
-                    if (stmt && stmt->stmtKind == StmtKind::Return) {
-                        auto& ret = static_cast<const ReturnStmt&>(*stmt);
-                        if (ret.value) {
-                            TypePtr retType = inferExprType(*ret.value);
-                            if (retType) return retType;
-                        }
-                        return getVoidType();
-                    }
-                }
-                // 如果没有 return 语句，检查最后一个表达式语句（隐式返回）
-                // For closures without explicit return, check last expression
-                if (!closure.body.empty()) {
-                    // 找到最后一个非空语句
-                    for (int si = static_cast<int>(closure.body.size()) - 1; si >= 0; si--) {
-                        const auto& stmt = closure.body[si];
-                        if (stmt && stmt->stmtKind == StmtKind::Expression) {
-                            auto& es = static_cast<const ExpressionStmt&>(*stmt);
-                            if (es.expression) {
-                                TypePtr exprType = inferExprType(*es.expression);
-                                if (exprType) return exprType;
+        case NodeKind::ForInStmt: {
+            auto* f = static_cast<ForInStmt*>(stmt);
+            const Type* seq = checkExpr(f->sequence.get(), context);
+            locals_.pushScope();
+            // Element type produced by iterating `seq`.
+            const Type* elem = types_.unknownType();
+            // A range has no semantic type of its own yet, but iterating one
+            // always yields integers (`for i in 0..<10` binds an Int), so the
+            // element is fixed here rather than left unknown.
+            if (f->sequence && f->sequence->kind == NodeKind::RangeExpr)
+                elem = types_.intType();
+            if (seq) {
+                switch (seq->kind) {
+                    case TypeKind::Array: case TypeKind::Set: elem = seq->element; break;
+                    case TypeKind::Dict: elem = types_.tuple({seq->key, seq->value}); break;
+                    case TypeKind::String: elem = types_.charType(); break;
+                    case TypeKind::Optional: elem = seq->element; break;
+                    case TypeKind::Named:
+                        if (seq->record) {
+                            for (const auto& m : seq->record->members) {
+                                if (m.isFunction && m.name == "makeIterator" && m.type &&
+                                    m.type->ret) { elem = m.type->ret; }
                             }
-                            break;
+                        }
+                        break;
+                    default: break;
+                }
+            }
+            // Declare the loop variable(s).
+            if (f->pattern) {
+                if (f->pattern->kind == NodeKind::VarDecl) {
+                    auto* vd = static_cast<VarDecl*>(f->pattern.get());
+                    const Type* pt = vd->type ? resolveTypeRepr(vd->type.get(), context) : elem;
+                    // The binding's type must be on the node too: lowering asks
+                    // for it at every use (`print(i)` needs to know `i` is an
+                    // Int), not only in the symbol table.
+                    vd->semaType = pt;
+                    declareLocal(*this, locals_, vd->name, pt, vd, true);
+                } else if (f->pattern->kind == NodeKind::TupleExpr) {
+                    auto* tup = static_cast<TupleExpr*>(f->pattern.get());
+                    for (size_t i = 0; i < tup->elements.size(); ++i) {
+                        auto& el = tup->elements[i];
+                        if (el && el->kind == NodeKind::IdentExpr) {
+                            const std::string& nm = static_cast<IdentExpr*>(el.get())->name;
+                            const Type* et = (elem && elem->kind == TypeKind::Tuple &&
+                                              i < elem->elements.size())
+                                ? elem->elements[i] : types_.unknownType();
+                            declareLocal(*this, locals_, nm, et, el.get(), true);
                         }
                     }
                 }
             }
-            return getVoidType();
+            checkStatements(f->body, context, fnReturnType, isThrowing);
+            locals_.popScope();
+            break;
         }
-        case ExprKind::If: {
-            auto& ifExpr = static_cast<const IfExpr&>(expr);
-            TypePtr thenType = ifExpr.thenExpr ? inferExprType(*ifExpr.thenExpr) : nullptr;
-            TypePtr elseType = ifExpr.elseExpr ? inferExprType(*ifExpr.elseExpr) : nullptr;
-            if (thenType) return thenType;
-            if (elseType) return elseType;
-            return nullptr;
+        case NodeKind::SwitchStmt: {
+            auto* s = static_cast<SwitchStmt*>(stmt);
+            const Type* subj = s->subject ? checkExpr(s->subject.get(), context)
+                                          : types_.unknownType();
+            // `case let v` needs the subject's type to type the binding.
+            const Type* savedSubject = switchSubjectType_;
+            switchSubjectType_ = subj;
+            for (auto& c : s->cases) checkStatement(c.get(), context, fnReturnType, isThrowing);
+            switchSubjectType_ = savedSubject;
+            (void)subj;
+            break;
         }
-        case ExprKind::InterpolatedString:
-            return getStringType();
-        case ExprKind::SelfRef:
-            // self 引用当前实例 / self references current instance
-            // 返回当前类型（如果有）/ Return current type (if available)
-            if (!currentTypeName_.empty()) {
-                Symbol* typeSym = symbols_.lookup(currentTypeName_);
-                if (typeSym) return typeSym->type;
+        case NodeKind::CaseClause: {
+            auto* c = static_cast<CaseClause*>(stmt);
+            if (c->pattern) {
+                inPattern_ = true;
+                checkExpr(c->pattern.get(), context);
+                inPattern_ = false;
             }
-            return getAnyType();
-        case ExprKind::SuperRef: {
-            // super 引用父类 / super references parent class
-            // 返回父类类型 / Return superclass type
-            if (!currentSuperclassName_.empty()) {
-                Symbol* typeSym = symbols_.lookup(currentSuperclassName_);
-                if (typeSym) return typeSym->type;
+            for (auto& alt : c->alternatives) {
+                if (!alt || alt->kind != NodeKind::CaseClause) continue;
+                auto* ac = static_cast<CaseClause*>(alt.get());
+                if (!ac->pattern) continue;
+                inPattern_ = false;
+                checkExpr(ac->pattern.get(), context);
             }
-            // 如果没有父类，返回当前类型
-            if (!currentTypeName_.empty()) {
-                Symbol* typeSym = symbols_.lookup(currentTypeName_);
-                if (typeSym) return typeSym->type;
+            locals_.pushScope();
+            // `case let v` / `case var v` — 值绑定模式：把 subject 以其类型绑定
+            // 到 v，随后 `where` 子句可用 v 过滤（规范 1.7）。
+            if (c->isBindingPattern) {
+                const Type* bt = switchSubjectType_ ? switchSubjectType_
+                                                    : types_.unknownType();
+                for (const std::string& b : c->bindings) {
+                    Symbol bs;
+                    bs.kind = Symbol::Kind::Variable;
+                    bs.type = bt;
+                    bs.isLet = true;
+                    locals_.declare(b, bs);
+                }
             }
-            return getAnyType();
-        }
-        case ExprKind::MacroExpansion: {
-            // 宏展开类型：从宏定义推断 / Macro expansion type: infer from macro definition
-            auto& me = static_cast<const MacroExpansionExpr&>(expr);
-            // 简化实现：返回 Any 类型 / Simplified: return Any type
-            // 实际应该分析宏展开结果的类型
-            return getAnyType();
-        }
-        default:
-            return nullptr;
-    }
-}
-
-TypePtr Sema::resolveTypeRepr(const TypeRepr& tr) {
-    switch (tr.typeReprKind) {
-        case TypeReprKind::Named: {
-            auto& n = static_cast<const NamedTypeRepr&>(tr);
-            TypePtr resolved = resolvePrimitiveType(n.name);
-            if (resolved) return resolved;
-            Symbol* sym = symbols_.lookup(n.name);
-            if (sym && sym->kind == SymbolKind::Type) return sym->type;
-            error(tr.loc, "unknown type '" + n.name + "'");
-            return getErrorType();
-        }
-        case TypeReprKind::Array: {
-            auto& a = static_cast<const ArrayTypeRepr&>(tr);
-            return std::make_shared<ArrayType>(resolveTypeRepr(*a.elementType));
-        }
-        case TypeReprKind::Dictionary: {
-            auto& d = static_cast<const DictTypeRepr&>(tr);
-            return std::make_shared<DictType>(resolveTypeRepr(*d.keyType),
-                                               resolveTypeRepr(*d.valueType));
-        }
-        case TypeReprKind::Optional: {
-            auto& o = static_cast<const OptionalTypeRepr&>(tr);
-            return std::make_shared<OptionalType>(resolveTypeRepr(*o.base));
-        }
-        case TypeReprKind::Function: {
-            auto& f = static_cast<const FunctionTypeRepr&>(tr);
-            std::vector<FunctionType::Param> params;
-            for (const auto& p : f.params) {
-                FunctionType::Param fp;
-                fp.type = resolveTypeRepr(*p.type);
-                fp.isInOut = p.isInOut;
-                params.push_back(fp);
-            }
-            TypePtr ret = f.returnType ? resolveTypeRepr(*f.returnType) : getVoidType();
-            return std::make_shared<FunctionType>(params, ret, f.isAsync, f.isThrows);
-        }
-        case TypeReprKind::Tuple: {
-            auto& t = static_cast<const TupleTypeRepr&>(tr);
-            std::vector<TupleType::Element> elems;
-            for (const auto& e : t.elements) {
-                TupleType::Element te;
-                te.label = e.label;
-                te.type = resolveTypeRepr(*e.type);
-                elems.push_back(te);
-            }
-            return std::make_shared<TupleType>(std::move(elems));
-        }
-        case TypeReprKind::Composition: {
-            // A & B 组合类型 — 创建包含所有协议的组合类型
-            auto& c = static_cast<const CompositionTypeRepr&>(tr);
-            if (!c.protocols.empty()) {
-                std::vector<TypePtr> protocolTypes;
-                for (const auto& proto : c.protocols) {
-                    if (proto) {
-                        TypePtr protoType = resolveTypeRepr(*proto);
-                        if (protoType && protoType->kind() != TypeKind::Error) {
-                            protocolTypes.push_back(protoType);
-                        } else {
-                            error(tr.loc, "protocol in composition type not found");
+            // Payload bindings introduced by the pattern (`let r`, `let w, ...`)
+            // are visible only inside this arm, typed by the case declaration.
+            if (!c->isBindingPattern && !c->bindings.empty() && c->pattern &&
+                c->pattern->kind == NodeKind::MemberExpr) {
+                auto* pm = static_cast<MemberExpr*>(c->pattern.get());
+                if (pm->base && pm->base->kind == NodeKind::IdentExpr) {
+                    const std::string& bn = static_cast<IdentExpr*>(pm->base.get())->name;
+                    if (const TypeRecord* rec = findType(bn)) {
+                        if (rec->kind == TypeDeclKind::Enum) {
+                            for (auto& ci : rec->cases) {
+                                if (ci.name != pm->member) continue;
+                                for (size_t i = 0;
+                                     i < c->bindings.size() && i < ci.associated.size(); ++i) {
+                                    Symbol bs;
+                                    bs.kind = Symbol::Kind::Variable;
+                                    bs.type = ci.associated[i];
+                                    locals_.declare(c->bindings[i], bs);
+                                }
+                            }
                         }
                     }
                 }
-                if (!protocolTypes.empty()) {
-                    return std::make_shared<CompositionType>(std::move(protocolTypes));
+            }
+            // `where` is evaluated after the bindings are in scope, so it can
+            // refer to them (`case let v where v > 100`).
+            if (c->whereExpr) checkExpr(c->whereExpr.get(), context);
+            {
+                const bool savedInCase = inCaseBody_;
+                inCaseBody_ = true;
+                checkStatements(c->body, context, fnReturnType, isThrowing);
+                inCaseBody_ = savedInCase;
+            }
+            locals_.popScope();
+            break;
+        }
+        case NodeKind::ThrowStmt: {
+            auto* t = static_cast<ThrowStmt*>(stmt);
+            checkExpr(t->value.get(), context);
+            if (!isThrowing) {
+                hadError_ = true;
+                diags_.reportError("error thrown from a non-throwing context",
+                                   rangeOf(t->value.get()));
+            }
+            break;
+        }
+        case NodeKind::DoStmt: {
+            auto* d = static_cast<DoStmt*>(stmt);
+            checkStatements(d->body, context, fnReturnType, isThrowing);
+            for (auto& c : d->catches) checkStatement(c.get(), context, fnReturnType, isThrowing);
+            break;
+        }
+        case NodeKind::CatchClause: {
+            auto* c = static_cast<CatchClause*>(stmt);
+            locals_.pushScope();
+            if (c->pattern) {
+                if (c->pattern->kind == NodeKind::VarDecl) {
+                    auto* vd = static_cast<VarDecl*>(c->pattern.get());
+                    const Type* t = vd->type ? resolveTypeRepr(vd->type.get(), context)
+                                             : types_.errorType();
+                    declareLocal(*this, locals_, vd->name, t, vd, true);
+                } else {
+                    checkExpr(c->pattern.get(), context);
                 }
             }
-            return getAnyType();
+            if (c->whereExpr) checkExpr(c->whereExpr.get(), context);
+            checkStatements(c->body, context, fnReturnType, isThrowing);
+            locals_.popScope();
+            break;
         }
-        case TypeReprKind::Opaque: {
-            // some P 不透明类型 — 返回约束类型
-            auto& o = static_cast<const OpaqueTypeRepr&>(tr);
-            return resolveTypeRepr(*o.constraint);
-        }
-        case TypeReprKind::Existential: {
-            // any P 存在类型 — 返回 Any 类型
-            return getAnyType();
-        }
-        case TypeReprKind::Owned: {
-            // Owned<T> — 返回内部类型（布局相同）
-            // 规范要求 T 必须是值类型（struct/enum/基本类型），不能是 class
-            auto& o = static_cast<const OwnedTypeRepr&>(tr);
-            TypePtr innerType = resolveTypeRepr(*o.inner);
-            if (innerType) {
-                // 检查是否为引用类型 / Check if reference type
-                TypeKind kind = innerType->kind();
-                if (kind == TypeKind::Class || kind == TypeKind::Actor) {
-                    error(tr.loc, "Owned<T> cannot be used with class types; "
-                          "use struct, enum, or primitive types instead");
-                }
+        case NodeKind::DeferStmt:
+            checkStatement(static_cast<DeferStmt*>(stmt)->body.get(), context, fnReturnType, isThrowing);
+            break;
+        case NodeKind::UnsafeStmt:
+            checkStatements(static_cast<UnsafeStmt*>(stmt)->body, context, fnReturnType, isThrowing);
+            break;
+        case NodeKind::BreakStmt:
+        case NodeKind::ContinueStmt:
+            break;
+        case NodeKind::FallthroughStmt:
+            // `fallthrough` is only meaningful as the last statement of a
+            // non-final switch arm (规范 1.7). Outside a switch it is an error.
+            if (!inCaseBody_) {
+                hadError_ = true;
+                diags_.reportError("'fallthrough' is only allowed inside a switch case",
+                                   rangeOf(stmt));
             }
-            return innerType;
-        }
-        case TypeReprKind::Self: {
-            // Self 类型 — 返回当前处理的类型
-            // Self type: return the current type being processed
-            if (!currentTypeName_.empty()) {
-                Symbol* typeSym = symbols_.lookup(currentTypeName_);
-                if (typeSym) return typeSym->type;
-            }
-            return getAnyType();
-        }
-        case TypeReprKind::Inferred:
-            // _ 推断类型 — 返回 nullptr（让调用者推断）
-            return nullptr;
+            break;
         default:
-            return nullptr;
+            // Expressions used as statements (e.g. bare closures).
+            checkExpr(stmt, context);
+            break;
     }
 }
 
-void Sema::error(SourceLocation loc, const std::string& msg) {
-    diag_.error(loc, "", msg);
-}
-
-void Sema::warning(SourceLocation loc, const std::string& msg) {
-    diag_.warning(loc, "", msg);
-}
-
-// ─── 代码风格检查 / Code style checking ────────────────────────────────
-
-bool Sema::isUpperCamelCase(const std::string& name) const {
-    if (name.empty()) return false;
-    // 第一个字符必须是大写 / First character must be uppercase
-    return std::isupper(name[0]);
-}
-
-bool Sema::isLowerCamelCase(const std::string& name) const {
-    if (name.empty()) return false;
-    // 第一个字符必须是小写或下划线 / First character must be lowercase or underscore
-    return std::islower(name[0]) || name[0] == '_';
-}
-
-void Sema::checkNamingConvention(const std::string& name, bool isType, SourceLocation loc) {
-    if (name.empty()) return;
-    // 跳过特殊名称 / Skip special names
-    if (name[0] == '_' || name == "main") return;
-
-    if (isType) {
-        if (!isUpperCamelCase(name)) {
-            warning(loc, "type name '" + name + "' should use UpperCamelCase");
+// ─── Control flow ──────────────────────────────────────────────────────────
+bool Sema::alwaysTransfers(Node* stmt) {
+    if (!stmt) return false;
+    switch (stmt->kind) {
+        case NodeKind::ReturnStmt:
+        case NodeKind::ThrowStmt:
+        case NodeKind::BreakStmt:
+        case NodeKind::ContinueStmt:
+            return true;
+        case NodeKind::BlockStmt:
+            return blockAlwaysTransfers(static_cast<BlockStmt*>(stmt)->statements);
+        case NodeKind::DoStmt: {
+            // `do { return } catch { return }` transfers on every path.
+            auto* d = static_cast<DoStmt*>(stmt);
+            if (!blockAlwaysTransfers(d->body)) return false;
+            for (auto& c : d->catches) {
+                if (!blockAlwaysTransfers(static_cast<CatchClause*>(c.get())->body))
+                    return false;
+            }
+            return true;
         }
-    } else {
-        if (!isLowerCamelCase(name)) {
-            warning(loc, "name '" + name + "' should use lowerCamelCase");
+        case NodeKind::IfStmt: {
+            auto* ifs = static_cast<IfStmt*>(stmt);
+            bool thenT = blockAlwaysTransfers(ifs->thenBody);
+            bool elseT = ifs->elseBranch ? alwaysTransfers(ifs->elseBranch.get()) : false;
+            return thenT && elseT;
         }
+        case NodeKind::SwitchStmt: {
+            // An exhaustive switch (has `default`) whose every arm transfers
+            // control transfers on all paths.
+            auto* sw = static_cast<SwitchStmt*>(stmt);
+            bool hasDefault = false;
+            for (auto& c : sw->cases) {
+                if (!c || c->kind != NodeKind::CaseClause) continue;
+                auto* cc = static_cast<CaseClause*>(c.get());
+                if (cc->isDefault) hasDefault = true;
+                if (!blockAlwaysTransfers(cc->body)) return false;
+            }
+            return hasDefault;
+        }
+        default:
+            return false;
+    }
+}
+
+bool Sema::blockAlwaysTransfers(const NodeList& stmts) {
+    for (auto& s : stmts) {
+        if (alwaysTransfers(s.get())) return true;
+    }
+    return false;
+}
+
+// ─── Expression type inference ─────────────────────────────────────────────
+const Type* Sema::checkExpr(Node* e, const TypeRecord* context) {
+    const Type* t = checkExprInner(e, context);
+    if (e) e->semaType = t;
+    return t;
+}
+
+const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
+    if (!e) return types_.unknownType();
+    switch (e->kind) {
+        case NodeKind::IntLitExpr:  return types_.intType();
+        case NodeKind::FloatLitExpr: return types_.doubleType();
+        case NodeKind::CharLitExpr:  return types_.charType();
+        case NodeKind::BoolLitExpr:  return types_.boolType();
+        case NodeKind::NilLitExpr:   return types_.unknownType();
+        case NodeKind::TernaryExpr: {
+            auto* t = static_cast<TernaryExpr*>(e);
+            const Type* ct = checkExpr(t->condition.get(), context);
+            if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown
+                && ct->kind != TypeKind::Optional) {
+                hadError_ = true;
+                diags_.reportError(
+                    "condition of '?:' must be Bool, found '" + typeToString(ct) + "'",
+                    rangeOf(e));
+            }
+            const Type* tt = checkExpr(t->thenValue.get(), context);
+            const Type* et = checkExpr(t->elseValue.get(), context);
+            // Both branches must agree; a numeric widening is allowed.
+            if (tt && et && tt->kind != TypeKind::Unknown &&
+                et->kind != TypeKind::Unknown && tt->kind != et->kind) {
+                hadError_ = true;
+                diags_.reportError(
+                    "branches of '?:' have incompatible types '" +
+                    typeToString(tt) + "' and '" + typeToString(et) + "'",
+                    rangeOf(e));
+                return types_.unknownType();
+            }
+            return (tt && tt->kind != TypeKind::Unknown) ? tt : et;
+        }
+        case NodeKind::StrLitExpr: {
+            auto* s = static_cast<StrLitExpr*>(e);
+            for (auto& ex : s->expressions) checkExpr(ex.get(), context);
+            // In a `Char` position a single-scalar string denotes a character.
+            if (charContext_) {
+                std::string text;
+                for (const auto& seg : s->segments) text += seg;
+                if (text.size() == 1) return types_.charType();
+                hadError_ = true;
+                diags_.reportError(
+                    "character literal must contain exactly one character",
+                    rangeOf(e));
+                return types_.charType();
+            }
+            return types_.stringType();
+        }
+        case NodeKind::IdentExpr: {
+            auto* id = static_cast<IdentExpr*>(e);
+            const std::string& name = id->name;
+            // `super` is only meaningful inside a class that has a superclass.
+            if (name == "super") {
+                if (currentType_ && currentType_->superclass) {
+                    id->semaType = types_.named(currentType_->superclass,
+                                               currentType_->superclass->name);
+                    return id->semaType;
+                }
+                hadError_ = true;
+                diags_.reportError(
+                    "'super' used outside a class with a superclass", rangeOf(e));
+                return types_.unknownType();
+            }
+            checkNotMoved(e, name);
+            // Every reference records its resolved type on the node: lowering
+            // (member access, tuple indexing, overload choice) consumes semaType
+            // rather than re-deriving types from syntax.
+            if (const Symbol* s = locals_.lookup(name)) {
+                id->semaType = s->type ? s->type : types_.unknownType();
+                return id->semaType;
+            }
+            if (const Symbol* s = globals_.lookup(name)) {
+                id->semaType = s->type ? s->type : types_.unknownType();
+                return id->semaType;
+            }
+            // Implicit self: inside a type's method, a bare member name refers
+            // to `self.<name>` (e.g. `x` for `self.x`).
+            if (currentType_) {
+                if (const TypeRecord::Member* m = lookupMember(currentType_, name, false))
+                    return m->type ? m->type : types_.unknownType();
+                if (const TypeRecord::Member* m = lookupMember(currentType_, name, true))
+                    return m->type ? m->type : types_.unknownType();
+                for (const auto& c : currentType_->cases)
+                    if (c.name == name) return types_.named(currentType_, c.name);
+            }
+            // A bare type name is a type reference (e.g. `String.self` base).
+            if (findType(name)) return types_.unknownType();
+            TypeKind bk;
+            if (builtinTypeFromName(name, bk)) return types_.unknownType();
+            // In a binding pattern an unresolved bare identifier is a new
+            // binding, not an error.
+            if (inPattern_) return types_.unknownType();
+            return reportUnresolved(e, name);
+        }
+        case NodeKind::BinaryExpr: {
+            auto* b = static_cast<BinaryExpr*>(e);
+            const Type* lt = checkExpr(b->lhs.get(), context);
+            const Type* rt = checkExpr(b->rhs.get(), context);
+            // `c == "A"`: a one-scalar string literal compared with a Char is the
+            // character, not a String (规范 1.5). The literal is therefore
+            // re-checked in a Char context so the code generator sees an i32.
+            if (lt && rt && b->lhs && b->rhs &&
+                lt->kind == TypeKind::Char && rt->kind == TypeKind::String &&
+                b->rhs->kind == NodeKind::StrLitExpr) {
+                charContext_ = true;
+                rt = checkExpr(b->rhs.get(), context);
+                charContext_ = false;
+            } else if (lt && rt && b->lhs && b->rhs &&
+                       rt->kind == TypeKind::Char && lt->kind == TypeKind::String &&
+                       b->lhs->kind == NodeKind::StrLitExpr) {
+                charContext_ = true;
+                lt = checkExpr(b->lhs.get(), context);
+                charContext_ = false;
+            }
+            switch (b->op) {
+                case PunctuatorID::EqualEqual: case PunctuatorID::BangEqual:
+                case PunctuatorID::Less: case PunctuatorID::Greater:
+                case PunctuatorID::LessEqual: case PunctuatorID::GreaterEqual:
+                    return types_.boolType();
+                case PunctuatorID::AmpAmp: case PunctuatorID::PipePipe: {
+                    auto bad = [&](const Type* t) {
+                        if (t && t->kind != TypeKind::Bool && t->kind != TypeKind::Unknown) {
+                            hadError_ = true;
+                            diags_.reportError("logical operator requires Bool operands, found '" +
+                                               typeToString(t) + "'", rangeOf(e));
+                        }
+                    };
+                    bad(lt); bad(rt);
+                    return types_.boolType();
+                }
+                case PunctuatorID::QuestionQuestion: {
+                    if (lt && lt->kind == TypeKind::Optional) return lt->element;
+                    return lt ? lt : types_.unknownType();
+                }
+                case PunctuatorID::LeftArrow:
+                    return types_.unknownType();
+                default: {
+                    // arithmetic / bitwise
+                    bool ok = (isNumeric(lt) || !lt || lt->kind == TypeKind::Unknown) &&
+                              (isNumeric(rt) || !rt || rt->kind == TypeKind::Unknown);
+                    if (!ok && lt && lt->kind == TypeKind::String &&
+                        (b->op == PunctuatorID::Plus))
+                        ok = (rt && rt->kind == TypeKind::String);
+                    if (!ok) {
+                        hadError_ = true;
+                        diags_.reportError("invalid operands to binary operator '" +
+                                           std::string(punctToString(b->op)) +
+                                           "' ('" + typeToString(lt) + "' and '" +
+                                           typeToString(rt) + "')", rangeOf(e));
+                    }
+                    return lt ? lt : types_.unknownType();
+                }
+            }
+        }
+        case NodeKind::UnaryExpr: {
+            auto* u = static_cast<UnaryExpr*>(e);
+            const Type* t = checkExpr(u->operand.get(), context);
+            // `try?` wraps the result in an Optional (规范 9.2): an thrown error
+            // becomes `nil` instead of propagating.
+            if (u->isOptionalTry && t && t->kind != TypeKind::Unknown)
+                return types_.optional(t);
+            // `try` and `await` reuse markers; they pass the operand type through.
+            return t ? t : types_.unknownType();
+        }
+        case NodeKind::MoveExpr: {
+            auto* m = static_cast<MoveExpr*>(e);
+            const Type* t = checkExpr(m->operand.get(), context);
+            if (m->operand && m->operand->kind == NodeKind::IdentExpr)
+                markMoved(e, static_cast<IdentExpr*>(m->operand.get())->name);
+            return t ? t : types_.unknownType();
+        }
+        case NodeKind::ParenExpr:
+            return checkExpr(static_cast<ParenExpr*>(e)->expr.get(), context);
+        case NodeKind::ForceUnwrapExpr: {
+            const Type* t = checkExpr(static_cast<ForceUnwrapExpr*>(e)->expr.get(), context);
+            if (t && t->kind == TypeKind::Optional) return t->element;
+            return t ? t : types_.unknownType();
+        }
+        case NodeKind::OptionalChainExpr: {
+            const Type* t = checkExpr(static_cast<OptionalChainExpr*>(e)->expr.get(), context);
+            return types_.optional(t);
+        }
+        case NodeKind::TupleExpr: {
+            auto* tup = static_cast<TupleExpr*>(e);
+            std::vector<const Type*> elems;
+            for (auto& el : tup->elements) elems.push_back(checkExpr(el.get(), context));
+            return types_.tuple(std::move(elems), tup->labels);
+        }
+        case NodeKind::SetLitExpr: {
+            auto* sl = static_cast<SetLitExpr*>(e);
+            const Type* elem = types_.unknownType();
+            bool first = true;
+            for (auto& el : sl->elements) {
+                const Type* t = checkExpr(el.get(), context);
+                if (first) { elem = t; first = false; }
+            }
+            return types_.set(elem);
+        }
+        case NodeKind::ArrayLitExpr: {
+            auto* a = static_cast<ArrayLitExpr*>(e);
+            const Type* elem = types_.unknownType();
+            bool first = true;
+            for (auto& el : a->elements) {
+                const Type* t = checkExpr(el.get(), context);
+                if (first) { elem = t; first = false; }
+            }
+            return types_.array(elem);
+        }
+        case NodeKind::DictLitExpr: {
+            auto* d = static_cast<DictLitExpr*>(e);
+            const Type* k = types_.unknownType();
+            const Type* v = types_.unknownType();
+            for (size_t i = 0; i < d->keys.size() && i < d->values.size(); ++i) {
+                const Type* kt = checkExpr(d->keys[i].get(), context);
+                const Type* vt = checkExpr(d->values[i].get(), context);
+                if (i == 0) { k = kt; v = vt; }
+            }
+            return types_.dict(k, v);
+        }
+        case NodeKind::RangeExpr: {
+            auto* r = static_cast<RangeExpr*>(e);
+            checkExpr(r->lower.get(), context);
+            checkExpr(r->upper.get(), context);
+            return types_.unknownType(); // Range is a stdlib generic
+        }
+        case NodeKind::AsExpr: {
+            auto* a = static_cast<AsExpr*>(e);
+            checkExpr(a->expr.get(), context);
+            const Type* target = resolveTypeRepr(a->type.get(), context);
+            if (a->asKind == AsExpr::AsQuestion) return types_.optional(target);
+            return target ? target : types_.unknownType();
+        }
+        case NodeKind::IsExpr: {
+            auto* is = static_cast<IsExpr*>(e);
+            checkExpr(is->expr.get(), context);
+            resolveTypeRepr(is->type.get(), context);
+            return types_.boolType();
+        }
+        case NodeKind::MemberExpr: {
+            auto* m = static_cast<MemberExpr*>(e);
+            const Type* base = checkExpr(m->base.get(), context);
+            // Tuple element access `t.0`: the member name is the index.
+            if (base && base->kind == TypeKind::Tuple) {
+                size_t idx = 0;
+                if (parseTupleIndex(m->member, idx)) {
+                    if (idx < base->elements.size()) {
+                        m->semaType = base->elements[idx];
+                        return m->semaType;
+                    }
+                    hadError_ = true;
+                    diags_.reportError("tuple index out of range: '" + m->member +
+                                           "' (tuple has " +
+                                           std::to_string(base->elements.size()) +
+                                           " element(s))",
+                                       rangeOf(e));
+                    return types_.unknownType();
+                }
+                // Labelled element: `pair.code` names the element by its label
+                // (规范 2.9). An unknown label is an error rather than a silent
+                // fallback, since a tuple has no members beyond its elements.
+                for (size_t i = 0; i < base->labels.size() && i < base->elements.size(); ++i) {
+                    if (base->labels[i] == m->member) {
+                        m->semaType = base->elements[i];
+                        return m->semaType;
+                    }
+                }
+                hadError_ = true;
+                diags_.reportError("tuple has no element '" + m->member + "'",
+                                   rangeOf(e));
+                return types_.unknownType();
+            }
+            const Type* mt = resolveMemberType(base, m->member, e, context);
+            if (m->optionalChain) return types_.optional(mt);
+            return mt ? mt : types_.unknownType();
+        }
+        case NodeKind::SubscriptExpr: {
+            auto* s = static_cast<SubscriptExpr*>(e);
+            const Type* base = checkExpr(s->base.get(), context);
+            for (auto& idx : s->indices) checkExpr(idx.get(), context);
+            if (!base) return types_.unknownType();
+            if (base->kind == TypeKind::Optional) base = base->element;
+            if (base->kind == TypeKind::Array) return base->element;
+            if (base->kind == TypeKind::Dict) return base->value;
+            return types_.unknownType();
+        }
+        case NodeKind::GenericExpr: {
+            auto* g = static_cast<GenericExpr*>(e);
+            for (auto& a : g->args) resolveTypeRepr(a.get(), context);
+            return checkExpr(g->base.get(), context);
+        }
+        case NodeKind::AssignmentExpr: {
+            auto* a = static_cast<AssignmentExpr*>(e);
+            const Type* lt = checkExpr(a->lhs.get(), context);
+            const Type* rt = checkExpr(a->rhs.get(), context);
+            if (a->lhs && a->lhs->kind == NodeKind::IdentExpr) {
+                const std::string& nm = static_cast<IdentExpr*>(a->lhs.get())->name;
+                bool isLet = false;
+                if (const Symbol* s = locals_.lookup(nm)) isLet = s->isLet;
+                else if (const Symbol* g = globals_.lookup(nm)) isLet = g->isLet;
+                if (isLet) {
+                    // `let x: Int` 声明后尚未初始化：这次赋值就是初始化，
+                    // 合法且只允许一次（规范 1.3）。
+                    if (!a->isCompound && pendingInit_.erase(nm) == 0) {
+                        hadError_ = true;
+                        diags_.reportError("cannot assign to immutable constant '" + nm + "'",
+                                           rangeOf(a->lhs.get()));
+                    }
+                }
+            }
+            if (!a->isCompound)
+                requireAssignable(lt, rt, e, "assignment");
+            return lt ? lt : types_.unknownType();
+        }
+        case NodeKind::CallExpr: {
+            auto* c = static_cast<CallExpr*>(e);
+            // A call whose callee names a type is a constructor invocation
+            // (`Point(x: 1)`, `MemoryPool<Int>(capacity: 8)`); it yields an
+            // instance of that type rather than a function's result.
+            if (c->callee && c->callee->kind == NodeKind::IdentExpr) {
+                const std::string& n = static_cast<IdentExpr*>(c->callee.get())->name;
+                if (const TypeRecord* rec = findType(n)) {
+                    for (auto& a : c->arguments) checkExpr(a.get(), context);
+                    return types_.named(rec, n);
+                }
+                // A built-in scalar type used as a callee is a conversion:
+                // `Int(x)`, `Double(n)`, `Char("A")`, `String(1)`. It yields
+                // the named type instead of calling a function.
+                TypeKind bk;
+                if (c->arguments.size() == 1 && builtinTypeFromName(n, bk)) {
+                    const Type* target = types_.primitive(bk);
+                    const Type* src = checkExpr(c->arguments[0].get(), context);
+                    if (bk == TypeKind::Char &&
+                        c->arguments[0]->kind == NodeKind::StrLitExpr) {
+                        // `Char("A")` takes the literal's first scalar.
+                        charContext_ = true;
+                        checkExpr(c->arguments[0].get(), context);
+                        charContext_ = false;
+                        return target;
+                    }
+                    if (bk == TypeKind::String && src &&
+                        src->kind == TypeKind::Char)
+                        return target;
+                    return target;
+                }
+            }
+            // `Enum.case(args...)` constructs an enum case with a payload. The
+            // callee resolves to a member of the enum type, so recover the enum
+            // here and require the payload arity to match the declaration.
+            if (c->callee && c->callee->kind == NodeKind::MemberExpr) {
+                auto* m = static_cast<MemberExpr*>(c->callee.get());
+                if (m->base && m->base->kind == NodeKind::IdentExpr) {
+                    const std::string& bn = static_cast<IdentExpr*>(m->base.get())->name;
+                    if (const TypeRecord* rec = findType(bn)) {
+                        if (rec->kind == TypeDeclKind::Enum) {
+                            for (auto& a : c->arguments) checkExpr(a.get(), context);
+                            for (size_t i = 0; i < rec->cases.size(); ++i) {
+                                if (rec->cases[i].name != m->member) continue;
+                                size_t want = rec->cases[i].associated.size();
+                                if (c->arguments.size() != want) {
+                                    hadError_ = true;
+                                    diags_.reportError(
+                                        "enum case '" + rec->name + "." + m->member +
+                                        "' expects " + std::to_string(want) +
+                                        " value(s), got " +
+                                        std::to_string(c->arguments.size()));
+                                }
+                                return types_.named(rec, rec->name);
+                            }
+                        }
+                    }
+                }
+            }
+            const Type* callee = checkExpr(c->callee.get(), context);
+            // `print` / `println` take any printable value and any number of
+            // them (规范 12.1), so they bypass the ordinary argument check.
+            if (c->callee && c->callee->kind == NodeKind::IdentExpr) {
+                const std::string& pn = static_cast<IdentExpr*>(c->callee.get())->name;
+                if (pn == "print" || pn == "println") {
+                    for (auto& a : c->arguments) checkExpr(a.get(), context);
+                    return types_.voidType();
+                }
+            }
+            // A closure argument learns its parameter types from the callee's
+            // signature, which is what makes `{ x in x * 3 }` type-check when
+            // the parameter is declared as `(Int) -> Int` (规范 3.3/3.4).
+            if (callee && (callee->kind == TypeKind::Function ||
+                           callee->kind == TypeKind::Closure)) {
+                for (size_t i = 0; i < c->arguments.size() && i < callee->elements.size(); ++i) {
+                    Node* a = c->arguments[i].get();
+                    if (!a || a->kind != NodeKind::ClosureExpr) continue;
+                    const Type* want = callee->elements[i];
+                    if (!want || (want->kind != TypeKind::Function &&
+                                  want->kind != TypeKind::Closure))
+                        continue;
+                    auto* cl = static_cast<ClosureExpr*>(a);
+                    if (cl->params.size() != want->elements.size()) continue;
+                    for (size_t k = 0; k < cl->params.size(); ++k)
+                        if (!cl->params[k].semaType)
+                            cl->params[k].semaType = want->elements[k];
+                }
+            }
+            // Type-check arguments.
+            std::vector<const Type*> argTypes;
+            argTypes.reserve(c->arguments.size());
+            for (auto& a : c->arguments) argTypes.push_back(checkExpr(a.get(), context));
+            // A call to a generic function instantiates it: the argument types
+            // are the type arguments, which is what monomorphisation needs.
+            if (c->callee && c->callee->kind == NodeKind::IdentExpr) {
+                const std::string& fname =
+                    static_cast<IdentExpr*>(c->callee.get())->name;
+                if (const Symbol* fs = globals_.lookup(fname)) {
+                    if (fs->kind == Symbol::Kind::Function && fs->function &&
+                        !fs->function->genericParams.empty() &&
+                        fs->function->genericParams.size() == argTypes.size()) {
+                        std::vector<std::string> targs;
+                        for (const Type* at : argTypes)
+                            targs.push_back(typeToString(inferTypeArgument(at)));
+                        recordGenericInstance(fname, targs);
+                        // Resolve the call's result type against this
+                        // instantiation, so `let n = f(x)` learns the concrete
+                        // type instead of inheriting the opaque one.
+                        std::unordered_map<std::string, const Type*> saved =
+                            genericBindings_;
+                        for (size_t i = 0; i < targs.size(); ++i)
+                            genericBindings_[fs->function->genericParams[i]] =
+                                inferTypeArgument(argTypes[i]);
+                        const Type* ret = fs->function->returnType
+                            ? resolveTypeRepr(fs->function->returnType.get(), nullptr)
+                            : types_.voidType();
+                        genericBindings_ = saved;
+                        callee = types_.function(argTypes, ret);
+                    }
+                }
+            }
+            if (callee && (callee->kind == TypeKind::Function ||
+                           callee->kind == TypeKind::Closure)) {
+                if (c->arguments.size() > callee->elements.size()) {
+                    hadError_ = true;
+                    diags_.reportError("too many arguments in call (expected " +
+                                       std::to_string(callee->elements.size()) + ", got " +
+                                       std::to_string(c->arguments.size()) + ")", rangeOf(e));
+                }
+                // Match provided args to parameters (ignoring a trailing closure
+                // and defaulted params).
+                size_t fixed = c->hasTrailingClosure && !c->arguments.empty()
+                    ? c->arguments.size() - 1 : c->arguments.size();
+                for (size_t i = 0; i < fixed && i < callee->elements.size(); ++i) {
+                    const Type* at2 = checkExpr(c->arguments[i].get(), context);
+                    requireAssignable(callee->elements[i], at2, c->arguments[i].get(), "argument");
+                }
+                return callee->ret ? callee->ret : types_.unknownType();
+            }
+            if (callee && callee->kind == TypeKind::Optional && callee->element &&
+                (callee->element->kind == TypeKind::Function ||
+                 callee->element->kind == TypeKind::Closure)) {
+                return callee->element->ret ? callee->element->ret : types_.unknownType();
+            }
+            return types_.unknownType();
+        }
+        case NodeKind::ClosureExpr: {
+            auto* cl = static_cast<ClosureExpr*>(e);
+            locals_.pushScope();
+            std::vector<const Type*> params;
+            for (auto& prm : cl->params) {
+                // A parameter the call site has already typed (inferred from
+                // the callee's signature) keeps that type; only a completely
+                // unannotated parameter stays unknown.
+                const Type* pt = prm.type ? resolveTypeRepr(prm.type.get(), context)
+                                          : (prm.semaType ? prm.semaType
+                                                          : types_.unknownType());
+                prm.semaType = pt;
+                params.push_back(pt);
+                Symbol s; s.kind = Symbol::Kind::Parameter; s.type = pt; s.decl = e;
+                locals_.declare(prm.internalName.empty() ? prm.externalName : prm.internalName, s);
+            }
+            const Type* ret = cl->returnType ? resolveTypeRepr(cl->returnType.get(), context)
+                                             : nullptr;
+            const Type* savedRet = currentReturn_;
+            // A closure without a declared return type does not inherit the
+            // enclosing function's return type.
+            currentReturn_ = ret;
+            checkStatements(cl->body, context, ret, currentThrows_);
+            if (!ret) {
+                // Infer from a trailing expression or return statement.
+                for (auto it = cl->body.rbegin(); it != cl->body.rend(); ++it) {
+                    if ((*it)->kind == NodeKind::ReturnStmt) {
+                        ret = checkExpr(static_cast<ReturnStmt*>((*it).get())->value.get(), context);
+                        break;
+                    }
+                }
+                // A single-expression closure returns that expression
+                // implicitly (规范 3.3), so `{ x in x * 3 }` has the type of
+                // `x * 3` even though no `return` is written.
+                if (!ret && !cl->body.empty() &&
+                    cl->body.back()->kind == NodeKind::ExprStmt) {
+                    auto* es = static_cast<ExprStmt*>(cl->body.back().get());
+                    ret = checkExpr(es->expr.get(), context);
+                }
+            }
+            currentReturn_ = savedRet;
+            locals_.popScope();
+            return types_.closure(std::move(params), ret ? ret : types_.unknownType());
+        }
+        case NodeKind::IfExpr: {
+            auto* ie = static_cast<IfExpr*>(e);
+            if (ie->condition && ie->condition->kind != NodeKind::VarDecl)
+                checkExpr(ie->condition.get(), context);
+            checkStatements(ie->thenBody, context, currentReturn_, currentThrows_);
+            const Type* thenT = types_.unknownType();
+            if (!ie->thenBody.empty()) {
+                Node* last = ie->thenBody.back().get();
+                if (last->kind == NodeKind::ExprStmt)
+                    thenT = checkExpr(static_cast<ExprStmt*>(last)->expr.get(), context);
+            }
+            if (ie->elseBranch) checkStatement(ie->elseBranch.get(), context, currentReturn_, currentThrows_);
+            return thenT;
+        }
+        default:
+            return types_.unknownType();
     }
 }
 

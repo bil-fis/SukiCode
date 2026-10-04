@@ -1,0 +1,54 @@
+// 规范 2.6 / 4.5：扩展（方法、计算属性、协议遵守）与协议默认实现。
+// Spec 2.6 / 4.5: extensions (methods, computed properties, protocol
+// conformance) and protocol default implementations.
+//
+// 覆盖场景：
+//   1) 扩展方法        —— `extension Point { func scaled }`
+//   2) 扩展计算属性    —— `extension Point { var magnitude }`
+//   3) 协议遵守扩展    —— `extension Point: Describable { func describe }`
+//   4) 协议默认实现    —— `extension Describable { func describe -> "default" }`
+//   5) 默认实现继承    —— 空遵守 `extension Tag: Describable {}` 应继承 "default"
+//
+// 严格断言：只有全部 4 条断言通过（score == 15）才返回 0；部分失败返回对应
+// 权重分（1/2/4/8），不会被误判为通过。
+
+protocol Describable {
+    func describe() -> String
+}
+
+extension Describable {
+    // 默认实现：未自行提供 `describe` 的遵守类型应继承此实现。
+    func describe() -> String { return "default" }
+}
+
+struct Point {
+    var x: Int
+    var y: Int
+}
+
+extension Point {
+    var magnitude: Int { return x + y }
+    func scaled(by k: Int) -> Point { return Point(x: x * k, y: y * k) }
+}
+
+extension Point: Describable {
+    func describe() -> String { return "Point" }
+}
+
+// 仅声明遵守协议、不提供自己的实现 —— 必须继承协议默认实现。
+struct Tag {}
+extension Tag: Describable {}
+
+@main
+func main() -> Int {
+    var score = 0
+    let p = Point(x: 3, y: 4)
+    if p.magnitude == 7 { score += 1 }            // 扩展计算属性
+    let q = p.scaled(by: 2)
+    if q.x == 6 { score += 2 }                   // 扩展方法
+    if p.describe() == "Point" { score += 4 }    // 协议遵守扩展提供的实现
+    let t = Tag()
+    if t.describe() == "default" { score += 8 }  // 继承协议默认实现
+    if score == 15 { return 0 }
+    return score
+}
