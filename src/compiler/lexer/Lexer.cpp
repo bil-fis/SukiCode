@@ -1,6 +1,8 @@
 #include "compiler/lexer/Lexer.h"
 
 #include <cctype>
+#include <cstdlib>
+#include <unordered_map>
 
 namespace suki {
 
@@ -48,6 +50,199 @@ bool Lexer::isDigit(char c) { return c >= '0' && c <= '9'; }
 Lexer::Lexer(std::string source, DiagnosticEngine& diags)
     : source_(std::move(source)), diags_(diags) {}
 
+// ─── 条件编译预处理（规范 1.2）──────────────────────────────────────────────
+// 支持 #if / #else / #elif / #endif / #ifdef / #ifndef / #define / #undef /
+// #error / #warning。指令以 '#' 引入，作用域到下一个 '#' 或文件结束（单行指令）。
+namespace {
+std::string directiveName(const Token& t) {
+    if (t.kind == TokenKind::TK_Keyword) return keywordToString(t.keyword);
+    return t.text;
+}
+bool dDefined(const std::unordered_map<std::string, std::string>& macros, const std::string& id) {
+    return macros.find(id) != macros.end();
+}
+
+bool dCondOr(const std::vector<Token>&, size_t&, const std::unordered_map<std::string, std::string>&, DiagnosticEngine&);
+bool dCondPrimary(const std::vector<Token>& t, size_t& i,
+                  const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+    if (i >= t.size()) { diags.reportError("unexpected end of #if condition"); return false; }
+    const Token& p = t[i];
+    if (p.isPunct(PunctuatorID::LParen)) {
+        ++i; bool v = dCondOr(t, i, macros, diags);
+        if (i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
+        return v;
+    }
+    if (p.kind == TokenKind::TK_Identifier) {
+        std::string s = p.text; ++i;
+        if (s == "defined") {
+            bool hasParen = i < t.size() && t[i].isPunct(PunctuatorID::LParen);
+            if (hasParen) ++i;
+            if (i >= t.size() || t[i].kind != TokenKind::TK_Identifier) {
+                diags.reportError("expected identifier after 'defined'"); return false;
+            }
+            std::string id = t[i].text; ++i;
+            if (hasParen && i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
+            return dDefined(macros, id);
+        }
+        if (s == "canImport") {
+            if (i < t.size() && t[i].isPunct(PunctuatorID::LParen)) ++i;
+            while (i < t.size() && !t[i].isPunct(PunctuatorID::RParen)) ++i;
+            if (i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
+            return false; // 跳过标准库时 canImport 视为不可用
+        }
+        if (dDefined(macros, s)) return true;
+        if (s == "compilerVersion") return true;
+        diags.reportError("use of undeclared identifier '" + s + "' in #if condition");
+        return false;
+    }
+    if (p.isKeyword(KeywordID::True)) { ++i; return true; }
+    if (p.isKeyword(KeywordID::False)) { ++i; return false; }
+    if (p.kind == TokenKind::TK_IntLiteral) {
+        long long v = std::strtoll(p.numberText.c_str(), nullptr, 10); ++i;
+        if (i < t.size()) {
+            PunctuatorID op = t[i].punct;
+            if (op == PunctuatorID::EqualEqual || op == PunctuatorID::BangEqual ||
+                op == PunctuatorID::Less || op == PunctuatorID::Greater ||
+                op == PunctuatorID::LessEqual || op == PunctuatorID::GreaterEqual) {
+                ++i;
+                long long rhs = 0;
+                if (i < t.size() && t[i].kind == TokenKind::TK_IntLiteral) {
+                    rhs = std::strtoll(t[i].numberText.c_str(), nullptr, 10); ++i;
+                } else { diags.reportError("invalid #if comparison"); return false; }
+                switch (op) {
+                    case PunctuatorID::EqualEqual: return v == rhs;
+                    case PunctuatorID::BangEqual: return v != rhs;
+                    case PunctuatorID::Less: return v < rhs;
+                    case PunctuatorID::Greater: return v > rhs;
+                    case PunctuatorID::LessEqual: return v <= rhs;
+                    case PunctuatorID::GreaterEqual: return v >= rhs;
+                    default: return false;
+                }
+            }
+        }
+        return v != 0;
+    }
+    diags.reportError("invalid #if condition"); ++i; return false;
+}
+bool dCondUnary(const std::vector<Token>& t, size_t& i,
+                const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+    if (i < t.size() && t[i].isPunct(PunctuatorID::Bang)) { ++i; return !dCondUnary(t, i, macros, diags); }
+    return dCondPrimary(t, i, macros, diags);
+}
+bool dCondAnd(const std::vector<Token>& t, size_t& i,
+              const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+    bool l = dCondUnary(t, i, macros, diags);
+    while (i < t.size() && t[i].isPunct(PunctuatorID::AmpAmp)) {
+        ++i; bool r = dCondUnary(t, i, macros, diags); l = l && r;
+    }
+    return l;
+}
+bool dCondOr(const std::vector<Token>& t, size_t& i,
+             const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+    bool l = dCondAnd(t, i, macros, diags);
+    while (i < t.size() && t[i].isPunct(PunctuatorID::PipePipe)) {
+        ++i; bool r = dCondAnd(t, i, macros, diags); l = l || r;
+    }
+    return l;
+}
+bool evalDirectiveCond(const std::vector<Token>& t,
+                       const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+    size_t i = 0;
+    return dCondOr(t, i, macros, diags);
+}
+
+std::vector<Token> preprocess(std::vector<Token> toks, DiagnosticEngine& diags) {
+    std::vector<Token> out;
+    std::unordered_map<std::string, std::string> macros;
+    macros["compilerVersion"] = "1"; // 内置宏
+    struct CondFrame { bool inTakenBranch; bool anyTaken; bool elseSeen; };
+    std::vector<CondFrame> stack;
+    auto emitNow = [&]() -> bool {
+        for (auto& f : stack) if (!f.inTakenBranch) return false;
+        return true;
+    };
+    // 外层（不含栈顶当前帧）是否生效：用于 #else/#elif 判断所在 #if 组是否处于
+    // 生效上下文，而非当前分支是否已采纳。
+    auto enclosingEmit = [&]() -> bool {
+        for (size_t k = 0; k + 1 < stack.size(); ++k) if (!stack[k].inTakenBranch) return false;
+        return true;
+    };
+    size_t n = toks.size();
+    size_t i = 0;
+    while (i < n) {
+        if (toks[i].isPunct(PunctuatorID::Hash)) {
+            size_t hpos = i; ++i;
+            if (i >= n) { diags.reportError("expected directive after '#'"); break; }
+            std::string dname = directiveName(toks[i]);
+            size_t dirLine = toks[i].loc.line; // 指令关键字所在行，操作数仅限同一行
+            ++i;
+            // 收集同一行上的操作数 token（到下一个 '#' 或换行为止）。分支体位于
+            // 其他行，由主循环按当前是否生效决定保留/丢弃，避免误吞分支与 EOF。
+            auto collect = [&](size_t line) -> std::vector<Token> {
+                std::vector<Token> body;
+                while (i < n && toks[i].loc.line == line && !toks[i].isPunct(PunctuatorID::Hash))
+                    body.push_back(toks[i++]);
+                return body;
+            };
+            bool parentEmit = enclosingEmit();
+            if (dname == "if") {
+                auto body = collect(dirLine);
+                bool val = evalDirectiveCond(body, macros, diags);
+                CondFrame f; f.inTakenBranch = parentEmit && val; f.anyTaken = f.inTakenBranch; f.elseSeen = false;
+                stack.push_back(f);
+            } else if (dname == "else") {
+                if (stack.empty()) { diags.reportError("#else without matching #if"); break; }
+                CondFrame& f = stack.back();
+                if (f.elseSeen) diags.reportError("#else after #else");
+                f.elseSeen = true;
+                bool taken = parentEmit && !f.anyTaken; if (taken) f.anyTaken = true;
+                f.inTakenBranch = taken;
+            } else if (dname == "elif") {
+                if (stack.empty()) { diags.reportError("#elif without matching #if"); break; }
+                auto body = collect(dirLine);
+                CondFrame& f = stack.back();
+                if (f.elseSeen) diags.reportError("#elif after #else");
+                bool val = evalDirectiveCond(body, macros, diags);
+                bool taken = parentEmit && !f.anyTaken && val; if (taken) f.anyTaken = true;
+                f.inTakenBranch = taken;
+            } else if (dname == "endif") {
+                if (stack.empty()) { diags.reportError("#endif without matching #if"); break; }
+                stack.pop_back();
+            } else if (dname == "ifdef" || dname == "ifndef") {
+                auto body = collect(dirLine);
+                bool def = !body.empty() && body[0].kind == TokenKind::TK_Identifier &&
+                           dDefined(macros, body[0].text);
+                if (dname == "ifndef") def = !def;
+                CondFrame f; f.inTakenBranch = parentEmit && def; f.anyTaken = f.inTakenBranch; f.elseSeen = false;
+                stack.push_back(f);
+            } else if (dname == "define") {
+                auto body = collect(dirLine);
+                if (parentEmit && !body.empty() && body[0].kind == TokenKind::TK_Identifier)
+                    macros[body[0].text] = (body.size() > 1 ? body[1].text : "");
+            } else if (dname == "undef") {
+                auto body = collect(dirLine);
+                if (parentEmit && !body.empty() && body[0].kind == TokenKind::TK_Identifier)
+                    macros.erase(body[0].text);
+            } else if (dname == "error" || dname == "warning") {
+                auto body = collect(dirLine);
+                if (parentEmit) {
+                    std::string msg; for (auto& tk : body) msg += tk.text + " ";
+                    if (dname == "error") diags.reportError("#error " + msg);
+                    else diags.reportWarning("#warning " + msg);
+                }
+            } else {
+                diags.reportError("unknown preprocessor directive '#" + dname + "'");
+            }
+        } else {
+            if (emitNow()) out.push_back(toks[i]);
+            ++i;
+        }
+    }
+    if (!stack.empty()) diags.reportError("missing #endif");
+    return out;
+}
+} // namespace
+
 std::vector<Token> Lexer::tokenizeAll() {
     std::vector<Token> toks;
     for (;;) {
@@ -55,7 +250,7 @@ std::vector<Token> Lexer::tokenizeAll() {
         toks.push_back(t);
         if (t.kind == TokenKind::TK_EOF) break;
     }
-    return toks;
+    return preprocess(std::move(toks), diags_);
 }
 
 void Lexer::advance() {

@@ -1,0 +1,4 @@
+#if false
+func needed() {}
+#endif
+func main() { let x = needed() }   // #if false 已移除 needed，期望 check 报 cannot find
