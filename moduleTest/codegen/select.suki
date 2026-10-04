@@ -1,0 +1,46 @@
+// `select` 语句（规范 7.5）：等待多个通道操作中第一个就绪的分支。
+// Spec 7.5: select waits for the first ready channel operation.
+//
+// 覆盖三种情形：接收分支就绪、无分支就绪时走 default、以及发送分支。
+// 采用"默认失败"的返回值设计：任一情形不符即返回非零。
+
+@main
+func main() -> Int {
+    // 1) 接收分支就绪：取到 7。
+    let ch1 = Channel<Int>(capacity: 4)
+    await ch1.send(7)
+    var got = 0
+    select {
+    case let a <- ch1:
+        got = a
+    default:
+        got = -1
+    }
+    if got != 7 { return 1 }
+
+    // 2) 无分支就绪：走 default。
+    let empty = Channel<Int>(capacity: 4)
+    var none = 99
+    select {
+    case let b <- empty:
+        none = b
+    default:
+        none = -1
+    }
+    if none != -1 { return 1 }
+
+    // 3) 发送分支：把 5 送入通道，随后可取出。
+    let ch2 = Channel<Int>(capacity: 4)
+    var sent = 0
+    select {
+    case 5 <- ch2:
+        sent = 1
+    default:
+        sent = -1
+    }
+    if sent != 1 { return 1 }
+    let v = await ch2.receive()
+    if v != 5 { return 1 }
+
+    return 0
+}

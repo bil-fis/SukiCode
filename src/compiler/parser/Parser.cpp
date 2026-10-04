@@ -1041,6 +1041,7 @@ NodePtr Parser::parseSelectStmt() {
     // `select { case <pat> <- <chan>: ... default: ... }` — structurally a
     // SwitchStmt without a subject; each case pattern is a `<-` channel expression.
     auto s = std::make_unique<SwitchStmt>();
+    s->isSelect = true;
     advance(); // select
     expectPunct(PunctuatorID::LBrace, "expected '{'");
     while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
@@ -1051,7 +1052,18 @@ NodePtr Parser::parseSelectStmt() {
             expectKw(KeywordID::Case, "expected 'case'");
             // `case let v` 是值绑定模式：不比较，只绑定。
             bool bindPattern = checkKw(KeywordID::Let) || checkKw(KeywordID::Var);
-            c->pattern = parseCasePatternExpr(c->bindings);
+            NodePtr pat = parseCasePatternExpr(c->bindings);
+            // `case <pat> <- <chan>`：一次通道操作。左侧是发送表达式（`case msg
+            // <- ch`）或接收绑定（`case let v <- ch` / `case _ <- ch`），由
+            // isBindingPattern 区分；右侧是通道。整体记为 `<-` 二元表达式。
+            if (matchPunct(PunctuatorID::LeftArrow)) {
+                auto be = std::make_unique<BinaryExpr>();
+                be->op = PunctuatorID::LeftArrow;
+                be->lhs = std::move(pat);
+                be->rhs = parseExpr();
+                pat = std::move(be);
+            }
+            c->pattern = std::move(pat);
             c->isBindingPattern = bindPattern;
             // `case 1, 2, 3:` — additional patterns for the same arm. They are
             // alternatives, so any of them selects this body.

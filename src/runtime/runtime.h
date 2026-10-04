@@ -191,6 +191,12 @@ int32_t      suki_channel_receive(SukiChannel* c, void* out_elem);
 void         suki_channel_close(SukiChannel* c);
 void         suki_channel_free(SukiChannel* c);
 
+// Non-blocking variants used by `select`: they report whether the operation could
+// proceed at once instead of waiting, which is what lets `select` poll its cases.
+// Returns 1 on success, 0 if the operation would block (-1 if closed).
+int32_t      suki_channel_try_send(SukiChannel* c, const void* elem);
+int32_t      suki_channel_try_receive(SukiChannel* c, void* out_elem);
+
 // ─── Task / TaskGroup ──────────────────────────────────────────────────────
 // A Task runs a closure on its own thread and publishes completion through a
 // Future, which the Task handle wraps. A TaskGroup records the Futures of its

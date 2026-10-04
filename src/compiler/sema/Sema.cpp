@@ -2236,6 +2236,27 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
         }
         case NodeKind::SwitchStmt: {
             auto* s = static_cast<SwitchStmt*>(stmt);
+            // `select` (规范 7.5): every case is a channel operation. Typing the
+            // channel here also gives a receiving case's binding the channel's
+            // element type, which the code generator needs to allocate its slot.
+            if (s->isSelect) {
+                for (auto& c : s->cases) {
+                    if (!c || c->kind != NodeKind::CaseClause) continue;
+                    auto* cc = static_cast<CaseClause*>(c.get());
+                    if (cc->isDefault || !cc->pattern) continue;
+                    if (cc->pattern->kind != NodeKind::BinaryExpr) continue;
+                    auto* be = static_cast<BinaryExpr*>(cc->pattern.get());
+                    if (be->op != PunctuatorID::LeftArrow) continue;
+                    const Type* chTy = checkExpr(be->rhs.get(), context);
+                    const Type* elemTy =
+                        (chTy && chTy->kind == TypeKind::Named &&
+                         !chTy->elements.empty()) ? chTy->elements[0] : nullptr;
+                    if (!elemTy) continue;
+                    for (const auto& nm : cc->bindings)
+                        declareLocal(*this, locals_, nm, elemTy,
+                                     cc->pattern.get(), true);
+                }
+            }
             const Type* subj = s->subject ? checkExpr(s->subject.get(), context)
                                           : types_.unknownType();
             // `case let v` needs the subject's type to type the binding.

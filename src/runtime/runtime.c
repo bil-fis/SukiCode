@@ -890,6 +890,32 @@ int32_t suki_channel_receive(SukiChannel* c, void* out_elem) {
     return 0;
 }
 
+int32_t suki_channel_try_send(SukiChannel* c, const void* elem) {
+    if (!c || !elem) return -1;
+    suki_bmtx_lock(&c->mtx);
+    if (c->closed) { suki_bmtx_unlock(&c->mtx); return -1; }
+    if (c->count == c->capacity) { suki_bmtx_unlock(&c->mtx); return 0; }
+    size_t off = (size_t)((c->head + c->count) % c->capacity) * (size_t)c->elemSize;
+    memcpy(c->buf + off, elem, (size_t)c->elemSize);
+    c->count += 1;
+    suki_cvar_broadcast(&c->notEmpty);
+    suki_bmtx_unlock(&c->mtx);
+    return 1;
+}
+
+int32_t suki_channel_try_receive(SukiChannel* c, void* out_elem) {
+    if (!c || !out_elem) return -1;
+    suki_bmtx_lock(&c->mtx);
+    if (c->count == 0) { suki_bmtx_unlock(&c->mtx); return c->closed ? -1 : 0; }
+    size_t off = (size_t)c->head * (size_t)c->elemSize;
+    memcpy(out_elem, c->buf + off, (size_t)c->elemSize);
+    c->head = (c->head + 1) % c->capacity;
+    c->count -= 1;
+    suki_cvar_broadcast(&c->notFull);
+    suki_bmtx_unlock(&c->mtx);
+    return 1;
+}
+
 void suki_channel_close(SukiChannel* c) {
     if (!c) return;
     suki_bmtx_lock(&c->mtx);

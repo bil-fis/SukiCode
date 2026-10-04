@@ -663,6 +663,9 @@ private:
             }
             case NodeKind::SwitchStmt: {
                 auto* sw = static_cast<SwitchStmt*>(s);
+                // A `select` has no subject — its cases are channel operations, so
+                // it takes a dedicated path rather than a value comparison.
+                if (sw->isSelect) { genSelect(sw); return; }
                 llvm::Value* subject = sw->subject ? genExpr(sw->subject.get()) : nullptr;
                 if (!subject) return;
                 // A payload-carrying enum lowers to `{ tag, payload }`; dispatch on
@@ -3691,6 +3694,111 @@ private:
         } else {
             b_->CreateRetVoid();
         }
+    }
+
+    // `select { case ... <- chan: ... default: ... }` (规范 7.5): try every case's
+    // channel operation; the first that can proceed runs its body. If none can,
+    // a `default` arm runs; without one the select yields and tries again, which
+    // is what makes it wait for the first ready case.
+    void genSelect(SwitchStmt* s) {
+        if (!s) return;
+        llvm::Function* cur = b_->GetInsertBlock()->getParent();
+        llvm::BasicBlock* retry = llvm::BasicBlock::Create(*ctx_, "select.retry",
+                                                           cur);
+        llvm::BasicBlock* done = llvm::BasicBlock::Create(*ctx_, "select.done",
+                                                          cur);
+        b_->CreateBr(retry);
+        b_->SetInsertPoint(retry);
+
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+
+        for (auto& c : s->cases) {
+            if (!c || c->kind != NodeKind::CaseClause) continue;
+            auto* cc = static_cast<CaseClause*>(c.get());
+            if (cc->isDefault || !cc->pattern) continue;
+            if (cc->pattern->kind != NodeKind::BinaryExpr) continue;
+            auto* be = static_cast<BinaryExpr*>(cc->pattern.get());
+            if (be->op != PunctuatorID::LeftArrow) continue;
+
+            const bool isReceive = cc->isBindingPattern ||
+                                   (!cc->bindings.empty());
+            // Element type and the channel's runtime handle.
+            const Type* chTy = be->rhs ? be->rhs->semaType : nullptr;
+            const Type* elemTy = (chTy && !chTy->elements.empty())
+                                     ? chTy->elements[0] : nullptr;
+            llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
+            llvm::Value* chVal = genExpr(be->rhs.get());
+            if (!chVal) continue;
+            llvm::Type* chStruct = chVal->getType();
+            llvm::Value* chSlot = b_->CreateAlloca(chStruct, nullptr, "sel.chan");
+            b_->CreateStore(chVal, chSlot);
+            llvm::Value* hp = b_->CreateStructGEP(chStruct, chSlot, 0, "sel.h");
+            llvm::Value* handle = b_->CreateLoad(i8p, hp, "sel.handle");
+
+            llvm::Value* ok = nullptr;
+            llvm::Value* outSlot = nullptr;
+            if (isReceive) {
+                outSlot = b_->CreateAlloca(elemLLVM, nullptr, "sel.recv");
+                llvm::Function* tf = declareExternalSig("suki_channel_try_receive",
+                    { i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
+                ok = b_->CreateCall(tf, { handle,
+                                          b_->CreateBitCast(outSlot, i8p) });
+            } else {
+                llvm::Value* v = genExpr(be->lhs.get());
+                if (!v) continue;
+                llvm::Value* vSlot = b_->CreateAlloca(elemLLVM, nullptr, "sel.send");
+                b_->CreateStore(coerce(v, elemLLVM), vSlot);
+                llvm::Function* tf = declareExternalSig("suki_channel_try_send",
+                    { i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
+                ok = b_->CreateCall(tf, { handle,
+                                          b_->CreateBitCast(vSlot, i8p) });
+            }
+            llvm::Value* ready = b_->CreateICmpEQ(ok,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 1));
+            llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*ctx_, "sel.case",
+                                                                cur);
+            llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(*ctx_, "sel.next",
+                                                                cur);
+            b_->CreateCondBr(ready, bodyBB, nextBB);
+            b_->SetInsertPoint(bodyBB);
+            // Bind the received value, if any, then run this case's body.
+            if (isReceive && outSlot && !cc->bindings.empty()) {
+                llvm::Value* val = b_->CreateLoad(elemLLVM, outSlot, "sel.value");
+                llvm::Value* slot = b_->CreateAlloca(elemLLVM, nullptr,
+                                                     cc->bindings[0]);
+                b_->CreateStore(val, slot);
+                locals_[cc->bindings[0]] = slot;
+            }
+            for (auto& st : cc->body) genStmt(st.get());
+            b_->CreateBr(done);
+            b_->SetInsertPoint(nextBB);
+        }
+
+        // Nothing was ready: run `default`, else yield briefly and try again.
+        bool hasDefault = false;
+        for (auto& c : s->cases) {
+            if (!c || c->kind != NodeKind::CaseClause) continue;
+            if (static_cast<CaseClause*>(c.get())->isDefault) { hasDefault = true; break; }
+        }
+        if (hasDefault) {
+            for (auto& c : s->cases) {
+                if (!c || c->kind != NodeKind::CaseClause) continue;
+                auto* cc = static_cast<CaseClause*>(c.get());
+                if (!cc->isDefault) continue;
+                for (auto& st : cc->body) genStmt(st.get());
+                break;
+            }
+            b_->CreateBr(done);
+        } else {
+            // Yield so a producer on another thread can make progress.
+            llvm::Function* sleepFn = declareExternalSig("suki_sleep", { i64 },
+                                                         voidTy);
+            b_->CreateCall(sleepFn, { llvm::ConstantInt::get(i64, 1) });
+            b_->CreateBr(retry);
+        }
+        b_->SetInsertPoint(done);
     }
 
     // A Future that is already complete. Used by runtime-backed async members

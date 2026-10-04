@@ -294,6 +294,10 @@ struct SwitchStmt : Node {
     SwitchStmt() : Node(NodeKind::SwitchStmt) {}
     NodePtr subject;
     std::vector<NodePtr> cases; // CaseClause
+    // `select { case ... <- chan: ... }` reuses this node with no subject; each
+    // case pattern is a channel operation rather than a value comparison
+    // (规范 7.5). The flag keeps the two apart without a second node kind.
+    bool isSelect = false;
 };
 
 struct CaseClause : Node {
