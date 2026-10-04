@@ -580,6 +580,9 @@ struct NamedType : Node {
 struct OptionalType : Node {
     OptionalType() : Node(NodeKind::OptionalType) {}
     NodePtr wrapped;
+    // `some P` 不透明返回类型（规范 5.5）复用 OptionalType 携带 isOpaque 标记，
+    // 与普通的 `T?` 区分；Sema 据此在 Pass 5 前推断底层具体类型并替换函数返回类型。
+    bool isOpaque = false;
 };
 
 struct ArrayType : Node {

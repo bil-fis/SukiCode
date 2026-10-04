@@ -1,0 +1,32 @@
+struct Pair {
+    var a: Int = 0
+    var b: Int = 0
+}
+
+// 不透明返回类型（规范 5.5）：调用点只见到底层具体类型，而非 `some Pair`。
+func build() -> some Pair {
+    return Pair(1, 2)
+}
+
+// 多个 return 同底层具体类型。
+func pick(flag: Int) -> some Pair {
+    if flag == 0 { return Pair(10, 20) }
+    return Pair(30, 40)
+}
+
+// 前向引用：build2 定义在 main 之后，推断须在函数体检查前完成。
+func main() -> Int {
+    let p = build()
+    if p.a != 1 || p.b != 2 { return 1 }
+    let q = pick(0)
+    if q.a != 10 { return 2 }
+    let r = pick(1)
+    if r.a != 30 { return 3 }
+    let s = build2()
+    if s != 7 { return 4 }
+    return 0
+}
+
+func build2() -> some Int {
+    return 7
+}

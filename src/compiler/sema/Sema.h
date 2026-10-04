@@ -286,6 +286,14 @@ private:
     // read as a character rather than a String.
     const Type* checkAsChar(Node* e, const TypeRecord* context);
     const Type* inferTypeArgument(const Type* t);
+    // 不透明返回类型（规范 5.5）：`func f() -> some P` 的底层具体类型由函数体
+    // 推断后原地替换函数类型对象的 ret 字段。此处记录 fn → 推断出的具体类型，
+    // 供 checkFunctionBody 取返回类型与调用点一致。
+    std::unordered_map<FunctionDecl*, const Type*> opaqueReturnType_;
+    // Pass 5 前：对所有返回 `some P` 的函数推断底层具体类型并改写其 ret 字段，
+    // 使后续调用点（即使是前向引用）也能拿到具体类型。
+    void inferOpaqueReturnTypes(const NodeList& decls);
+    const Type* inferOpaqueReturnType(FunctionDecl* fn, const TypeRecord* owner);
     // Resolve a written type name the way an annotation would.
     const Type* typeByName(const std::string& name);
     void recordGenericInstance(const std::string& funcName,

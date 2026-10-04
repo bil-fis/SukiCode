@@ -130,10 +130,20 @@ private:
             for (auto& p : fn->params)
                 params.push_back(lowerDeclType(p.semaType, p.type.get()));
         if (throws) params.push_back(llvm::PointerType::get(*ctx_, 0));
+        // 不透明返回类型（规范 5.5）：优先使用 Sema 推断后改写的函数类型对象
+        // 的 ret（底层具体类型 C），使签名与函数体返回值一致。
+        // 不透明返回类型（规范 5.5）：仅当返回类型为 `some P` 时才优先使用 Sema
+        // 推断出的底层具体类型（fn->semaType->ret）；泛型等仍走 fn->returnType->semaType，
+        // 避免泛型实例化的克隆 fn->semaType 携带泛型 ret 导致签名不匹配。
+        const Type* rt =
+            (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
+             static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
+             fn->semaType && fn->semaType->kind == TypeKind::Function && fn->semaType->ret)
+                ? fn->semaType->ret
+                : (fn->returnType ? fn->returnType->semaType : nullptr);
         llvm::Type* ret = isMain
             ? llvm::Type::getInt32Ty(*ctx_)
-            : lowerDeclType(fn->returnType ? fn->returnType->semaType : nullptr,
-                            fn->returnType.get());
+            : lowerDeclType(rt, fn->returnType.get());
         fnThrows_[symName] = throws;
         llvm::Function* f = llvm::Function::Create(
             llvm::FunctionType::get(ret, params, false),
@@ -236,8 +246,17 @@ private:
         llvm::Function* f = fns_[symName];
         if (!f || !f->empty()) return;
         isMain_ = isMainFns_[symName];
+        // 不透明返回类型（规范 5.5）：仅当返回类型为 `some P` 时才优先使用 Sema
+        // 推断出的底层具体类型（fn->semaType->ret）；泛型等仍走 fn->returnType->semaType，
+        // 避免泛型实例化的克隆 fn->semaType 携带泛型 ret 导致签名不匹配。
+        const Type* rt =
+            (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
+             static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
+             fn->semaType && fn->semaType->kind == TypeKind::Function && fn->semaType->ret)
+                ? fn->semaType->ret
+                : (fn->returnType ? fn->returnType->semaType : nullptr);
         currentRet_ = isMain_ ? llvm::Type::getInt32Ty(*ctx_)
-                              : lowerDeclType(fn->returnType ? fn->returnType->semaType : nullptr, fn->returnType.get());
+                              : lowerDeclType(rt, fn->returnType.get());
         locals_.clear();
         inoutLocals_.clear();
         scopeRefs_.clear();
@@ -3904,8 +3923,14 @@ public:
             params.push_back(lowerDeclType(p.semaType, p.type.get()));
         // A throwing method carries the hidden error slot just like a function.
         if (fn->isThrows) params.push_back(llvm::PointerType::get(*ctx_, 0));
-        llvm::Type* ret = fn->returnType ? lowerDeclType(fn->returnType ? fn->returnType->semaType : nullptr, fn->returnType.get())
-                                         : llvm::Type::getVoidTy(*ctx_);
+        const Type* mrt =
+            (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
+             static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
+             fn->semaType && fn->semaType->kind == TypeKind::Function && fn->semaType->ret)
+                ? fn->semaType->ret
+                : (fn->returnType ? fn->returnType->semaType : nullptr); // 不透明返回类型（规范 5.5）
+        llvm::Type* ret = mrt ? lowerDeclType(mrt, fn->returnType.get())
+                               : llvm::Type::getVoidTy(*ctx_);
         methodThrows_[key] = fn->isThrows;
         llvm::Function* f = llvm::Function::Create(
             llvm::FunctionType::get(ret, params, /*isVarArg=*/false),
@@ -4231,8 +4256,14 @@ public:
         if (!f || !f->empty()) return;
         isMain_ = false;
         currentOwner_ = ownerTy;
-        currentRet_ = fn->returnType ? lowerDeclType(fn->returnType ? fn->returnType->semaType : nullptr, fn->returnType.get())
-                                     : llvm::Type::getVoidTy(*ctx_);
+        const Type* mrt =
+            (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
+             static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
+             fn->semaType && fn->semaType->kind == TypeKind::Function && fn->semaType->ret)
+                ? fn->semaType->ret
+                : (fn->returnType ? fn->returnType->semaType : nullptr); // 不透明返回类型（规范 5.5）
+        currentRet_ = mrt ? lowerDeclType(mrt, fn->returnType.get())
+                          : llvm::Type::getVoidTy(*ctx_);
         locals_.clear();
         inoutLocals_.clear();
         scopeRefs_.clear();

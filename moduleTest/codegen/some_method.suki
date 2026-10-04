@@ -1,0 +1,18 @@
+struct Pair {
+    var a: Int = 0
+    var b: Int = 0
+}
+
+// 成员方法的不透明返回类型（规范 5.5）。
+struct Box {
+    func make() -> some Pair {
+        return Pair(7, 8)
+    }
+}
+
+func main() -> Int {
+    var b = Box()
+    let p = b.make()
+    if p.a == 7 && p.b == 8 { return 0 }
+    return 1
+}

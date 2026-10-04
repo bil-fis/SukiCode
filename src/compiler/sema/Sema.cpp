@@ -1,6 +1,7 @@
 #include "compiler/sema/Sema.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 
 namespace suki {
@@ -296,6 +297,9 @@ void Sema::analyze(const NodeList& decls) {
     }
 
     // Pass 5: check function bodies.
+    // 不透明返回类型（规范 5.5）推断必须在函数体检查之前完成，以便前向引用的
+    // 调用点也能解析到底层具体类型。
+    inferOpaqueReturnTypes(decls);
     for (auto& kv : typeIndex_) {
         TypeRecord* rec = kv.second;
         if (!rec->decl) continue;
@@ -674,6 +678,7 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
                                          : types_.voidType();
         if (fn->returnType) fn->returnType->semaType = ret;
         mem.type = types_.function(std::move(params), ret);
+        fn->semaType = mem.type; // 缓存函数类型对象，供 some 推断改写 ret
         if (rec.isProtocol()) {
             // A default implementation (a body present) is recorded on the
             // protocol so conforming types can inherit it; a pure requirement
@@ -910,6 +915,8 @@ void Sema::collectFunction(FunctionDecl* fn, const TypeRecord* owner) {
     if (fn->returnType) fn->returnType->semaType = ret;
     s.type = tc.function(std::move(params), ret);
     globals_.declare(fn->name, s);
+    // 缓存函数类型对象到 AST 节点，供不透明返回类型（some）推断后原地改写 ret。
+    fn->semaType = s.type;
 }
 
 void Sema::collectGlobalVar(VarDecl* vd) {
@@ -1397,12 +1404,133 @@ const Type* Sema::reportUnresolved(Node* identExpr, const std::string& name) {
 }
 
 // ─── Function / global bodies ──────────────────────────────────────────────
+void Sema::inferOpaqueReturnTypes(const NodeList& decls) {
+    for (auto& d : decls) {
+        if (d && d->kind == NodeKind::FunctionDecl)
+            inferOpaqueReturnType(static_cast<FunctionDecl*>(d.get()), nullptr);
+    }
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl) continue;
+        for (auto& m : rec->members) {
+            if (m.decl && m.decl->kind == NodeKind::FunctionDecl)
+                inferOpaqueReturnType(static_cast<FunctionDecl*>(m.decl), rec);
+        }
+    }
+}
+
+const Type* Sema::inferOpaqueReturnType(FunctionDecl* fn, const TypeRecord* owner) {
+    // 仅处理 `func f() -> some P`（规范 5.5）。
+    if (!fn->returnType || fn->returnType->kind != NodeKind::OptionalType ||
+        !static_cast<OptionalType*>(fn->returnType.get())->isOpaque)
+        return nullptr;
+    if (!fn->semaType || fn->semaType->kind != TypeKind::Function) return nullptr;
+
+    // 构造最小上下文（参数 + self），遍历函数体收集 return 表达式类型。
+    locals_.pushScope();
+    if (owner) {
+        Symbol self; self.kind = Symbol::Kind::Variable;
+        self.type = types_.named(owner, owner->name); self.decl = fn;
+        locals_.declare("self", self);
+    }
+    for (auto& prm : fn->params) {
+        Symbol s; s.kind = Symbol::Kind::Parameter;
+        s.type = resolveTypeRepr(prm.type.get(), owner);
+        if (prm.isVariadic) s.type = types_.array(s.type);
+        s.decl = fn;
+        locals_.declare(prm.internalName, s);
+    }
+
+    const Type* underlying = nullptr;
+    std::function<void(Node*)> visit = [&](Node* st) {
+        if (!st) return;
+        switch (st->kind) {
+            case NodeKind::ReturnStmt: {
+                auto* r = static_cast<ReturnStmt*>(st);
+                if (r->value) {
+                    const Type* t = checkExpr(r->value.get(), owner);
+                    if (t && t->kind != TypeKind::Void && t->kind != TypeKind::Unknown && !underlying)
+                        underlying = t;
+                }
+                break;
+            }
+            case NodeKind::BlockStmt:
+                for (auto& s : static_cast<BlockStmt*>(st)->statements) visit(s.get());
+                break;
+            case NodeKind::IfStmt: {
+                auto* is = static_cast<IfStmt*>(st);
+                for (auto& s : is->thenBody) visit(s.get());
+                if (is->elseBranch) visit(is->elseBranch.get());
+                break;
+            }
+            case NodeKind::WhileStmt:
+                for (auto& s : static_cast<WhileStmt*>(st)->body) visit(s.get());
+                break;
+            case NodeKind::RepeatWhileStmt:
+                for (auto& s : static_cast<RepeatWhileStmt*>(st)->body) visit(s.get());
+                break;
+            case NodeKind::ForInStmt:
+                for (auto& s : static_cast<ForInStmt*>(st)->body) visit(s.get());
+                break;
+            case NodeKind::VarDecl: {
+                // 声明体内 var 以便 return 引用前序变量时能推断其类型。
+                auto* vd = static_cast<VarDecl*>(st);
+                Symbol s; s.kind = Symbol::Kind::Variable;
+                s.type = vd->type ? resolveTypeRepr(vd->type.get(), owner)
+                                  : types_.unknownType();
+                s.decl = vd;
+                locals_.declare(vd->name, s);
+                break;
+            }
+            default: break;
+        }
+    };
+    for (auto& st : fn->body) visit(st.get());
+    locals_.popScope();
+
+    if (!underlying) return nullptr;
+
+    // 约束校验：要求底层类型满足 `some P` 的约束 P。仅当约束是具体类型时检查
+    // 相等/子类关系；协议约束（`some View`）暂略（教学场景常见）。
+    auto* ot = static_cast<OptionalType*>(fn->returnType.get());
+    if (ot->wrapped) {
+        const Type* constraint = resolveTypeRepr(ot->wrapped.get(), owner);
+        if (constraint && constraint->kind == TypeKind::Named &&
+            underlying->kind == TypeKind::Named) {
+            const TypeRecord* cr = constraint->record;
+            const TypeRecord* ur = underlying->record;
+            bool ok = (ur == cr);
+            if (!ok && cr && ur) {
+                for (const TypeRecord* s = ur->superclass; s; s = s->superclass)
+                    if (s == cr) { ok = true; break; }
+            }
+            if (!ok) {
+                hadError_ = true;
+                diags_.reportError("opaque return type '" + typeToString(underlying) +
+                    "' does not satisfy constraint '" + typeToString(constraint) + "'",
+                    rangeOf(fn->returnType.get()));
+            }
+        }
+    }
+
+    // 原地改写函数类型对象的 ret 字段为底层具体类型，调用点（含前向引用）
+    // 与 codegen 都能直接拿到 C。同时覆盖 `fn->returnType->semaType`，因为
+    // codegen 从该字段取函数返回类型生成签名。
+    const_cast<Type*>(fn->semaType)->ret = underlying;
+    fn->returnType->semaType = underlying;
+    opaqueReturnType_[fn] = underlying;
+    return underlying;
+}
+
 void Sema::checkFunctionBody(FunctionDecl* fn, const TypeRecord* owner) {
     if (fn->isForeign) return; // external declaration: no body to check
     currentType_ = owner;
     currentThrows_ = fn->isThrows;
     const Type* ret = fn->returnType ? resolveTypeRepr(fn->returnType.get(), owner)
                                      : types_.voidType();
+    // 不透明返回类型（规范 5.5）：使用已推断的底层具体类型，确保函数体与调用点一致。
+    auto oi = opaqueReturnType_.find(fn);
+    if (oi != opaqueReturnType_.end()) ret = oi->second;
     currentReturn_ = ret;
 
     locals_.pushScope();

@@ -2028,6 +2028,16 @@ NodePtr Parser::parseClosure(bool arrowSyntax) {
 // ─── types ─────────────────────────────────────────────────────────────────────
 NodePtr Parser::parseType() {
     NodePtr base;
+    if (checkKw(KeywordID::Some)) {
+        // 不透明返回类型 `some P`（规范 5.5）：前缀修饰符，复用 OptionalType 标记
+        // isOpaque，底层具体类型由 Sema 在函数体分析后推断。
+        advance();
+        NodePtr wrapped = parseType();
+        auto o = std::make_unique<OptionalType>();
+        o->isOpaque = true;
+        o->wrapped = std::move(wrapped);
+        return parseTypePostfix(std::move(o));
+    }
     if (checkKw(KeywordID::Inout)) {
         advance();
         auto it = std::make_unique<InoutType>();
@@ -2139,11 +2149,6 @@ NodePtr Parser::parseTypePostfix(NodePtr base) {
         if (checkPunct(PunctuatorID::Question)) {
             advance();
             auto o = std::make_unique<OptionalType>();
-            o->wrapped = std::move(base);
-            base = std::move(o);
-        } else if (matchKw(KeywordID::Some)) {
-            // opaque type `some Protocol`
-            auto o = std::make_unique<OptionalType>(); // reuse; sema distinguishes
             o->wrapped = std::move(base);
             base = std::move(o);
         } else if (checkPunct(PunctuatorID::LBracket)) {
