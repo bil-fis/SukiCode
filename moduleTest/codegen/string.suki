@@ -1,0 +1,51 @@
+// 字符串：长度语义（字节 vs Unicode 标量）、插值、拼接、查询方法
+// String: byte length vs Unicode scalar count, interpolation, concatenation
+
+func lengthSemantics() -> Int {
+    let s = "Hello"
+    if s.length != 5 { return 1 }          // 字节长度
+    if s.count != 5 { return 2 }           // Unicode 标量数
+    if s.isEmpty { return 3 }
+
+    // "héllo"：5 个标量，6 字节（é 占 2 字节 UTF-8）
+    let u = "héllo"
+    if u.count != 5 { return 4 }           // 按标量计数
+    if u.length != 6 { return 5 }          // 按字节计数
+
+    let empty = ""
+    if !empty.isEmpty { return 6 }
+    if empty.length != 0 { return 7 }
+    return 0
+}
+
+func queries() -> Int {
+    let s = "Hello"
+    if !s.hasPrefix("He") { return 1 }
+    if !s.hasSuffix("lo") { return 2 }
+    return 0
+}
+
+func concatenation() -> Int {
+    let name = "Suki"
+    let greeting = name + "!"
+    if greeting.length != 5 { return 1 }
+    if greeting.count != 5 { return 2 }
+    return 0
+}
+
+@main
+func main() -> Int {
+    // 每一步失败都返回可区分的错误码，便于定位。
+    let a = lengthSemantics()
+    if a != 0 { return a }
+    let b = queries()
+    if b != 0 { return 10 + b }
+    let c = concatenation()
+    if c != 0 { return 20 + c }
+
+    // 插值：字符串与数值
+    let who = "Suki"
+    let n = 42
+    print("Hello \(who), n=\(n)\n")
+    return 0
+}

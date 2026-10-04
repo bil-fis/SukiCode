@@ -1,0 +1,109 @@
+// 规范 1.7：控制流语法 —— if / guard / switch（区间、绑定、where、多值、
+// fallthrough）/ for-in / while / repeat-while。
+// Spec 1.7: control flow — if / guard / switch (ranges, bindings, `where`,
+// multiple values, fallthrough) / for-in / while / repeat-while.
+
+func classify(n: Int) -> Int {
+    switch n {
+        case 0:
+            return 100
+        case 1..<10:
+            return 101
+        case 10...20:
+            return 102
+        case 30, 31, 32:
+            return 103
+        case let v where v > 1000:
+            return 104
+        default:
+            return 199
+    }
+}
+
+func fallthroughSum(n: Int) -> Int {
+    var r = 0
+    switch n {
+        case 1:
+            r = 1
+            fallthrough
+        case 2:
+            r = r + 10
+        case 3:
+            r = r + 100
+        default:
+            r = r + 1000
+    }
+    return r
+}
+
+func firstEven(_ xs: [Int]) -> Int {
+    for x in xs {
+        if x % 2 == 0 { return x }
+    }
+    return 0 - 1
+}
+
+// guard 提前退出（规范 1.7）
+func pick(_ v: Int?) -> Int {
+    guard let x = v else { return 0 - 1 }
+    return x
+}
+
+// if / else if / else 链
+func grade(_ n: Int) -> Int {
+    if n >= 90 { return 3 }
+    else if n >= 60 { return 2 }
+    else { return 1 }
+}
+
+@main
+func main() -> Int {
+    if classify(0) != 100 { return 1 }
+    if classify(5) != 101 { return 2 }
+    if classify(15) != 102 { return 3 }
+    if classify(31) != 103 { return 4 }
+    if classify(5000) != 104 { return 5 }
+    if classify(777) != 199 { return 6 }
+
+    // fallthrough 落入下一个 case 的 body
+    if fallthroughSum(1) != 11 { return 7 }
+    if fallthroughSum(2) != 10 { return 8 }
+    if fallthroughSum(3) != 100 { return 9 }
+    if fallthroughSum(9) != 1000 { return 10 }
+
+    // for-in over an array and over a dictionary
+    let xs = [1, 4, 5]
+    if firstEven(xs) != 4 { return 11 }
+    var sum = 0
+    for x in xs { sum += x }
+    if sum != 10 { return 12 }
+    let d: [String: Int] = ["a": 1, "b": 2]
+    var dsum = 0
+    for (k, v) in d { dsum += v }
+    if dsum != 3 { return 13 }
+
+    // for-in over a half-open and a closed range
+    var r1 = 0
+    for i in 0..<4 { r1 += i }
+    if r1 != 6 { return 14 }
+    var r2 = 0
+    for i in 1...4 { r2 += i }
+    if r2 != 10 { return 15 }
+
+    // while / repeat-while
+    var i = 0
+    while i < 3 { i += 1 }
+    if i != 3 { return 16 }
+    var j = 0
+    repeat { j += 1 } while j < 2
+    if j != 2 { return 17 }
+
+    if pick(7) != 7 { return 18 }
+    if pick(nil) != 0 - 1 { return 19 }
+
+    if grade(95) != 3 { return 20 }
+    if grade(70) != 2 { return 21 }
+    if grade(10) != 1 { return 22 }
+
+    return 0
+}

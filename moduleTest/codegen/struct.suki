@@ -1,0 +1,37 @@
+// 结构体：字段布局、成员访问、构造、方法、mutating 方法
+// Struct: field layout, member access, construction, methods, mutating methods
+//
+// 注：计算属性（`var total: Int { ... }`）尚未实现，见 class-arc 任务。
+// Note: computed properties are not implemented yet (see the class-arc task).
+
+struct Point {
+    var x: Int
+    var y: Int
+
+    func scaled(by: Int) -> Point {
+        return Point(x: self.x * by, y: self.y * by)
+    }
+
+    mutating func shift(dx: Int) {
+        self.x = self.x + dx
+    }
+}
+
+@main
+func main() -> Int {
+    let p = Point(x: 3, y: 4)
+    if p.x != 3 { return 1 }
+    if p.y != 4 { return 2 }
+
+    // 方法返回新实例（值语义）
+    let q = p.scaled(by: 2)
+    if q.x != 6 { return 3 }
+    if q.y != 8 { return 4 }
+
+    // mutating 方法写回调用方
+    var m = Point(x: 1, y: 1)
+    m.shift(dx: 10)
+    if m.x != 11 { return 5 }
+    if m.y != 1 { return 6 }
+    return 0
+}

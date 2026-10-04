@@ -1,0 +1,54 @@
+// 继承与虚方法分派：super.init、override、动态派发
+// Inheritance and virtual dispatch: super.init, override, dynamic dispatch
+
+class Animal {
+    var name: String
+    init(name: String) { self.name = name }
+    // 虚方法：子类可覆写
+    func speak() -> Int { return 1 }
+    // 父类实现可被子类复用（扩展而非替换）
+    func describe() -> Int { return self.speak() * 10 }
+}
+
+class Dog : Animal {
+    init(name: String) { super.init(name: name) }
+    // override：运行时应派发到这里
+    func speak() -> Int { return 2 }
+    // 复用父类实现再叠加行为
+    func describe() -> Int { return super.describe() + 5 }
+}
+
+class Cat : Animal {
+    init(name: String) { super.init(name: name) }
+    func speak() -> Int { return 3 }
+}
+
+// 通过父类引用调用，实际执行动态类型的方法
+func callSpeak(a: Animal) -> Int { return a.speak() }
+func callDescribe(a: Animal) -> Int { return a.describe() }
+
+@main
+func main() -> Int {
+    let d = Dog(name: "Rex")
+    let c = Cat(name: "Tom")
+    let a = Animal(name: "Generic")
+
+    // 直接调用
+    if d.speak() != 2 { return 1 }
+    if c.speak() != 3 { return 2 }
+    if a.speak() != 1 { return 3 }
+
+    // 通过父类类型调用：动态派发
+    if callSpeak(d) != 2 { return 4 }
+    if callSpeak(c) != 3 { return 5 }
+    if callSpeak(a) != 1 { return 6 }
+
+    // 继承的字段布局：父类存储在子类之前
+    if d.name != "Rex" { return 7 }
+
+    // super 复用父类实现：Animal.describe = speak*10，Dog 追加 5
+    if a.describe() != 10 { return 8 }
+    if d.describe() != 25 { return 9 }
+    if callDescribe(d) != 25 { return 10 }
+    return 0
+}

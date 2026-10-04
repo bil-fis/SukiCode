@@ -1,0 +1,50 @@
+// 规范 1.3 / 1.4 / 1.5：变量与常量、延迟初始化、基础类型、字符与转换。
+// Spec 1.3 / 1.4 / 1.5: variables and constants, deferred initialisation,
+// basic types, characters and conversions.
+
+/// 文档注释也应能被词法/分析阶段接受。
+func widths(a: Int8, b: Int16, c: Int32, d: Int64,
+            e: UInt8, f: UInt16, g: UInt32, h: UInt64) -> Int {
+    return Int(a) + Int(b) + Int(c) + Int(d) +
+           Int(e) + Int(f) + Int(g) + Int(h)
+}
+
+// `let x: Int` 声明后延迟初始化：首次赋值合法（规范 1.3）
+func deferred() -> Int {
+    let x: Int
+    x = 41
+    return x + 1
+}
+
+@main
+func main() -> Int {
+    // var / let + 标注 + 推断
+    var mutable: Int = 1
+    let inferred = 2
+    mutable += inferred
+    if mutable != 3 { return 1 }
+
+    if deferred() != 42 { return 2 }
+
+    // 全部整数宽度与浮点
+    if widths(1, 1, 1, 1, 1, 1, 1, 1) != 8 { return 3 }
+    let f: Float = 1.5
+    let dd: Double = 2.25
+    if Double(f) + dd != 3.75 { return 4 }
+    let b: Bool = true
+    if !b { return 5 }
+
+    // 字符：单标量字符串字面量即为 Char（规范 1.5）
+    let c: Char = "A"
+    if Int(c) != 65 { return 6 }
+    if c != "A" { return 7 }
+    if c == "B" { return 8 }
+
+    // 显式转换
+    if Int(3.9) != 3 { return 9 }
+    if Int("42") != 42 { return 10 }
+    let s: String = String(c)
+    if s != "A" { return 11 }
+    if s.count != 1 { return 12 }
+    return 0
+}

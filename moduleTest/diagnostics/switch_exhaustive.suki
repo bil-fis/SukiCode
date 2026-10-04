@@ -1,0 +1,25 @@
+// 规范 1.7（负例）：switch 必须穷举枚举的全部 case，缺少分支应报错。
+// Spec 1.7 (negative): a switch must be exhaustive over an enum; a missing
+// case must produce a diagnostic.
+//
+// 期望行为：`sukic check` 报出"缺少 case"的诊断。
+// 当前状态：未做穷举检查，该文件会被静默接受。
+
+enum Direction {
+    case north
+    case south
+    case east
+    case west
+}
+
+@main
+func main() -> Int {
+    let d = Direction.north
+    switch d {
+        case Direction.north:
+            return 1
+        case Direction.south:
+            return 2
+    }
+    return 0
+}

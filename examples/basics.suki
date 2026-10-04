@@ -1,4 +1,8 @@
 // Basics — SukiCode language features overview
+//
+// This is a feature *overview*, not a program: it has no `@main` entry, so it
+// is verified by compiling (`sukic emit-ir` / `sukic check`) rather than by
+// running. See hello_world.suki for a runnable example.
 
 // Variables and constants
 var mutableVar = 10

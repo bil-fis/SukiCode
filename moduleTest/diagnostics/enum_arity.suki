@@ -1,0 +1,11 @@
+// 负例：枚举 case 关联值个数不匹配，应报 arity 错误
+// Negative: wrong number of associated values must be diagnosed.
+enum Shape {
+    case circle(radius: Int)
+    case empty
+}
+@main
+func main() -> Int {
+    let s = Shape.circle(1, 2)
+    return 0
+}

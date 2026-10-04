@@ -1,0 +1,37 @@
+// 类与 ARC：堆分配、init、方法、字段链、引用共享
+// Class and ARC: heap allocation, init, methods, field chains, sharing
+
+class Box {
+    var v: Int
+    init(v: Int) { self.v = v }
+    func get() -> Int { return self.v }
+}
+
+class Holder {
+    var b: Box
+    init(b: Box) { self.b = b }
+    func first() -> Int { return self.b.v }   // 两级字段链
+}
+
+func readBox(b: Box) -> Int { return b.v }
+
+@main
+func main() -> Int {
+    let a = Box(v: 7)
+    if a.get() != 7 { return 1 }
+    if a.v != 7 { return 2 }
+
+    // 引用共享：多处持有同一实例
+    let h = Holder(b: a)
+    if h.first() != 7 { return 3 }
+    if readBox(a) != 7 { return 4 }
+
+    let alias = a
+    if alias.v != 7 { return 5 }
+
+    // 两个独立实例互不影响
+    let other = Box(v: 1)
+    if other.v != 1 { return 6 }
+    if a.v != 7 { return 7 }
+    return 0
+}

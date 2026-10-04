@@ -1,0 +1,41 @@
+// 枚举：原始值、关联值、switch 模式匹配与绑定
+// Enum: raw values, associated values, switch pattern matching with binding
+
+enum Color {
+    case red
+    case green
+    case blue
+}
+
+enum Shape {
+    case circle(radius: Int)
+    case rect(width: Int, height: Int)
+    case empty
+}
+
+func colorCode(c: Color) -> Int {
+    switch c {
+        case Color.red: return 1
+        case Color.green: return 2
+        default: return 0
+    }
+}
+
+func area(s: Shape) -> Int {
+    switch s {
+        case Shape.circle(let r): return r * r * 3
+        case Shape.rect(let w, let h): return w * h
+        default: return 0
+    }
+}
+
+@main
+func main() -> Int {
+    if colorCode(Color.red) != 1 { return 1 }
+    if colorCode(Color.green) != 2 { return 2 }
+    if colorCode(Color.blue) != 0 { return 3 }   // 落入 default
+    if area(Shape.circle(radius: 5)) != 75 { return 4 }
+    if area(Shape.rect(width: 6, height: 7)) != 42 { return 5 }
+    if area(Shape.empty) != 0 { return 6 }
+    return 0
+}

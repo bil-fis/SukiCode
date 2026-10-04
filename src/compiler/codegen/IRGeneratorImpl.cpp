@@ -138,6 +138,7 @@ private:
             llvm::FunctionType::get(ret, params, false),
             llvm::GlobalValue::ExternalLinkage, symName, module_.get());
         fns_[symName] = f;
+        fnDecls_[fn->name] = fn;
         pendingBodies_.emplace_back(fn, symName);
         isMainFns_[symName] = isMain;
         return f;
@@ -234,6 +235,7 @@ private:
         currentRet_ = isMain_ ? llvm::Type::getInt32Ty(*ctx_)
                               : lowerDeclType(fn->returnType ? fn->returnType->semaType : nullptr, fn->returnType.get());
         locals_.clear();
+        inoutLocals_.clear();
         scopeRefs_.clear();
         scopeMarks_.clear();
         currentScopeMark_ = 0;
@@ -260,9 +262,16 @@ private:
         if (!isMain_) {
             for (auto& p : fn->params) {
                 llvm::Type* pt = lowerDeclType(p.semaType, p.type.get());
-                llvm::Value* slot = b_->CreateAlloca(pt, nullptr, p.internalName);
-                b_->CreateStore(f->getArg(idx), slot);
-                locals_[p.internalName] = slot;
+                if (p.isInout) {
+                    // 按引用传参：形参槽直接持有调用方传入的地址（T*），读取
+                    // 经该地址取 val，赋值经该地址写回（规范 3.1）。
+                    locals_[p.internalName] = f->getArg(idx);
+                    inoutLocals_.insert(p.internalName);
+                } else {
+                    llvm::Value* slot = b_->CreateAlloca(pt, nullptr, p.internalName);
+                    b_->CreateStore(f->getArg(idx), slot);
+                    locals_[p.internalName] = slot;
+                }
                 ++idx;
             }
         }
@@ -1210,6 +1219,33 @@ private:
         return p;
     }
 
+    // 由若干元素就地构造一个数组（变长参数打包 / 集合字面量复用，规范 3.1）。
+    llvm::Value* genArrayFromElems(const Type* arrTy,
+                                   std::vector<llvm::Value*> elems) {
+        llvm::Type* aty = layout_->lower(arrTy);
+        if (!aty || !aty->isStructTy()) return nullptr;
+        const Type* elemT = arrTy->element;
+        llvm::Type* elemTy = elemT ? layout_->lower(elemT)
+                                   : llvm::Type::getInt64Ty(*ctx_);
+        int64_t esz = sizeOf(elemTy);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::Value* cap = llvm::ConstantInt::get(i64, (int64_t)elems.size());
+        llvm::Value* slot = b_->CreateAlloca(aty, nullptr, "arr.tmp");
+        b_->CreateCall(declareExternalSig("suki_array_new",
+                        { i64, i64, llvm::PointerType::getUnqual(aty) }),
+                        { llvm::ConstantInt::get(i64, esz), cap, slot });
+        llvm::Function* push = declareExternalSig("suki_array_push",
+            { llvm::PointerType::getUnqual(aty), i64,
+              llvm::PointerType::getUnqual(elemTy) });
+        for (auto& ev : elems) {
+            if (!ev) continue;
+            llvm::Value* e2 = b_->CreateAlloca(elemTy);
+            b_->CreateStore(coerce(ev, elemTy), e2);
+            b_->CreateCall(push, { slot, llvm::ConstantInt::get(i64, esz), e2 });
+        }
+        return b_->CreateLoad(aty, slot);
+    }
+
     // Address of `base.member`'s storage, or null when the base is not an
     // aggregate we can index into.
     // A reference-typed variable keeps an object pointer in its stack slot, so
@@ -1518,6 +1554,19 @@ private:
                     // has to be recovered from the semantic type instead of
                     // assuming the value is an AllocaInst.
                     llvm::Value* slot = it->second;
+                    // inout 形参：槽中存放的是调用方地址 T*，读取时需再解引用
+                    // 一次得到值（规范 3.1）。赋值时 genAddr 直接返回该地址，
+                    // 从而写回调用方的变量。
+                    if (inoutLocals_.count(n)) {
+                        // inout 形参：槽中存放调用方地址 T*，需多解引用一次取值。
+                        llvm::Type* pty = slot->getType();
+                        if (!pty->isPointerTy()) return nullptr;
+                        llvm::Type* elemTy = (e->semaType && e->semaType->element)
+                            ? layout_->lower(e->semaType->element) : nullptr;
+                        if (!elemTy) return nullptr;
+                        llvm::Value* addr = b_->CreateLoad(pty, slot);
+                        return b_->CreateLoad(elemTy, addr);
+                    }
                     llvm::Type* slotTy = nullptr;
                     if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(slot))
                         slotTy = ai->getAllocatedType();
@@ -1616,6 +1665,8 @@ private:
                     case PunctuatorID::Bang:
                         return b_->CreateNot(coerce(v, llvm::Type::getInt1Ty(*ctx_)));
                     case PunctuatorID::Tilde: return b_->CreateNot(v);
+                    // `&x` 取地址：inout 参数据此按引用传递（规范 3.1）。
+                    case PunctuatorID::Amp: return genAddr(u->operand.get());
                     default: return v;
                 }
             }
@@ -1951,6 +2002,31 @@ private:
                           llvm::ConstantInt::get(i64, vsz), ka, out });
                     return b_->CreateLoad(vTy, out);
                 }
+                // 自定义下标（规范 3.1）：在具名类型上查找 subscript 成员的 getter。
+                if (bt && bt->kind == TypeKind::Named) {
+                    std::string key = bt->name + ".subscript.get";
+                    auto sit = methodFns_.find(key);
+                    if (sit != methodFns_.end() && sit->second) {
+                        llvm::Function* gf = sit->second;
+                        llvm::FunctionType* gfty = gf->getFunctionType();
+                        llvm::Value* recv = nullptr;
+                        bool selfByPointer = gfty->getNumParams() &&
+                            gfty->getParamType(0)->isPointerTy();
+                        if (selfByPointer && !layout_->isReferenceType(bt))
+                            recv = genAddr(sx->base.get());
+                        else
+                            recv = genExpr(sx->base.get());
+                        if (!recv) return nullptr;
+                        std::vector<llvm::Value*> a{recv};
+                        for (auto& ix : sx->indices) {
+                            llvm::Value* iv = genExpr(ix.get());
+                            if (iv) a.push_back(iv);
+                        }
+                        for (size_t i = 0; i < a.size() && i < gfty->getNumParams(); ++i)
+                            a[i] = coerce(a[i], gfty->getParamType(i));
+                        return b_->CreateCall(gf, a);
+                    }
+                }
                 return nullptr;
             }
             case NodeKind::MemberExpr: {
@@ -2151,6 +2227,25 @@ private:
                     auto it = locals_.find(n);
                     if (it != locals_.end()) {
                         llvm::Value* slot = it->second;
+                        // inout 形参：slot 即调用方地址 T*，赋值直接写回该地址，
+                        // 复合赋值先解引用读旧值再写回（规范 3.1）。
+                        if (inoutLocals_.count(n)) {
+                            llvm::Type* elemTy = (a->lhs->semaType && a->lhs->semaType->element)
+                                ? layout_->lower(a->lhs->semaType->element) : nullptr;
+                            if (!elemTy) return nullptr;
+                            llvm::Value* v = genExpr(a->rhs.get());
+                            if (v) {
+                                if (a->isCompound) {
+                                    llvm::Value* old = b_->CreateLoad(elemTy, slot);
+                                    llvm::Value* nv = coerce(applyCompound(old, a->compoundOp,
+                                        coerce(v, elemTy)), elemTy);
+                                    b_->CreateStore(nv, slot);
+                                    return nv;
+                                }
+                                b_->CreateStore(coerce(v, elemTy), slot);
+                            }
+                            return v;
+                        }
                         // As with a load, the slot may be a captured variable
                         // reached through the closure context rather than an
                         // alloca, so fall back to the semantic type.
@@ -2210,6 +2305,56 @@ private:
                         }
                         return v;
                     }
+                }
+                // 下标写入（规范 3.1）：`a[i] = v` 经运行时 set 写入（数组/字典），
+                // 或经自定义下标的 setter。
+                if (a->lhs && a->lhs->kind == NodeKind::SubscriptExpr) {
+                    auto* sx = static_cast<SubscriptExpr*>(a->lhs.get());
+                    const Type* bt = sx->base ? sx->base->semaType : nullptr;
+                    if (!bt) return genExpr(a->rhs.get());
+                    llvm::Value* recv = genExpr(sx->base.get());
+                    llvm::Value* idx = sx->indices.empty() ? nullptr
+                                                         : genExpr(sx->indices[0].get());
+                    llvm::Value* val = genExpr(a->rhs.get());
+                    if (!recv || !idx || !val) return genExpr(a->rhs.get());
+                    if (bt->kind == TypeKind::Array) {
+                        llvm::Type* aty = layout_->lower(bt);
+                        const Type* et = bt->element;
+                        llvm::Type* elemTy = et ? layout_->lower(et)
+                                                : llvm::Type::getInt64Ty(*ctx_);
+                        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+                        recv = coerce(recv, llvm::PointerType::getUnqual(aty));
+                        llvm::Value* vptr = b_->CreateAlloca(elemTy);
+                        b_->CreateStore(coerce(val, elemTy), vptr);
+                        b_->CreateCall(
+                            declareExternalSig("suki_array_set",
+                                { llvm::PointerType::getUnqual(aty), i64,
+                                  llvm::PointerType::getUnqual(elemTy) },
+                                llvm::Type::getVoidTy(*ctx_)),
+                            { recv, coerce(idx, i64), vptr });
+                        return val;
+                    }
+                    if (bt->kind == TypeKind::Named) {
+                        std::string key = bt->name + ".subscript.set";
+                        auto sit = methodFns_.find(key);
+                        if (sit != methodFns_.end() && sit->second) {
+                            llvm::Function* sf = sit->second;
+                            llvm::FunctionType* sfty = sf->getFunctionType();
+                            llvm::Value* srecv = nullptr;
+                            bool selfByPointer = sfty->getNumParams() &&
+                                sfty->getParamType(0)->isPointerTy();
+                            if (selfByPointer && !layout_->isReferenceType(bt))
+                                srecv = genAddr(sx->base.get());
+                            else
+                                srecv = genExpr(sx->base.get());
+                            if (!srecv) return genExpr(a->rhs.get());
+                            std::vector<llvm::Value*> a2{srecv,
+                                coerce(idx, sfty->getParamType(1)),
+                                coerce(val, sfty->getParamType(2))};
+                            return b_->CreateCall(sf, a2);
+                        }
+                    }
+                    return genExpr(a->rhs.get());
                 }
                 return genExpr(a->rhs.get());
             }
@@ -3065,6 +3210,7 @@ private:
 
         b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", thunk));
         locals_.clear();
+        inoutLocals_.clear();
         scopeRefs_.clear();
         scopeMarks_.clear();
         currentScopeMark_ = 0;
@@ -3302,15 +3448,81 @@ private:
         std::vector<llvm::Value*> args;
         std::vector<bool> isNilArg;
         std::vector<std::string> argTypeNames;
-        for (auto& a : e->arguments) {
-            isNilArg.push_back(a && a->kind == NodeKind::NilLitExpr);
-            // `nil` has no type of its own: the value is built once the callee's
-            // parameter type is known, so a placeholder stands in for now.
-            if (a && a->kind == NodeKind::NilLitExpr) args.push_back(nullptr);
-            else if (llvm::Value* v = genExpr(a.get())) args.push_back(v);
-            argTypeNames.push_back(
-                a->semaType ? typeToString(inferTypeArgument(a->semaType))
+        auto fdit = fnDecls_.find(n);
+        if (fdit != fnDecls_.end()) {
+            // 默认参数 / 变长参数展开（规范 3.1）。
+            FunctionDecl* fdecl = fdit->second;
+            std::vector<bool> provided(fdecl->params.size(), false);
+            for (size_t i = 0; i < e->arguments.size(); ++i) {
+                const std::string& lab = (i < e->argumentLabels.size())
+                    ? e->argumentLabels[i] : std::string();
+                int target = -1;
+                if (!lab.empty()) {
+                    for (size_t p = 0; p < fdecl->params.size(); ++p)
+                        if (fdecl->params[p].externalName == lab) { target = (int)p; break; }
+                    // 标签未匹配任何形参的外部名时，回退到位置匹配
+                    //（规范 3.1：标签调用若缺失对应标签则按位置传参）。
+                    if (target < 0 && i < fdecl->params.size()) target = (int)i;
+                } else if (i < fdecl->params.size()) {
+                    target = (int)i;
+                }
+                if (target < 0 || target >= (int)fdecl->params.size()) continue;
+                if (fdecl->params[target].isVariadic) {
+                    // 从该位置起的全部实参打包为数组（变长参数）。
+                    std::vector<llvm::Value*> elems;
+                    for (size_t j = i; j < e->arguments.size(); ++j)
+                        if (llvm::Value* ev = genExpr(e->arguments[j].get()))
+                            elems.push_back(ev);
+                    args.push_back(genArrayFromElems(
+                        fdecl->params[target].semaType, elems));
+                    isNilArg.push_back(false);
+                    argTypeNames.push_back("Array");
+                    provided[target] = true;
+                    break;
+                }
+                if (e->arguments[i] && e->arguments[i]->kind == NodeKind::NilLitExpr) {
+                    isNilArg.push_back(true);
+                    args.push_back(nullptr);
+                } else {
+                    isNilArg.push_back(false);
+                    if (llvm::Value* v = genExpr(e->arguments[i].get())) args.push_back(v);
+                }
+                argTypeNames.push_back(
+                    e->arguments[i]->semaType
+                        ? typeToString(inferTypeArgument(e->arguments[i]->semaType))
+                        : std::string());
+                provided[target] = true;
+            }
+            // 补齐缺失形参：默认参数值，或空变长数组。
+            for (size_t p = 0; p < fdecl->params.size(); ++p) {
+                if (provided[p]) continue;
+                if (fdecl->params[p].isVariadic) {
+                    args.push_back(genArrayFromElems(
+                        fdecl->params[p].semaType, {}));
+                    isNilArg.push_back(false);
+                    argTypeNames.push_back("Array");
+                } else if (fdecl->params[p].defaultValue) {
+                    isNilArg.push_back(false);
+                    if (llvm::Value* v = genExpr(fdecl->params[p].defaultValue.get()))
+                        args.push_back(v);
+                    argTypeNames.push_back(
+                        fdecl->params[p].defaultValue->semaType
+                            ? typeToString(inferTypeArgument(
+                                  fdecl->params[p].defaultValue->semaType))
                             : std::string());
+                }
+            }
+        } else {
+            for (auto& a : e->arguments) {
+                isNilArg.push_back(a && a->kind == NodeKind::NilLitExpr);
+                // `nil` has no type of its own: the value is built once the callee's
+                // parameter type is known, so a placeholder stands in for now.
+                if (a && a->kind == NodeKind::NilLitExpr) args.push_back(nullptr);
+                else if (llvm::Value* v = genExpr(a.get())) args.push_back(v);
+                argTypeNames.push_back(
+                    a->semaType ? typeToString(inferTypeArgument(a->semaType))
+                                : std::string());
+            }
         }
         // A call to a generic function names its instantiation: the argument
         // types decide which `f<T1,T2>` to call. The symbol encodes the type
@@ -3529,6 +3741,9 @@ public:
             // Bodies of the instances were emitted above; anything still pending
             // is a non-generic function.
         }
+        // 自定义下标的 getter/setter 必须在生成普通函数体之前声明，否则
+        // 函数体内对 `obj[idx]` 的调用在查表时还找不到对应方法（规范 3.1）。
+        genSubscriptBodies(decls);
         for (auto& pb : pendingBodies_) {
             if (fns_.count(pb.second) && !fns_[pb.second]->empty()) continue;
             generateBodyAs(pb.first, pb.second);
@@ -3592,6 +3807,9 @@ public:
     std::vector<std::pair<FunctionDecl*, std::string>> pendingBodies_;
     std::map<std::string, bool> isMainFns_;
     std::map<std::string, llvm::Value*> locals_;
+    // inout 形参：其 local 槽存放的是调用方地址（T*）。读取需多解引用一次，
+    // 赋值直接写回该地址。键为形参内部名，按函数体清理（同 locals_）。
+    std::unordered_set<std::string> inoutLocals_;
     llvm::Type* currentRet_ = nullptr;
     bool isMain_ = false;
     // Declare a value-type instance method. The receiver is an implicit first
@@ -3636,6 +3854,7 @@ public:
         currentOwner_ = ownerTy;
         currentRet_ = llvm::Type::getVoidTy(*ctx_);
         locals_.clear();
+        inoutLocals_.clear();
         scopeRefs_.clear();
         scopeMarks_.clear();
         currentScopeMark_ = 0;
@@ -3681,6 +3900,7 @@ public:
         currentOwner_ = ownerTy;
         currentRet_ = llvm::Type::getVoidTy(*ctx_);
         locals_.clear();
+        inoutLocals_.clear();
         scopeRefs_.clear();
         scopeMarks_.clear();
         currentScopeMark_ = 0;
@@ -3805,6 +4025,7 @@ public:
         // Without a property type there is nothing the getter can return.
         if (!currentRet_) return;
         locals_.clear();
+        inoutLocals_.clear();
         scopeRefs_.clear();
         scopeMarks_.clear();
         currentScopeMark_ = 0;
@@ -3935,6 +4156,7 @@ public:
         currentRet_ = fn->returnType ? lowerDeclType(fn->returnType ? fn->returnType->semaType : nullptr, fn->returnType.get())
                                      : llvm::Type::getVoidTy(*ctx_);
         locals_.clear();
+        inoutLocals_.clear();
         scopeRefs_.clear();
         scopeMarks_.clear();
         currentScopeMark_ = 0;
@@ -3954,11 +4176,17 @@ public:
         }
         for (auto& p : fn->params) {
             llvm::Type* pt = lowerDeclType(p.semaType, p.type.get());
-            if (p.isVariadic) pt = llvm::PointerType::getUnqual(
-                llvm::ArrayType::get(pt, 0));
-            llvm::Value* slot = b_->CreateAlloca(pt, nullptr, p.internalName);
-            if (arg < f->arg_size()) b_->CreateStore(f->getArg(arg), slot);
-            locals_[p.internalName] = slot;
+            if (p.isInout) {
+                // 按引用传参：形参槽持有调用方地址（规范 3.1）。
+                locals_[p.internalName] = f->getArg(arg);
+                inoutLocals_.insert(p.internalName);
+            } else {
+                if (p.isVariadic) pt = llvm::PointerType::getUnqual(
+                    llvm::ArrayType::get(pt, 0));
+                llvm::Value* slot = b_->CreateAlloca(pt, nullptr, p.internalName);
+                if (arg < f->arg_size()) b_->CreateStore(f->getArg(arg), slot);
+                locals_[p.internalName] = slot;
+            }
             ++arg;
         }
         // A throwing method's hidden trailing argument is its error slot.
@@ -3976,6 +4204,118 @@ public:
             else b_->CreateRet(llvm::Constant::getNullValue(currentRet_));
         }
         currentErrorSlot_ = savedErrorSlot;
+    }
+
+    // 自定义下标的单个存取器体（规范 3.1）。
+    void genSubscriptBody(SubscriptDecl* sub, const Type* ownerTy,
+                      const Type* idxT, const Type* elemT,
+                      bool isSetter, llvm::Function* f) {
+    if (!f || !f->empty()) return;
+    // 保存被本函数改写的环境，结束后还原，避免污染后续函数体的生成。
+    bool savedMain = isMain_;
+    const Type* savedOwner = currentOwner_;
+    llvm::Type* savedRet = currentRet_;
+    isMain_ = false;
+    currentOwner_ = ownerTy;
+    currentRet_ = isSetter ? llvm::Type::getVoidTy(*ctx_)
+                           : layout_->lower(elemT);
+        locals_.clear();
+        inoutLocals_.clear();
+        scopeRefs_.clear();
+        scopeMarks_.clear();
+        currentScopeMark_ = 0;
+        b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+        // getter 的 self 按值传递（struct 值），setter 的 self 按指针传递
+        // （struct*，指向调用方的副本，写回对调用方可见）。两者最终都让
+        // `self` 在体中等价于一个 struct*，成员访问 `self.x` 的处理一致。
+        if (isSetter) {
+            locals_["self"] = f->getArg(0);
+        } else {
+            llvm::Type* selfTy = layout_->lower(ownerTy);
+            llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
+            b_->CreateStore(f->getArg(0), selfSlot);
+            locals_["self"] = selfSlot;
+        }
+        // 下标形参命名为 `index`，与 getter 体内引用一致。
+        if (!sub->params.empty()) {
+            llvm::Type* iTy = layout_->lower(idxT);
+            llvm::Value* islot = b_->CreateAlloca(iTy, nullptr, "index");
+            b_->CreateStore(f->getArg(1), islot);
+            locals_["index"] = islot;
+        }
+        if (isSetter) {
+            llvm::Type* eTy = layout_->lower(elemT);
+            llvm::Value* nslot = b_->CreateAlloca(eTy, nullptr, "newValue");
+            b_->CreateStore(f->getArg(2), nslot);
+            locals_["newValue"] = nslot;
+        }
+        currentScopeMark_ = scopeRefs_.size();
+        for (auto& st : (isSetter ? sub->setter : sub->getter))
+            genStmt(st.get());
+        releaseScopeTo(currentScopeMark_);
+        if (!b_->GetInsertBlock()->getTerminator()) {
+            if (currentRet_->isVoidTy()) b_->CreateRetVoid();
+            else b_->CreateRet(llvm::Constant::getNullValue(currentRet_));
+        }
+        // 还原被保存的环境（与函数入口的保存配对）。
+        isMain_ = savedMain;
+        currentOwner_ = savedOwner;
+        currentRet_ = savedRet;
+    }
+
+    // 为所有含下标的类型登记并生成 getter/setter 函数（规范 3.1）。
+    void genSubscriptBodies(const NodeList& decls) {
+        for (auto& d : decls) {
+            if (!d) continue;
+            if (d->kind != NodeKind::StructDecl && d->kind != NodeKind::ClassDecl &&
+                d->kind != NodeKind::EnumDecl)
+                continue;
+            auto* td = static_cast<TypeDecl*>(d.get());
+            const TypeRecord* rec = sema_ ? sema_->findType(td->name) : nullptr;
+            if (!rec) continue;
+            const Type* ownerTy = td->semaType;
+            if (!ownerTy) continue;
+            for (auto& m : td->members) {
+                if (!m || m->kind != NodeKind::SubscriptDecl) continue;
+                auto* sub = static_cast<SubscriptDecl*>(m.get());
+                const TypeRecord::Member* sm = nullptr;
+                for (const auto& mm : rec->members)
+                    if (mm.name == "subscript") { sm = &mm; break; }
+                if (!sm || !sm->type) continue;
+                const Type* idxT = !sm->type->elements.empty() ? sm->type->elements[0]
+                                                              : nullptr;
+                const Type* elemT = sm->type->ret ? sm->type->ret : nullptr;
+                if (!idxT || !elemT) continue; // 下标需有下标参数与元素类型
+                // getter：非 mutating，self 按值传递。
+                {
+                    std::string key = td->name + ".subscript.get";
+                    if (methodFns_.count(key)) continue;
+                    llvm::Type* selfTy = layout_->lower(ownerTy);
+                    llvm::Type* iTy = layout_->lower(idxT);
+                    llvm::Type* eTy = layout_->lower(elemT);
+                    llvm::Function* f = llvm::Function::Create(
+                        llvm::FunctionType::get(eTy, {selfTy, iTy}, false),
+                        llvm::GlobalValue::ExternalLinkage, key, module_.get());
+                    methodFns_[key] = f;
+                    genSubscriptBody(sub, ownerTy, idxT, elemT, false, f);
+                }
+                // setter：始终可变，self 按指针传递以便写回。
+                {
+                    std::string key = td->name + ".subscript.set";
+                    if (methodFns_.count(key)) continue;
+                    llvm::Type* selfTy =
+                        llvm::PointerType::getUnqual(layout_->lower(ownerTy));
+                    llvm::Type* iTy = layout_->lower(idxT);
+                    llvm::Type* eTy = layout_->lower(elemT);
+                    llvm::Function* f = llvm::Function::Create(
+                        llvm::FunctionType::get(llvm::Type::getVoidTy(*ctx_),
+                                                {selfTy, iTy, eTy}, false),
+                        llvm::GlobalValue::ExternalLinkage, key, module_.get());
+                    methodFns_[key] = f;
+                    genSubscriptBody(sub, ownerTy, idxT, elemT, true, f);
+                }
+            }
+        }
     }
 
     std::unique_ptr<TypeLayout> layout_;
@@ -4122,6 +4462,8 @@ public:
     std::map<std::string, const Type*> enumTypes_;
     // Instance methods of value types, keyed by mangled "Type.method".
     std::map<std::string, llvm::Function*> methodFns_;
+    // Free functions keyed by name, for call-site default/variadic expansion.
+    std::map<std::string, FunctionDecl*> fnDecls_;
     std::vector<std::pair<FunctionDecl*, const Type*>> methodOrder_; // decl, owner
     // Enclosing value type while generating a method body (implicit self).
     const Type* currentOwner_ = nullptr;

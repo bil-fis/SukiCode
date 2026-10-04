@@ -1,0 +1,53 @@
+// 规范 9：throws / throw / do-catch / try? / try! / catch 类型匹配。
+// Spec 9: throws / throw / do-catch / try? / try! / typed catch.
+//
+// 每个行为用一个非零分值断言；全部通过返回 0，否则返回累计分数（便于定位）。
+
+enum FileError: Error {
+    case notFound(path: String)
+    case permissionDenied
+}
+
+func readFile(path: String) throws -> String {
+    if path == "" { throw FileError.notFound(path: path) }
+    if path == "denied" { throw FileError.permissionDenied }
+    return "ok"
+}
+
+@main
+func main() -> Int {
+    var score = 0
+
+    // 1. 正常路径：do-catch 走 try 成功。
+    do {
+        let c = try readFile(path: "x")
+        if c == "ok" { score += 1 }
+    } catch {
+        // 不应到达这里
+    }
+
+    // 2. 错误路径：throw 触发 catch。
+    do {
+        try readFile(path: "")
+    } catch let e as FileError {
+        // 捕获到 FileError（类型匹配）。
+        score += 2
+    } catch {
+        // 不应到达这里
+    }
+
+    // 3. try? 成功 → 非 nil。
+    let okMaybe = try? readFile(path: "y")
+    if okMaybe != nil { score += 4 }
+
+    // 4. try? 失败 → nil。
+    let failMaybe = try? readFile(path: "")
+    if failMaybe == nil { score += 8 }
+
+    // 5. try! 成功路径。
+    let forced = try! readFile(path: "z")
+    if forced == "ok" { score += 16 }
+
+    if score == 1 + 2 + 4 + 8 + 16 { return 0 }
+    return score
+}

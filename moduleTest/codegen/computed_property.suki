@@ -1,0 +1,41 @@
+// 计算属性：隐式 getter、显式 get、无存储不占字段
+// Computed properties: implicit getter, explicit get, no storage
+
+struct Rect {
+    var w: Int
+    var h: Int
+    // 隐式 getter：直接写在花括号里
+    var area: Int { return self.w * self.h }
+    // 显式 getter，且可依赖另一个计算属性
+    var scaled: Int { get { return self.area * 2 } }
+    var label: String { return "rect" }
+}
+
+class Box {
+    var v: Int
+    init(v: Int) { self.v = v }
+    // class 上的计算属性同样可用
+    var doubled: Int { return self.v * 2 }
+    var tripled: Int { return self.doubled + self.v }
+}
+
+@main
+func main() -> Int {
+    let r = Rect(w: 3, h: 4)
+    if r.area != 12 { return 1 }
+    if r.scaled != 24 { return 2 }
+    if r.w != 3 { return 3 }              // 存储属性不受影响
+    if r.label.length != 4 { return 4 }  // 返回 String
+
+    let b = Box(v: 5)
+    if b.doubled != 10 { return 5 }
+    if b.tripled != 15 { return 6 }
+    if b.v != 5 { return 7 }
+
+    // 每次读取都重新求值
+    var m = Rect(w: 2, h: 2)
+    if m.area != 4 { return 8 }
+    m.w = 10
+    if m.area != 20 { return 9 }         // 计算属性随存储变化
+    return 0
+}

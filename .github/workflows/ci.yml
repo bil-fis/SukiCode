@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    name: Build & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DSUKICODE_BUILD_TESTS=OFF \
+          -DSUKICODE_BUILD_TOOLS=OFF \
+          -DSUKICODE_BUILD_SUKIPM=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Smoke test (compiler lib builds)
+        run: cmake --build build --target sukicompiler

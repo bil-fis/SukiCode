@@ -1,144 +1,137 @@
 #pragma once
-// SukiCode recursive descent parser.
-// Transforms a token stream into an AST (CompilationUnit).
 
-#include "compiler/lexer/Lexer.h"
+#include "compiler/ast/AST.h"
+#include "compiler/diag/DiagnosticEngine.h"
 #include "compiler/lexer/Token.h"
-#include "compiler/ast/ASTNode.h"
-#include "compiler/diag/Diagnostic.h"
 #include <vector>
-#include <string_view>
 
 namespace suki {
 
+// Recursive-descent parser producing the AST defined in ast/AST.h.
+// Includes error recovery: on a parse error it reports a diagnostic and
+// resynchronizes to the next statement/declaration boundary instead of
+// aborting, so multiple errors can be reported in one pass.
 class Parser {
 public:
-    Parser(std::vector<Token> tokens, std::string_view source,
-           std::string_view filename, DiagnosticEngine& diag);
+    Parser(std::vector<Token> tokens, DiagnosticEngine& diags);
 
-    // Parse the entire source file into a CompilationUnit
-    std::unique_ptr<CompilationUnit> parse();
+    // Parse an entire translation unit; returns top-level declarations.
+    NodeList parseModule();
+
+    // Parse a single expression (used by tests / REPL).
+    NodePtr parseExpression();
 
 private:
-    // ─── Token navigation ─────────────────────────────────────────────────
-    const Token& peek() const;
-    const Token& peekAt(size_t offset) const;
-    const Token& advance();
-    bool check(TokenKind kind) const;
-    bool match(TokenKind kind);
-    bool expect(TokenKind kind); // consume if match, else error
-    bool isAtEnd() const;
-    SourceLocation loc() const;
-
-    // ─── Declarations ─────────────────────────────────────────────────────
-    DeclPtr parseDeclaration();
-    // Parse declaration and collect any extra decls (multi-variable) into the given vector
-    void parseDeclarationInto(std::vector<DeclPtr>& out);
-    DeclPtr parseModuleDecl();
-    DeclPtr parseImportDecl();
-    DeclPtr parseVariableDecl();  // let / var
-    DeclPtr parseFunctionDecl();  // func
-    DeclPtr parseStructDecl();
-    DeclPtr parseClassDecl();
-    DeclPtr parseEnumDecl();
-    DeclPtr parseProtocolDecl();
-    DeclPtr parseActorDecl();
-    DeclPtr parseExtensionDecl();
-    DeclPtr parseTypealiasDecl();
-    DeclPtr parseAssociatedTypeDecl();
-    DeclPtr parseInitDecl();
-    DeclPtr parseDeinitDecl();
-    DeclPtr parseSubscriptDecl();
-
-    // Control flow
-    DeclPtr parseIfDecl();
-    DeclPtr parseGuardDecl();
-    DeclPtr parseSwitchDecl();
-    DeclPtr parseForInDecl();
-    DeclPtr parseWhileDecl();
-    DeclPtr parseRepeatWhileDecl();
-    DeclPtr parseDoCatchDecl();
-    DeclPtr parseSelectDecl();
-    DeclPtr parseUnsafeDecl();
-    DeclPtr parseAsmDecl();
-    DeclPtr parseMacroDecl(MacroKind kind);
-    DeclPtr parseExternDecl();
-    DeclPtr parseExternFuncDecl(const std::string& callingConv);
-    FunctionParam parseExternParam();
-
-    // ─── Statements ───────────────────────────────────────────────────────
-    StmtPtr parseStatement();
-    StmtPtr parseReturnStmt();
-    StmtPtr parseBreakStmt();
-    StmtPtr parseContinueStmt();
-    StmtPtr parseFallthroughStmt();
-    StmtPtr parseDeferStmt();
-    StmtPtr parseThrowStmt();
-    std::vector<StmtPtr> parseBlock(); // { stmts }
-
-    // ─── Expressions ──────────────────────────────────────────────────────
-    // Precedence climbing for binary operators
-    ExprPtr parseExpression();
-    ExprPtr parseAssignmentExpr();
-    ExprPtr parseTernaryExpr();
-    ExprPtr parseRangeExpr();
-    ExprPtr parseLogicalOrExpr();
-    ExprPtr parseLogicalAndExpr();
-    ExprPtr parseBitwiseOrExpr();
-    ExprPtr parseBitwiseXorExpr();
-    ExprPtr parseBitwiseAndExpr();
-    ExprPtr parseComparisonExpr();
-    ExprPtr parseShiftExpr();
-    ExprPtr parseAdditionExpr();
-    ExprPtr parseMultiplicationExpr();
-    ExprPtr parsePrefixExpr();
-    ExprPtr parsePostfixExpr();
-    ExprPtr parsePrimaryExpr();
-
-    ExprPtr parseCallExpr(ExprPtr callee);
-    ExprPtr parseMemberAccessExpr(ExprPtr base);
-    ExprPtr parseSubscriptExpr(ExprPtr base);
-
-    // ─── Types ────────────────────────────────────────────────────────────
-    TypeReprPtr parseType();
-    TypeReprPtr parseSimpleType();
-    TypeReprPtr parseFunctionType();
-
-    // ─── Patterns ─────────────────────────────────────────────────────────
-    PatternPtr parsePattern();
-
-    // ─── Function parameters ──────────────────────────────────────────────
-    FunctionParam parseFunctionParam();
-    std::vector<FunctionParam> parseParamList();
-
-    // ─── Generic parameters ───────────────────────────────────────────────
-    std::vector<GenericParam> parseGenericParams();
-
-    // ─── Access control ───────────────────────────────────────────────────
-    AccessLevel parseAccessLevel();
-
-    // ─── Helpers ──────────────────────────────────────────────────────────
-    // Error recovery: skip to next statement boundary
+    // ── token stream ───────────────────────────────────────────────────────
+    const Token& cur() const;
+    const Token& peek(size_t off = 1) const;
+    bool atEnd() const;
+    bool check(TokenKind k) const;
+    bool checkPunct(PunctuatorID p) const;
+    bool checkKw(KeywordID k) const;
+    bool match(TokenKind k);
+    bool matchPunct(PunctuatorID p);
+    bool matchKw(KeywordID k);
+    Token advance();
+    Token expect(TokenKind k, const char* msg);
+    Token expectPunct(PunctuatorID p, const char* msg);
+    Token expectKw(KeywordID k, const char* msg);
+    void errorAt(const Token& t, const std::string& msg);
     void synchronize();
-    void error(std::string_view message);
 
-    // ─── State ────────────────────────────────────────────────────────────
+    // ── declarations ─────────────────────────────────────────────────────────
+    NodePtr parseDecl();
+    std::vector<std::string> parseModifiers();
+    NodePtr parseFunctionDecl(std::vector<std::string> modifiers);
+    NodePtr parseInitializerDecl(std::vector<std::string> modifiers);
+    NodePtr parseDeinitializerDecl();
+    NodePtr parseSubscriptDecl(std::vector<std::string> modifiers);
+    NodePtr parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers);
+    NodePtr parseTypealiasDecl();
+    NodePtr parseAssociatedTypeDecl();
+    NodePtr parseVarDecl(bool isLet, std::vector<std::string> modifiers, bool member);
+    // Parse a computed-property accessor block: `{ get {..} set {..} }` or an
+    // implicit getter `{ statements }`. Returns the collected statements.
+    std::vector<NodePtr> parseAccessors();
+    // `{1, 2, 3}` set literal; the opening brace is already current.
+    NodePtr parseSetLiteral();
+    // True when the tokens after `{` form a closure parameter list.
+    bool closureParamsAhead();
+    // True when `[` at the cursor opens a capture list (`[weak self] in ...`).
+    bool captureListAhead();
+    // True when the token after the current one begins an expression.
+    bool nextStartsExpression();
+    NodePtr parseEnumCase();
+    std::vector<Param> parseParameterList();
+    std::vector<std::string> parseGenericParamNames(); // <T, U: Bound>
+    NodeList parseInheritedTypes();        // : A, B, C
+
+    // ── statements ────────────────────────────────────────────────────────────
+    NodePtr parseStatement();
+    NodePtr parseBlock();
+    NodeList parseBlockStatements();
+    NodePtr parseIfStmt();
+    NodePtr parseGuardStmt();
+    NodePtr parseWhileStmt();
+    NodePtr parseRepeatStmt();
+    NodePtr parseForInStmt();
+    NodePtr parseSwitchStmt();
+    NodePtr parseSelectStmt();
+    NodePtr parseReturnStmt();
+    NodePtr parseThrowStmt();
+    NodePtr parseDeferStmt();
+    NodePtr parseDoStmt();
+    NodePtr parseUnsafeStmt();
+    NodePtr parseCondition();
+
+    // ── expressions (precedence climbing) ─────────────────────────────────────
+    NodePtr parseExpr();
+    // Parse an expression in a context where a following `{` is a statement
+    // block (if/while/guard conditions, for-in sequences, switch subjects),
+    // not a trailing closure.
+    NodePtr parseExprNoTrailingClosure();
+    // Parse a case-pattern subject, stopping before a payload binding list so
+    // that `case Shape.circle(let r)` is not read as a call taking `let r`.
+    // Binding names are appended to `bindings`.
+    NodePtr parseCasePatternExpr(std::vector<std::string>& bindings);
+    NodePtr parseAssignment();
+    // A conditional whose condition is already parsed (then-branch of `?:`).
+    NodePtr parseConditionalFromRange();
+    NodePtr parseRange();
+    NodePtr parseNilCoalescing();
+    NodePtr parseLogicalOr();
+    NodePtr parseLogicalAnd();
+    NodePtr parseBitwiseOr();
+    NodePtr parseBitwiseXor();
+    NodePtr parseBitwiseAnd();
+    NodePtr parseComparison();
+    NodePtr parseShift();
+    NodePtr parseAdditive();
+    NodePtr parseMultiplicative();
+    NodePtr parseUnary();
+    NodePtr parsePostfix();
+    NodePtr parsePrimary();
+    NodePtr parseCallSuffix(NodePtr callee);
+    NodePtr parseClosure(bool arrowSyntax);
+    NodePtr parseCollectionLiteral();
+    bool looksLikeArrowClosure();
+
+    // ── types ──────────────────────────────────────────────────────────────────
+    NodePtr parseType();
+    NodePtr parseTypePostfix(NodePtr base);
+    // 泛型实参列表（`<` 已消费）：成功返回持有各实参的 TupleType，失败返回
+    // nullptr 且不消费 `>`，由调用方决定回退。
+    NodePtr parseTypeArgsUntilGreater();
+
     std::vector<Token> tokens_;
-    size_t pos_;
-    std::string_view source_;
-    std::string_view filename_;
-    DiagnosticEngine& diag_;
-    NodeID nextNodeId_ = 1;
-    uint64_t uniqueIdCounter_ = 0; // 用于 #unique 生成唯一标识符
-    // Multi-variable declarations: var x, y: Double produces extra decls
-    std::vector<DeclPtr> multiDecls_;
-
-    template<typename T>
-    std::unique_ptr<T> makeNode() {
-        auto node = std::make_unique<T>();
-        node->id = nextNodeId_++;
-        return node;
-    }
+    size_t pos_ = 0;
+    DiagnosticEngine& diags_;
+    // >0 while parsing a control-flow condition/subject, where `{` denotes a
+    // block rather than a trailing closure argument.
+    int suppressTrailingClosure_ = 0;
+    // >0 while parsing a case pattern, where `(` starts a payload binding list
+    // rather than a call argument list.
+    int suppressCall_ = 0;
 };
 
 } // namespace suki

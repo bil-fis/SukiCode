@@ -1,0 +1,47 @@
+// ARC 生命周期：deinit 在最后一个强引用消失时执行；作用域退出释放引用
+// ARC lifetime: deinit runs when the last strong reference goes away.
+
+var destroyed: Int = 0
+
+class Res {
+    var v: Int
+    init(v: Int) { self.v = v }
+    deinit { destroyed += 1 }
+}
+
+class Derived : Res {
+    init(v: Int) { super.init(v: v) }
+    deinit { destroyed += 10 }
+}
+
+class NoDeinit {
+    var v: Int
+    init(v: Int) { self.v = v }
+}
+
+// 返回局部创建的实例：函数结束时局部引用被释放，对象随之销毁
+func makeAndDrop() -> Int {
+    let a = Res(v: 1)
+    let b = Derived(v: 2)
+    if a.v != 1 { return 90 }
+    if b.v != 2 { return 91 }
+    return 0
+}
+
+@main
+func main() -> Int {
+    if makeAndDrop() != 0 { return 1 }
+    // 子类 deinit 先执行（+10），父类随后（+1）
+    if destroyed != 11 { return destroyed }
+
+    // 显式释放：手动把引用交出后，对象立即销毁
+    destroyed = 0
+    let keep = Res(v: 3)
+    if destroyed != 0 { return 2 }        // 仍被持有
+    if keep.v != 3 { return 3 }
+
+    // 无 deinit 的类不应崩溃
+    let plain = NoDeinit(v: 4)
+    if plain.v != 4 { return 4 }
+    return 0
+}

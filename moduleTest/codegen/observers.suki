@@ -1,0 +1,55 @@
+// 属性观察器：willSet / didSet 顺序，初始化期间不触发
+// Property observers: willSet / didSet ordering; not fired during initialization
+
+// 模块级变量：跨函数可见
+var log: Int = 0
+var hits: Int = 0
+
+func record(_ n: Int) { log += n }
+
+class Counter {
+    var v: Int = 0 {
+        // willSet 看到即将存入的新值
+        willSet { record(1) }
+        // didSet 看到被替换的旧值
+        didSet { record(10) }
+    }
+    func bump() { self.v = self.v + 1 }
+    func observe() -> Int { return log }
+}
+
+struct Tracked {
+    var n: Int = 0 {
+        didSet { hits = hits + 100 }
+    }
+    mutating func set(_ x: Int) { self.n = x }
+}
+
+@main
+func main() -> Int {
+    // 初始值不触发观察器
+    let c = Counter()
+    if log != 0 { return 1 }
+    if c.v != 0 { return 2 }
+
+    // 赋值触发：willSet(+1) 先于 didSet(+10)
+    c.bump()
+    if log != 11 { return 3 }
+    if c.v != 1 { return 4 }
+
+    // 再赋值一次，累计
+    c.bump()
+    if log != 22 { return 5 }
+    if c.v != 2 { return 6 }
+
+    // 每次读取都看到最新值
+    if c.observe() != 22 { return 7 }
+
+    // struct 上的观察器同样工作
+    let t = Tracked()
+    if hits != 0 { return 8 }
+    t.set(5)
+    if hits != 100 { return 9 }
+    if t.n != 5 { return 10 }
+    return 0
+}

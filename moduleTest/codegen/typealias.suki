@@ -1,0 +1,27 @@
+// 类型别名：别名是透明的，直接展开为其底层类型
+// Type alias: an alias is transparent and expands to its underlying type.
+
+typealias ID = Int
+typealias Pair = (Int, Int)
+
+func getID() -> ID { return 7 }
+
+func sumPair(p: Pair) -> Int { return p.0 + p.1 }
+
+@main
+func main() -> Int {
+    // 别名可用于返回类型、参数类型与局部变量标注
+    let a: ID = 3
+    if a != 3 { return 1 }
+    if getID() != 7 { return 2 }
+
+    let p: Pair = (10, 32)
+    if sumPair(p) != 42 { return 3 }
+
+    // 别名与底层类型可互换赋值
+    let b: Int = a
+    var c: ID = b
+    c += 4
+    if c != 7 { return 4 }
+    return 0
+}

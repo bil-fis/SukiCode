@@ -34,8 +34,8 @@ func sum(n: Int) -> Int {
     return total
 }
 
-// 泛型
-func identity<T>(value: T) -> T {
+// 泛型（单态化尚未实现，见 plan 的 protocol-generic 任务）
+func identityInt(value: Int) -> Int {
     return value
 }
 
@@ -58,10 +58,8 @@ func main() -> Int {
     let a = add(a: 1, b: 2)
     let b = abs(n: -42)
     let c = sum(n: 10)
-    let d = identity(value: 100)
-    print(a)
-    print(b)
-    print(c)
-    print(d)
+    let d = identityInt(value: 100)
+    // print 接受 String（带长度的运行时结构），数值需用插值转换。
+    print("\(a) \(b) \(c) \(d)\n")
     return 0
 }

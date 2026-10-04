@@ -1,0 +1,21 @@
+// 规范 4.3 / 10.1（负例）：`final` 方法禁止被重写，重写必须命中父类成员。
+// Spec 4.3 / 10.1 (negative): a `final` method must not be overridden, and an
+// `override` must match an inherited member.
+//
+// 期望行为：`sukic check` 报出重写 final 方法的诊断。
+// 当前状态：override / final 只是修饰符字符串，没有任何语义校验。
+
+class Base {
+    final func locked() -> Int { return 1 }
+}
+
+class Derived: Base {
+    override func locked() -> Int { return 2 }
+}
+
+@main
+func main() -> Int {
+    let d = Derived()
+    if d.locked() != 1 { return 1 }
+    return 0
+}

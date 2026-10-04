@@ -1,0 +1,37 @@
+// 泛型单态化：每个类型实参元组生成一份具体函数
+// Generic monomorphisation: one concrete function per type-argument tuple.
+
+struct P { var x: Int
+    var y: Int }
+
+func identity<T>(value: T) -> T { return value }
+func firstOf<T>(items: [T]) -> T { return items[0] }
+func pairCount<A, B>(a: A, b: B) -> Int { return 2 }
+func makePoint(x: Int, y: Int) -> P { return P(x: x, y: y) }
+func wrap<T>(v: T) -> [T] { return [v] }
+
+@main
+func main() -> Int {
+    // 同一泛型函数的不同实例
+    if identity(value: 42) != 42 { return 1 }
+    if identity(value: "s") != "s" { return 2 }
+    if identity(value: 1.5) != 1.5 { return 3 }
+
+    // 容器参数按元素类型实例化
+    if firstOf(items: [1, 2, 3]) != 1 { return 4 }
+    if firstOf(items: ["a", "b"]) != "a" { return 5 }
+
+    // 多类型参数
+    if pairCount(a: 1, b: "x") != 2 { return 6 }
+    if pairCount(a: "x", b: 1) != 2 { return 7 }
+
+    // 实例返回聚合类型
+    let p = makePoint(x: 3, y: 4)
+    if p.x != 3 { return 8 }
+
+    // 泛型返回容器
+    let boxed = wrap(value: 9)
+    if boxed.count != 1 { return 9 }
+    if firstOf(items: boxed) != 9 { return 10 }
+    return 0
+}

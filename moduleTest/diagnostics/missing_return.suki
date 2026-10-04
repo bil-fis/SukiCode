@@ -1,0 +1,7 @@
+// 负例：有返回值的函数缺少 return，应报缺失返回
+// Negative: a value-returning function with no return must be diagnosed.
+func noReturn() -> Int {
+    let x = 1
+}
+@main
+func main() -> Int { return 0 }

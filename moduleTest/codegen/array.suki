@@ -1,0 +1,27 @@
+// 数组：字面量、count/isEmpty、append、removeAt、元素访问
+// Array: literals, count/isEmpty, append, removeAt, element access
+
+@main
+func main() -> Int {
+    let a = [1, 2, 3]
+    if a.count != 3 { return 1 }
+    if a.isEmpty { return 2 }
+    if a.isEmpty { return 3 }
+
+    // 数组保留顺序与重复元素（与 Set 不同）
+    let dup = [1, 2, 2, 3]
+    if dup.count != 4 { return 4 }
+
+    // append 遵循值语义：返回扩容后的新数组
+    let b = a.append(4)
+    if b.count != 4 { return 5 }
+    if a.count != 3 { return 6 }           // 原数组不变
+
+    let c = b.removeAt(0)
+    if c.count != 3 { return 7 }
+
+    let empty: [Int] = []
+    if !empty.isEmpty { return 8 }
+    if empty.count != 0 { return 9 }
+    return 0
+}

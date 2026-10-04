@@ -1,0 +1,45 @@
+// 规范 3.1 / 4.2：inout 参数、默认参数、变长参数、自定义下标。
+// Spec 3.1 / 4.2: inout parameters, default arguments, variadics, subscripts.
+//
+// 期望行为：按引用传参并写回、默认值在调用点补齐、下标 get/set 生效。
+//
+// 返回值采用"默认失败"设计，避免表达式无法生成时因 `if` 被跳过而假通过。
+
+struct Matrix {
+    var grid: [Int]
+    subscript(index: Int) -> Int {
+        get { return grid[index] }
+        set { grid[index] = newValue }
+    }
+}
+
+func bump(_ v: inout Int) {
+    v += 1
+}
+
+func greet(name: String, punctuation: String = "!") -> String {
+    return name + punctuation
+}
+
+func total(_ values: Int...) -> Int {
+    var sum = 0
+    for v in values { sum += v }
+    return sum
+}
+
+@main
+func main() -> Int {
+    var result = 23 // 1 + 2 + 4 + 8 + 8（下标 get/set 各 8）
+    var n = 1
+    bump(&n)
+    if n == 2 { result -= 1 }
+
+    if greet(name: "hi") == "hi!" { result -= 2 }
+    if total(1, 2, 3) == 6 { result -= 4 }
+
+    var m = Matrix(grid: [10, 20])
+    if m[0] == 10 { result -= 8 }
+    m[1] = 99
+    if m[1] == 99 { result -= 8 }
+    return result
+}

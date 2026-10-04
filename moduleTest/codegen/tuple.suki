@@ -1,0 +1,14 @@
+// 元组：构造、按索引访问、作为参数传递
+// Tuple: construction, indexed access, passing as an argument
+
+func sumOf(t: (Int, Int)) -> Int { return t.0 + t.1 }
+
+@main
+func main() -> Int {
+    let t = (10, 32)
+    if t.0 != 10 { return 1 }
+    if t.1 != 32 { return 2 }
+    if t.0 + t.1 != 42 { return 3 }
+    if sumOf(t) != 42 { return 4 }
+    return 0
+}

@@ -1,0 +1,7 @@
+// 负例：把 String 当 Int 返回，应报类型不匹配
+// Negative: returning a String where Int is expected must be diagnosed.
+func bad() -> Int {
+    return "not an int"
+}
+@main
+func main() -> Int { return bad() }

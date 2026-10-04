@@ -1,0 +1,24 @@
+// 规范 5.2：泛型类型的实例化。
+// Spec 5.2: generic type instantiation.
+//
+// 期望行为：`Box<Int>` / `Box<String>` 各自单态化并正确读写，退出码 0。
+// 当前状态：只有泛型函数会单态化，泛型类型不会。
+//
+// 与 extension.suki 一样采用"默认失败"的返回值设计，避免表达式无法生成时
+// 因 `if` 被跳过而假通过。
+
+struct Box<T> {
+    var value: T
+    func get() -> T { return value }
+}
+
+@main
+func main() -> Int {
+    var result = 7 // 1 + 2 + 4
+    let b = Box<Int>(value: 7)
+    if b.value == 7 { result -= 1 }
+    if b.get() == 7 { result -= 2 }
+    let s = Box<String>(value: "hi")
+    if s.value == "hi" { result -= 4 }
+    return result
+}

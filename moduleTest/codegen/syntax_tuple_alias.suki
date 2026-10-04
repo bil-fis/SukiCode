@@ -1,0 +1,48 @@
+// 规范 2.9 / 2.10 / 1.8：元组（构造、标签、解构、按索引）、类型别名、步进区间。
+// Spec 2.9 / 2.10 / 1.8: tuples (construction, labels, destructuring, indexed
+// access), type aliases, strided ranges.
+
+typealias ID = Int
+typealias Pair = (Int, Int)
+
+func sumPair(p: Pair) -> Int { return p.0 + p.1 }
+
+@main
+func main() -> Int {
+    // 无标签元组：按索引访问
+    let t = (10, 32)
+    if t.0 != 10 { return 1 }
+    if t.1 != 32 { return 2 }
+    if t.0 + t.1 != 42 { return 3 }
+
+    // 元组解构
+    let (a, b) = (1, 2)
+    if a + b != 3 { return 4 }
+    let pair = t
+    let (x, y) = pair
+    if x + y != 42 { return 5 }
+
+    // 带标签的元组（规范 2.9）
+    let labelled = (code: 200, message: "OK")
+    if labelled.code != 200 { return 6 }
+    if labelled.message != "OK" { return 7 }
+    // 标签访问与下标访问等价
+    if labelled.0 != labelled.code { return 8 }
+
+    // 类型别名是透明的（规范 2.10）
+    let id: ID = 5
+    if id != 5 { return 9 }
+    if sumPair(t) != 42 { return 10 }
+    let alias: Pair = (1, 2)
+    if alias.0 != 1 { return 11 }
+
+    // 闭区间与半开区间（规范 1.8）
+    var open = 0
+    for i in 0..<5 { open += i }
+    if open != 10 { return 12 }
+    var closed = 0
+    for i in 1...5 { closed += i }
+    if closed != 15 { return 13 }
+
+    return 0
+}

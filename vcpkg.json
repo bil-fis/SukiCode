@@ -1,0 +1,15 @@
+{
+  "name": "sukicode",
+  "version": "0.1.0",
+  "description": "SukiCode programming language toolchain (LLVM backend)",
+  "homepage": "https://github.com/SukiCode/SukiCode",
+  "license": "MIT",
+  "dependencies": [
+    "gtest",
+    "abseil",
+    "re2",
+    "curl",
+    "nlohmann-json"
+  ],
+  "builtin-baseline": "2024.01.01"
+}

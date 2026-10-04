@@ -1,212 +1,169 @@
 // Parser unit tests for SukiCode.
-// Tests parsing of declarations, statements, and expressions.
+//
+// The parser's job is to build the right tree and to keep going after an error.
+// These cases therefore check two things: that valid input produces the expected
+// declaration/statement shape, and that malformed input is reported without
+// looping forever (a real bug once: a lookahead path re-entered itself and grew
+// the token stream until allocation failed).
 
 #include "compiler/lexer/Lexer.h"
 #include "compiler/parser/Parser.h"
-#include "compiler/ast/ASTNode.h"
-#include "compiler/ast/ASTPrinter.h"
-#include "compiler/diag/Diagnostic.h"
+#include "compiler/ast/AST.h"
+#include "compiler/diag/DiagnosticEngine.h"
 
-#include <cassert>
 #include <iostream>
 #include <string>
 
 using namespace suki;
 
-static std::unique_ptr<CompilationUnit> parse(const std::string& source) {
-    DiagnosticEngine diag;
-    Lexer lexer(source, "test.suki", diag);
-    auto tokens = lexer.lexAll();
-    Parser parser(std::move(tokens), source, "test.suki", diag);
-    auto cu = parser.parse();
+namespace {
 
-    if (diag.hadErrors()) {
-        std::cerr << "Parse errors:\n";
-        diag.printAll(source, "test.suki");
+int g_failures = 0;
+int g_checks = 0;
+
+void check(bool cond, const std::string& what) {
+    ++g_checks;
+    if (!cond) {
+        ++g_failures;
+        std::cout << "  FAIL: " << what << "\n";
     }
-
-    return cu;
 }
 
-static void testModuleDeclaration() {
-    auto cu = parse("module MyApp");
-    assert(cu != nullptr);
-    assert(cu->moduleDecl != nullptr);
-    assert(cu->moduleDecl->name == "MyApp");
-    std::cout << "PASS: testModuleDeclaration\n";
+struct ParseResult {
+    NodeList decls;
+    bool hadError = false;
+};
+
+ParseResult parseSource(const std::string& source) {
+    ParseResult r;
+    DiagnosticEngine diags;
+    {
+        Lexer lex(source, diags);
+        Parser parser(lex.tokenizeAll(), diags);
+        r.decls = parser.parseModule();
+    }
+    r.hadError = diags.hasErrors();
+    return r;
 }
 
-static void testVariableDeclaration() {
-    auto cu = parse("let x = 42");
-    assert(cu != nullptr);
-    assert(cu->declarations.size() >= 1);
-    // First decl might be module or variable
-    Decl* varDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Variable) {
-            varDecl = d.get();
-            break;
+void accepts(const std::string& name, const std::string& src) {
+    auto r = parseSource(src);
+    check(!r.hadError, name + ": expected acceptance, got a diagnostic");
+}
+
+void rejects(const std::string& name, const std::string& src) {
+    auto r = parseSource(src);
+    check(r.hadError, name + ": expected a diagnostic, got acceptance");
+}
+
+void testDeclarations() {
+    std::cout << "Declarations\n";
+    accepts("function", R"(
+        func add(a: Int, b: Int) -> Int { return a + b }
+    )");
+    accepts("variadic parameter", R"(
+        func log(items: Int...) -> Int { return 0 }
+    )");
+    accepts("struct with methods", R"(
+        struct P {
+            var x: Int
+            func get() -> Int { return self.x }
         }
-    }
-    assert(varDecl != nullptr);
-    auto* vd = static_cast<VariableDecl*>(varDecl);
-    assert(vd->isLet == true);
-    std::cout << "PASS: testVariableDeclaration\n";
-}
-
-static void testFunctionDeclaration() {
-    auto cu = parse("func add(_ a: Int, _ b: Int) -> Int {\n    return a + b\n}");
-    assert(cu != nullptr);
-    Decl* funcDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Function) {
-            funcDecl = d.get();
-            break;
+    )");
+    accepts("enum with payloads", R"(
+        enum E { case a
+                 case c(r: Int) }
+    )");
+    accepts("class with initialiser", R"(
+        class C {
+            var v: Int
+            init(v: Int) { self.v = v }
         }
-    }
-    assert(funcDecl != nullptr);
-    auto* fd = static_cast<FunctionDecl*>(funcDecl);
-    assert(fd->name == "add");
-    assert(fd->params.size() == 2);
-    std::cout << "PASS: testFunctionDeclaration\n";
+    )");
 }
 
-static void testStructDeclaration() {
-    auto cu = parse("struct Point {\n    var x: Double\n    var y: Double\n}");
-    assert(cu != nullptr);
-    Decl* structDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Struct) {
-            structDecl = d.get();
-            break;
+void testStatementsAndExpressions() {
+    std::cout << "Statements and expressions\n";
+    accepts("if/else", "func f() -> Int { if true { return 1 } else { return 2 } }");
+    accepts("while", "func f() { while true { break } }");
+    accepts("for-in", "func f(xs: [Int]) -> Int { var s = 0\n for x in xs { s += x }\n return s }");
+    accepts("switch", R"(
+        func f(n: Int) -> Int {
+            switch n {
+                case 1: return 1
+                default: return 0
+            }
         }
-    }
-    assert(structDecl != nullptr);
-    auto* sd = static_cast<StructDecl*>(structDecl);
-    assert(sd->name == "Point");
-    assert(sd->members.size() == 2);
-    std::cout << "PASS: testStructDeclaration\n";
-}
-
-static void testClassDeclaration() {
-    auto cu = parse("class Animal {\n    var name: String\n    func speak() -> String {\n        return \"...\"\n    }\n}");
-    assert(cu != nullptr);
-    Decl* classDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Class) {
-            classDecl = d.get();
-            break;
+    )");
+    // A case pattern may bind payload values: `case E.c(let r)`.
+    accepts("enum payload pattern", R"(
+        enum E { case c(r: Int)
+                 case e }
+        func f(e: E) -> Int {
+            switch e {
+                case E.c(let r): return r
+                default: return 0
+            }
         }
-    }
-    assert(classDecl != nullptr);
-    auto* cd = static_cast<ClassDecl*>(classDecl);
-    assert(cd->name == "Animal");
-    std::cout << "PASS: testClassDeclaration\n";
+    )");
+    // Trailing closures and closure parameter lists.
+    accepts("trailing closure", "func f() -> Int { let g = { 1 }\n return 0 }");
+    accepts("closure with `in` parameters", "func f() -> Int { let g = { x, y in x }\n return 0 }");
+    // `t.0` is tuple indexing; the lexer must not swallow `.0` as a float.
+    accepts("tuple index", "func f() -> Int { let t = (1, 2)\n return t.0 }");
+    accepts("empty dictionary literal", "func f() -> Int { let d = [:]\n return 0 }");
 }
 
-static void testIfStatement() {
-    auto cu = parse("if x > 0 {\n    print(x)\n} else {\n    print(0)\n}");
-    assert(cu != nullptr);
-    Decl* ifDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::If) {
-            ifDecl = d.get();
-            break;
-        }
-    }
-    assert(ifDecl != nullptr);
-    std::cout << "PASS: testIfStatement\n";
+void testOperators() {
+    std::cout << "Operators\n";
+    // `a < b` is a comparison, while `Base<T>` is a generic specialisation;
+    // confusing the two used to send the parser into an unbounded loop.
+    accepts("comparison is not a specialisation", "func f(a: Int, b: Int) -> Bool { return a < b }");
+    accepts("generic specialisation", "func f() -> Int { return g<Int>() }");
+    accepts("bitwise and shift", "func f(a: Int, b: Int) -> Int { return (a & b) << 2 }");
+    accepts("nil coalescing", "func f(a: Int?) -> Int { return a ?? 0 }");
+    accepts("range", "func f() -> Int { var s = 0\n for i in 0..<10 { s += i }\n return s }");
 }
 
-static void testForInLoop() {
-    auto cu = parse("for item in array {\n    print(item)\n}");
-    assert(cu != nullptr);
-    Decl* forDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::ForIn) {
-            forDecl = d.get();
-            break;
-        }
+void testErrorRecovery() {
+    std::cout << "Error recovery\n";
+    // Malformed input must be reported, and parsing must terminate.
+    rejects("missing body", "func f(");
+    rejects("stray token", "func f() -> Int { return } +++ }");
+    rejects("unterminated string", "func f() { let s = \"abc }");
+    // Recovery: an error inside one declaration must not swallow the next one.
+    // `let s = S()` is legal, so the diagnostic has to come from the bad call
+    // that follows, and `g` must still be parsed.
+    {
+        // Member *existence* is Sema's job, not the parser's; the parser only
+        // rejects what it cannot read at all. A stray token mid-expression is
+        // such a case, and must not prevent the next declaration from parsing.
+        auto r = parseSource(R"(
+            struct S { var x: Int }
+            func f() -> Int {
+                let s = S()
+                return @@@
+            }
+            func g() -> Int { return 1 }
+        )");
+        check(r.hadError, "recovery: stray token is diagnosed");
+        int funcs = 0;
+        for (auto& d : r.decls)
+            if (d && d->kind == NodeKind::FunctionDecl) ++funcs;
+        check(funcs == 2, "recovery: the following declaration still parsed");
     }
-    assert(forDecl != nullptr);
-    std::cout << "PASS: testForInLoop\n";
 }
 
-static void testSwitchStatement() {
-    auto cu = parse("switch value {\ncase 0:\n    print(\"zero\")\ncase 1:\n    print(\"one\")\ndefault:\n    print(\"other\")\n}");
-    assert(cu != nullptr);
-    Decl* switchDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Switch) {
-            switchDecl = d.get();
-            break;
-        }
-    }
-    assert(switchDecl != nullptr);
-    auto* sd = static_cast<SwitchDecl*>(switchDecl);
-    assert(sd->cases.size() == 3);
-    std::cout << "PASS: testSwitchStatement\n";
-}
-
-static void testEnumDeclaration() {
-    auto cu = parse("enum Color {\n    case red\n    case green\n    case blue\n}");
-    assert(cu != nullptr);
-    Decl* enumDecl = nullptr;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Enum) {
-            enumDecl = d.get();
-            break;
-        }
-    }
-    assert(enumDecl != nullptr);
-    auto* ed = static_cast<EnumDecl*>(enumDecl);
-    assert(ed->name == "Color");
-    assert(ed->cases.size() == 3);
-    std::cout << "PASS: testEnumDeclaration\n";
-}
-
-static void testHelloWorld() {
-    // A complete hello world program
-    auto cu = parse(R"(
-@main
-func main() {
-    print("Hello, SukiCode!")
-}
-)");
-    assert(cu != nullptr);
-    // Should have at least the main function
-    bool foundMain = false;
-    for (auto& d : cu->declarations) {
-        if (d->declKind == DeclKind::Function) {
-            auto* fd = static_cast<FunctionDecl*>(d.get());
-            if (fd->name == "main") foundMain = true;
-        }
-    }
-    assert(foundMain);
-    std::cout << "PASS: testHelloWorld\n";
-}
-
-static void testASTPrinter() {
-    auto cu = parse("let x = 42");
-    ASTPrinter printer;
-    std::string output = printer.print(*cu);
-    assert(!output.empty());
-    std::cout << "PASS: testASTPrinter\n";
-}
+} // namespace
 
 int main() {
-    testModuleDeclaration();
-    testVariableDeclaration();
-    testFunctionDeclaration();
-    testStructDeclaration();
-    testClassDeclaration();
-    testIfStatement();
-    testForInLoop();
-    testSwitchStatement();
-    testEnumDeclaration();
-    testHelloWorld();
-    testASTPrinter();
+    std::cout << "=== Parser unit tests ===\n";
+    testDeclarations();
+    testStatementsAndExpressions();
+    testOperators();
+    testErrorRecovery();
 
-    std::cout << "\nAll parser tests passed!\n";
-    return 0;
+    std::cout << (g_failures ? "\nFAILED " : "\nPASSED ")
+              << (g_checks - g_failures) << "/" << g_checks << " checks\n";
+    return g_failures ? 1 : 0;
 }

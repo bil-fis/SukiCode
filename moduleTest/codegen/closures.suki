@@ -1,0 +1,38 @@
+// 规范 3.3 / 3.4：闭包 —— Swift 风格、箭头风格、捕获列表、尾随闭包。
+// Spec 3.3 / 3.4: closures — Swift style, arrow style, capture lists,
+// trailing closures.
+//
+// 期望行为：全部断言成立，退出码 0。
+// 当前状态：闭包表达式尚未生成代码（甚至会让编译器崩溃）。
+//
+// 返回值采用"默认失败"设计（初始为各断言权重之和），避免表达式无法生成时
+// 因 `if` 被跳过而假通过。
+
+func apply(_ f: (Int) -> Int, _ v: Int) -> Int {
+    return f(v)
+}
+
+func applyTrailing(_ v: Int, _ f: (Int) -> Int) -> Int {
+    return f(v)
+}
+
+@main
+func main() -> Int {
+    var result = 15 // 1 + 2 + 4 + 8
+    // Swift 风格闭包
+    let inc = { (a: Int) -> Int in return a + 1 }
+    // 箭头风格闭包（受 TypeScript 启发）
+    let twice = (a: Int) => a * 2
+    if apply(inc, 1) == 2 { result -= 1 }
+    if apply(twice, 3) == 6 { result -= 2 }
+
+    // 捕获外部变量
+    var captured = 10
+    let addCaptured = { (a: Int) -> Int in return a + captured }
+    if apply(addCaptured, 5) == 15 { result -= 4 }
+
+    // 尾随闭包
+    let tripled = applyTrailing(4) { x in x * 3 }
+    if tripled == 12 { result -= 8 }
+    return result
+}

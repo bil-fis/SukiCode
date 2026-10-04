@@ -1,22 +1,4 @@
-# SukiCode Standard Library
-# Core, System, Concurrency modules compiled from .suki sources
-# For now, this is a placeholder — the stdlib is written in SukiCode itself
-# and compiled by sukic. The C/C++ stubs here provide runtime support.
-
-add_library(sukistd STATIC
-    core/Print.cpp
-    core/Assert.cpp
-    core/String.cpp
-    # System 模块是 header-only，不需要编译
-)
-
-target_include_directories(sukistd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-
-if(MSVC)
-    target_compile_options(sukistd PRIVATE /utf-8)
-endif()
-
-install(TARGETS sukistd
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-)
+# SukiCode Standard Library (sukistd)
+# The standard library is written in SukiCode itself and compiled by sukic.
+# A small C runtime support layer is provided by src/runtime (stage 5).
+# Placeholder for now.

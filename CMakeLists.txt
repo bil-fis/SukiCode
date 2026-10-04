@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # SukiCode Programming Language Toolchain
-# A modern systems programming language with LLVM backend
+# A modern, memory-safe systems programming language with an LLVM backend.
 project(SukiCode
     VERSION 0.1.0
     LANGUAGES C CXX
@@ -13,8 +13,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Position-independent code for shared libraries
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Output directories
@@ -23,135 +21,88 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # ─── Options ───────────────────────────────────────────────────────────────
-option(SUKICODE_BUILD_TESTS "Build test suite" ON)
-option(SUKICODE_BUILD_TOOLS "Build tools (suki-lsp, suki-fmt)" ON)
-option(SUKICODE_BUILD_SUKIPM "Build package manager" ON)
+# Tests/tools are built incrementally as the toolchain is implemented.
+option(SUKICODE_BUILD_TESTS   "Build test suite"            OFF)
+option(SUKICODE_BUILD_TOOLS   "Build tools (suki-lsp, etc)" OFF)
+option(SUKICODE_BUILD_SUKIPM  "Build package manager"       OFF)
 option(SUKICODE_USE_SYSTEM_LLVM "Use system LLVM installation" ON)
 
 # ─── Find LLVM ─────────────────────────────────────────────────────────────
-# Try to find LLVM via cmake config first, then fall back to llvm-config
+# LLVM is the sole cross-platform code-generation backend.
 if(SUKICODE_USE_SYSTEM_LLVM)
-    # Try standard CMake config
-    find_package(LLVM CONFIG QUIET)
-
-    if(NOT LLVM_FOUND)
-        # Try finding via llvm-config
-        find_program(LLVM_CONFIG_EXECUTABLE
-            NAMES llvm-config llvm-config-18 llvm-config-17 llvm-config-16 llvm-config-15
-            PATHS
-                /usr/bin
-                /usr/local/bin
-                /opt/homebrew/bin
-                "C:/Program Files/LLVM/bin"
-                "$ENV{LLVM_DIR}/bin"
-        )
-
-        if(LLVM_CONFIG_EXECUTABLE)
-            message(STATUS "Found llvm-config: ${LLVM_CONFIG_EXECUTABLE}")
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --prefix
-                OUTPUT_VARIABLE LLVM_PREFIX
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --version
-                OUTPUT_VARIABLE LLVM_VERSION_STRING
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --libdir
-                OUTPUT_VARIABLE LLVM_LIBDIR
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --includedir
-                OUTPUT_VARIABLE LLVM_INCLUDEDIR
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --system-libs --libs all
-                OUTPUT_VARIABLE LLVM_LIBS
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --ldflags
-                OUTPUT_VARIABLE LLVM_LDFLAGS
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            execute_process(
-                COMMAND ${LLVM_CONFIG_EXECUTABLE} --cxxflags
-                OUTPUT_VARIABLE LLVM_CXXFLAGS
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-
-            # Build LLVM_LIBRARIES from llvm-config output
-            # Strip the flags from libs output (e.g., -lfoo -> foo)
-            string(REPLACE "-l" "" LLVM_LIBS_STRIPPED "${LLVM_LIBS}")
-            string(REPLACE " " ";" LLVM_LIBS_LIST "${LLVM_LIBS_STRIPPED}")
-
-            set(LLVM_FOUND TRUE)
-            set(LLVM_INCLUDE_DIRS ${LLVM_INCLUDEDIR})
-            set(LLVM_DEFINITIONS "")
-            # We'll use llvm-config output directly
+    # Drive everything from llvm-config. It supplies the include/lib paths and
+    # the exact RTTI setting without importing LLVM's exported CMake targets.
+    # Importing those targets aborts configuration on distro LLVM packages
+    # whose *static* component set is incomplete (Ubuntu, for example, omits
+    # several clangBasic/LLVM archives) even though the shared libLLVM is
+    # perfectly usable. We therefore link the monolithic LLVM from --libs.
+    find_program(LLVM_CONFIG_EXECUTABLE
+        NAMES llvm-config llvm-config-20 llvm-config-19 llvm-config-18
+              llvm-config-17 llvm-config-16 llvm-config-15
+        PATHS
+            /usr/bin
+            /usr/local/bin
+            /opt/homebrew/bin
+            "C:/Program Files/LLVM/bin"
+            "$ENV{LLVM_DIR}/bin"
+    )
+    if(LLVM_CONFIG_EXECUTABLE)
+        execute_process(COMMAND ${LLVM_CONFIG_EXECUTABLE} --version  OUTPUT_VARIABLE LLVM_VERSION_STRING OUTPUT_STRIP_TRAILING_WHITESPACE)
+        execute_process(COMMAND ${LLVM_CONFIG_EXECUTABLE} --libdir   OUTPUT_VARIABLE LLVM_LIBDIR         OUTPUT_STRIP_TRAILING_WHITESPACE)
+        execute_process(COMMAND ${LLVM_CONFIG_EXECUTABLE} --includedir OUTPUT_VARIABLE LLVM_INCLUDEDIR    OUTPUT_STRIP_TRAILING_WHITESPACE)
+        execute_process(COMMAND ${LLVM_CONFIG_EXECUTABLE} --system-libs --libs all OUTPUT_VARIABLE LLVM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+        execute_process(COMMAND ${LLVM_CONFIG_EXECUTABLE} --has-rtti   OUTPUT_VARIABLE LLVM_HAS_RTTI       OUTPUT_STRIP_TRAILING_WHITESPACE)
+        string(REGEX MATCH "^([0-9]+)" LLVM_VERSION_MAJOR "${LLVM_VERSION_STRING}")
+        set(LLVM_FOUND TRUE)
+        set(LLVM_INCLUDE_DIRS ${LLVM_INCLUDEDIR})
+        # Match LLVM's own RTTI setting: objects compiled with a different
+        # -fno-rtti setting than libLLVM cause undefined typeinfo/vtable refs.
+        if(LLVM_HAS_RTTI STREQUAL "YES")
+            set(LLVM_ENABLE_RTTI TRUE)
+        else()
+            set(LLVM_ENABLE_RTTI FALSE)
         endif()
+        # Full library set for the final link (used by the driver target).
+        set(LLVM_LIBRARIES ${LLVM_LIBS})
     endif()
 
     if(LLVM_FOUND)
-        message(STATUS "Found LLVM: ${LLVM_DIR}")
-        message(STATUS "LLVM version: ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}")
-
-        # Get LLVM version
-        if(NOT DEFINED LLVM_VERSION_MAJOR AND DEFINED LLVM_VERSION_STRING)
-            string(REGEX MATCH "^([0-9]+)" LLVM_VERSION_MAJOR "${LLVM_VERSION_STRING}")
-        endif()
-
-        # Add LLVM includes
-        if(TARGET LLVMCore)
-            # Modern LLVM CMake targets available
-            set(SUKI_LLVM_TARGETS
-                LLVMCore LLVMSupport LLVMX86CodeGen LLVMX86AsmParser
-                LLVMX86Desc LLVMX86Info LLVMARMCodeGen LLVMARMAsmParser
-                LLVMARMDesc LLVMARMInfo LLVMAArch64CodeGen LLVMAArch64AsmParser
-                LLVMAArch64Desc LLVMAArch64Info
-                LLVMRISCVCodeGen LLVMRISCVAsmParser LLVMRISCVDesc LLVMRISCVInfo
-                LLVMWebAssemblyCodeGen LLVMWebAssemblyAsmParser
-                LLVMWebAssemblyDesc LLVMWebAssemblyInfo
-                LLVMipo LLVMScalarOpts LLVMInstCombine LLVMTransformUtils
-                LLVMAnalysis LLVMCodeGen LLVMSelectionDAG LLVMAsmPrinter
-                LLVMMC LLVMMCParser LLVMMCDisassembler LLVMObject
-                LLVMBitReader LLVMBitWriter LLVMTarget
-                LLVMLinker LLVMLTO
-            )
-            foreach(target ${SUKI_LLVM_TARGETS})
-                if(TARGET ${target})
-                    list(APPEND LLVM_LINK_TARGETS ${target})
-                endif()
-            endforeach()
-        else()
-            # Use library files directly
-            message(STATUS "Using LLVM libraries from: ${LLVM_LIBRARY_DIRS}")
-        endif()
+        message(STATUS "Found LLVM: ${LLVM_VERSION_MAJOR} (${LLVM_CONFIG_EXECUTABLE})")
     else()
         message(WARNING
             "LLVM not found. The compiler backend will not be built.\n"
-            "Install LLVM 15+ or set LLVM_DIR to your LLVM installation.\n"
-            "  Ubuntu/Debian: sudo apt install llvm-dev clang-dev\n"
-            "  macOS: brew install llvm\n"
-            "  Windows: Download from https://releases.llvm.org/\n"
-        )
+            "Install LLVM 15+ or set LLVM_DIR to your LLVM installation.")
     endif()
 endif()
 
-# ─── Find Clang libraries (for C/ObjC interop) ───────────────────────────
-if(LLVM_FOUND)
+# ─── Find Clang C++ API (optional; for the C/ObjC FFI interop stage) ──────
+# Ubuntu's clang packages ship an incomplete *static* component set (the
+# clangBasic archive is absent), so importing the full Clang target set can
+# fail configuration. The FFI interop stage that actually needs libclang opts
+# in explicitly; code generation only needs the LLVM C++ API and the clang
+# driver (detected below), neither of which requires this.
+option(SUKICODE_USE_CLANG_CPP_API "Use the libclang C++ API (C/ObjC FFI interop)" OFF)
+set(SUKI_HAS_CLANG FALSE)
+if(SUKICODE_USE_CLANG_CPP_API AND LLVM_FOUND)
     find_package(Clang CONFIG QUIET)
     if(Clang_FOUND)
-        message(STATUS "Found Clang: ${CLANG_CMAKE_DIR}")
         set(SUKI_HAS_CLANG TRUE)
     else()
-        message(STATUS "Clang libraries not found - C/ObjC interop will be limited")
-        set(SUKI_HAS_CLANG FALSE)
+        message(WARNING "SUKICODE_USE_CLANG_CPP_API=ON but libclang was not found.")
     endif()
+endif()
+
+# The clang *driver executable* is used as the linker and as the C compiler for
+# the runtime/stdlib objects during the `suki build` stage.
+find_program(SUKI_CLANG_EXECUTABLE
+    NAMES clang-20 clang-19 clang-18 clang-17 clang-16 clang-15
+          clang++-20 clang++-19 clang++-18 clang++-17 clang++-16 clang++
+    PATHS /usr/bin /usr/local/bin /opt/homebrew/bin
+)
+if(SUKI_CLANG_EXECUTABLE)
+    message(STATUS "Found clang driver: ${SUKI_CLANG_EXECUTABLE}")
+else()
+    message(WARNING "clang driver not found; the `suki build` link stage will be unavailable.")
 endif()
 
 # ─── Platform Detection ───────────────────────────────────────────────────

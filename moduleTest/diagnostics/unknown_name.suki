@@ -1,0 +1,6 @@
+// 负例：未定义的标识符，应报未解析
+// Negative: an undefined identifier must be diagnosed.
+@main
+func main() -> Int {
+    return doesNotExist
+}

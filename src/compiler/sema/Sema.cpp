@@ -236,6 +236,8 @@ void Sema::analyze(const NodeList& decls) {
     // and member lookup need no special handling for extensions (规范 2.6/4.5).
     mergeExtensions(decls);
     mergeDefaultImplementations();
+    // 继承校验（规范 4.3）：override / final 语义，需在成员收集完成后进行。
+    checkOverrides();
 
     // Pass 4: collect global functions and variables.
     for (auto& d : decls) {
@@ -275,6 +277,39 @@ void Sema::analyze(const NodeList& decls) {
                 checkStatements(init->body, rec, types_.voidType(), false);
                 locals_.popScope();
                 currentType_ = nullptr;
+            } else if (m && m->kind == NodeKind::SubscriptDecl) {
+                // 自定义下标（规范 3.1）：get/set 体内 `self`、下标参数、`newValue`
+                // 可用，且隐式 self 成员需解析（与访问器一致）。
+                auto* sub = static_cast<SubscriptDecl*>(m.get());
+                const Type* elemT = sub->elementType
+                    ? resolveTypeRepr(sub->elementType.get(), rec)
+                    : types_.unknownType();
+                const TypeRecord* savedType = currentType_;
+                currentType_ = rec;
+                auto checkSubBody = [&](const NodeList& body, const Type* ret,
+                                         bool isSetter) {
+                    locals_.pushScope();
+                    Symbol self; self.kind = Symbol::Kind::Variable;
+                    self.type = types_.named(rec, rec->name); self.decl = m.get();
+                    locals_.declare("self", self);
+                    for (auto& prm : sub->params) {
+                        Symbol s; s.kind = Symbol::Kind::Parameter;
+                        s.type = resolveTypeRepr(prm.type.get(), rec);
+                        s.decl = m.get();
+                        locals_.declare(prm.internalName, s);
+                    }
+                    if (isSetter) {
+                        Symbol nv; nv.kind = Symbol::Kind::Parameter;
+                        nv.type = elemT; nv.decl = m.get();
+                        locals_.declare("newValue", nv);
+                    }
+                    checkStatements(body, rec, ret, false);
+                    locals_.popScope();
+                };
+                if (!sub->getter.empty()) checkSubBody(sub->getter, elemT, false);
+                if (!sub->setter.empty())
+                    checkSubBody(sub->setter, types_.voidType(), true);
+                currentType_ = savedType;
             }
         }
     }
@@ -427,7 +462,12 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
         std::vector<const Type*> params;
         for (auto& prm : fn->params) {
             const Type* pt = resolveTypeRepr(prm.type.get(), &rec);
-            if (prm.isVariadic) pt = types_.array(pt);
+            // `inout` 既可作为关键字置于形参名前，也可作为类型修饰符 `T: inout U`
+            // （解析为 InoutType）。两种写法都应将形参标记为按引用传递（规范 3.1）。
+            if (prm.type && prm.type->kind == NodeKind::InoutType) prm.isInout = true;
+            if (prm.isInout && pt->kind != TypeKind::Ref)
+                pt = types_.ref(RefKind::Mut, pt);
+            else if (prm.isVariadic) pt = types_.array(pt);
             prm.semaType = pt; // authoritative for lowering
             params.push_back(pt);
         }
@@ -452,10 +492,30 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
         mem.decl = m;
         std::vector<const Type*> params;
         for (auto& prm : init->params) {
-            prm.semaType = resolveTypeRepr(prm.type.get(), &rec);
-            params.push_back(prm.semaType);
+            const Type* pt = resolveTypeRepr(prm.type.get(), &rec);
+            if (prm.type && prm.type->kind == NodeKind::InoutType) prm.isInout = true;
+            if (prm.isInout && pt->kind != TypeKind::Ref)
+                pt = types_.ref(RefKind::Mut, pt);
+            else if (prm.isVariadic) pt = types_.array(pt);
+            prm.semaType = pt;
+            params.push_back(pt);
         }
         mem.type = types_.function(std::move(params), types_.named(&rec, rec.name));
+        rec.members.push_back(std::move(mem));
+    } else if (m->kind == NodeKind::SubscriptDecl) {
+        // 自定义下标（规范 3.1）：作为成员登记，get 返回元素类型、接受下标参数。
+        auto* sub = static_cast<SubscriptDecl*>(m);
+        TypeRecord::Member mem;
+        mem.name = "subscript";
+        mem.isFunction = true;
+        mem.decl = m;
+        const Type* idxT = sub->params.empty()
+            ? types_.intType()
+            : resolveTypeRepr(sub->params[0].type.get(), &rec);
+        const Type* elemT = sub->elementType
+            ? resolveTypeRepr(sub->elementType.get(), &rec)
+            : types_.unknownType();
+        mem.type = types_.function({idxT}, elemT);
         rec.members.push_back(std::move(mem));
     } else if (m->kind == NodeKind::DeinitDecl) {
         TypeRecord::Member mem;
@@ -548,6 +608,67 @@ void Sema::collectTypeAlias(TypealiasDecl* ta) {
     if (ta->underlying) ta->underlying->semaType = target;
 }
 
+void Sema::checkOverrides() {
+    // 规范 4.3 / 10.1：`override` 必须命中父类成员；`final` 成员禁止被重写。
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (!rec->decl || rec->kind != TypeDeclKind::Class || !rec->superclass)
+            continue;
+        auto* td = static_cast<TypeDecl*>(rec->decl);
+        for (auto& m : td->members) {
+            if (!m) continue;
+            std::string name;
+            bool isOverride = false;
+            bool wantFn = false;
+            if (m->kind == NodeKind::FunctionDecl) {
+                auto* fn = static_cast<FunctionDecl*>(m.get());
+                name = fn->name; wantFn = true;
+                isOverride = std::find(fn->modifiers.begin(), fn->modifiers.end(),
+                                      "override") != fn->modifiers.end();
+            } else if (m->kind == NodeKind::VarDecl) {
+                auto* vd = static_cast<VarDecl*>(m.get());
+                name = vd->name; wantFn = false;
+                isOverride = std::find(vd->modifiers.begin(), vd->modifiers.end(),
+                                      "override") != vd->modifiers.end();
+            } else if (m->kind == NodeKind::InitDecl) {
+                auto* id = static_cast<InitDecl*>(m.get());
+                name = "init"; wantFn = true;
+                isOverride = std::find(id->modifiers.begin(), id->modifiers.end(),
+                                      "override") != id->modifiers.end();
+            }
+            if (!isOverride) continue;
+            // 在父类链中寻找同名同形态成员。
+            const TypeRecord::Member* inherited = nullptr;
+            for (const TypeRecord* r = rec->superclass; r; r = r->superclass)
+                if (auto* im = lookupMember(r, name, wantFn)) { inherited = im; break; }
+            if (!inherited) {
+                hadError_ = true;
+                diags_.reportError("'override' member '" + name +
+                    "' does not override any member from a superclass",
+                    rangeOf(m.get()));
+                continue;
+            }
+            if (inherited->decl) {
+                bool isFinal = false;
+                if (inherited->decl->kind == NodeKind::FunctionDecl) {
+                    auto* f = static_cast<FunctionDecl*>(inherited->decl);
+                    isFinal = std::find(f->modifiers.begin(), f->modifiers.end(),
+                                       "final") != f->modifiers.end();
+                } else if (inherited->decl->kind == NodeKind::VarDecl) {
+                    auto* v = static_cast<VarDecl*>(inherited->decl);
+                    isFinal = std::find(v->modifiers.begin(), v->modifiers.end(),
+                                       "final") != v->modifiers.end();
+                }
+                if (isFinal) {
+                    hadError_ = true;
+                    diags_.reportError("'override' member '" + name +
+                        "' cannot override a 'final' member", rangeOf(m.get()));
+                }
+            }
+        }
+    }
+}
+
 void Sema::collectFunction(FunctionDecl* fn, const TypeRecord* owner) {
     Symbol s;
     s.kind = Symbol::Kind::Function;
@@ -557,7 +678,12 @@ void Sema::collectFunction(FunctionDecl* fn, const TypeRecord* owner) {
     TypeContext& tc = types_;
     for (auto& prm : fn->params) {
         const Type* pt = resolveTypeRepr(prm.type.get(), owner);
-        if (prm.isVariadic) pt = tc.array(pt);
+        // `inout` 作为类型修饰符 `T: inout U`（InoutType）时，形参按引用传递
+        // （规范 3.1）。resolveTypeRepr 已将其解析为 Ref(Mut, U)。
+        if (prm.type && prm.type->kind == NodeKind::InoutType) prm.isInout = true;
+        if (prm.isInout && pt->kind != TypeKind::Ref)
+            pt = types_.ref(RefKind::Mut, pt);
+        else if (prm.isVariadic) pt = tc.array(pt);
         prm.semaType = pt; // authoritative for lowering
         params.push_back(pt);
     }
@@ -1197,7 +1323,12 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                 // A getter returns the property type; the others return Void.
                 const Type* accRet = ad->kind == AccessorDecl::Kind::Getter
                     ? type : types_.voidType();
+                // 访问器体内隐式 self 成员（如 `grid`）需要在属主类型上下文中解析，
+                // 故临时将 currentType_ 设为属主（规范 1.7 / 3.1）。
+                const TypeRecord* savedType = currentType_;
+                currentType_ = context;
                 checkStatements(ad->body, context, accRet, isThrowing);
+                currentType_ = savedType;
             }
             declareLocal(*this, locals_, vd->name, type, vd, vd->isLet);
             // `let x: Int`（无初始化器）进入待初始化状态：首次赋值即初始化，
@@ -1374,6 +1505,42 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
             switchSubjectType_ = subj;
             for (auto& c : s->cases) checkStatement(c.get(), context, fnReturnType, isThrowing);
             switchSubjectType_ = savedSubject;
+
+            // 穷举检查（规范 1.7）：枚举 switch 必须覆盖全部 case，否则必须提供
+            // `default` 或值绑定（`case let v`）兜底分支。
+            if (subj && subj->kind == TypeKind::Named && subj->record &&
+                subj->record->kind == TypeDeclKind::Enum) {
+                const TypeRecord* erec = subj->record;
+                std::vector<std::string> covered;
+                bool hasDefault = false, hasBinding = false;
+                auto collectEnumCase = [&](Node* p) {
+                    if (!p || p->kind != NodeKind::MemberExpr) return;
+                    auto* pm = static_cast<MemberExpr*>(p);
+                    if (pm->base && pm->base->kind == NodeKind::IdentExpr &&
+                        static_cast<IdentExpr*>(pm->base.get())->name == erec->name)
+                        covered.push_back(pm->member);
+                };
+                for (auto& c : s->cases) {
+                    if (!c || c->kind != NodeKind::CaseClause) continue;
+                    auto* cc = static_cast<CaseClause*>(c.get());
+                    if (cc->isDefault) { hasDefault = true; continue; }
+                    if (cc->isBindingPattern) { hasBinding = true; continue; }
+                    collectEnumCase(cc->pattern.get());
+                    for (auto& alt : cc->alternatives) collectEnumCase(alt.get());
+                }
+                if (!hasDefault && !hasBinding) {
+                    std::string missing;
+                    for (const auto& ci : erec->cases)
+                        if (std::find(covered.begin(), covered.end(), ci.name) == covered.end())
+                            missing += (missing.empty() ? "" : ", ") + ci.name;
+                    if (!missing.empty()) {
+                        hadError_ = true;
+                        diags_.reportError("switch over enum '" + erec->name +
+                            "' must be exhaustive; missing case(s): " + missing,
+                            s->subject ? rangeOf(s->subject.get()) : rangeOf(stmt));
+                    }
+                }
+            }
             (void)subj;
             break;
         }
@@ -1636,10 +1803,14 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             // Implicit self: inside a type's method, a bare member name refers
             // to `self.<name>` (e.g. `x` for `self.x`).
             if (currentType_) {
-                if (const TypeRecord::Member* m = lookupMember(currentType_, name, false))
-                    return m->type ? m->type : types_.unknownType();
-                if (const TypeRecord::Member* m = lookupMember(currentType_, name, true))
-                    return m->type ? m->type : types_.unknownType();
+                if (const TypeRecord::Member* m = lookupMember(currentType_, name, false)) {
+                    id->semaType = m->type ? m->type : types_.unknownType();
+                    return id->semaType;
+                }
+                if (const TypeRecord::Member* m = lookupMember(currentType_, name, true)) {
+                    id->semaType = m->type ? m->type : types_.unknownType();
+                    return id->semaType;
+                }
                 for (const auto& c : currentType_->cases)
                     if (c.name == name) return types_.named(currentType_, c.name);
             }
@@ -1715,6 +1886,12 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         case NodeKind::UnaryExpr: {
             auto* u = static_cast<UnaryExpr*>(e);
             const Type* t = checkExpr(u->operand.get(), context);
+            // `&x` 取地址：产生 `inout T`，供按引用传参（规范 3.1）。
+            if (u->op == PunctuatorID::Amp) {
+                if (t && t->kind != TypeKind::Unknown)
+                    return types_.ref(RefKind::Mut, t);
+                return types_.unknownType();
+            }
             // `try?` wraps the result in an Optional (规范 9.2): an thrown error
             // becomes `nil` instead of propagating.
             if (u->isOptionalTry && t && t->kind != TypeKind::Unknown)
@@ -1799,6 +1976,15 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         case NodeKind::MemberExpr: {
             auto* m = static_cast<MemberExpr*>(e);
             const Type* base = checkExpr(m->base.get(), context);
+            // 类型名作命名空间：`Type.case` / `Type.self` 等成员访问（规范 1.7
+            // 枚举成员值）。裸类型名本身在引用处被解析为 Unknown，但作为成员
+            // 访问的基时，应还原为其具名类型，使枚举 case 值可达。
+            if (base && base->kind == TypeKind::Unknown &&
+                m->base->kind == NodeKind::IdentExpr) {
+                const std::string& bn = static_cast<IdentExpr*>(m->base.get())->name;
+                if (const TypeRecord* brec = findType(bn))
+                    base = types_.named(brec, bn);
+            }
             // Tuple element access `t.0`: the member name is the index.
             if (base && base->kind == TypeKind::Tuple) {
                 size_t idx = 0;
@@ -1994,19 +2180,47 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             }
             if (callee && (callee->kind == TypeKind::Function ||
                            callee->kind == TypeKind::Closure)) {
-                if (c->arguments.size() > callee->elements.size()) {
+                // 获取实际声明以识别变长参数（规范 3.1）：变长参数将吸收其位置
+                // 及之后所有实参，从而允许“过多”的实参；带默认值的形参可被省略。
+                const FunctionDecl* fdecl = nullptr;
+                if (c->callee && c->callee->kind == NodeKind::IdentExpr) {
+                    const std::string& fname =
+                        static_cast<IdentExpr*>(c->callee.get())->name;
+                    if (const Symbol* fs = globals_.lookup(fname)) {
+                        if (fs->kind == Symbol::Kind::Function && fs->function)
+                            fdecl = fs->function;
+                    }
+                }
+                size_t nParams = callee->elements.size();
+                size_t variadicIdx = (size_t)-1;
+                if (fdecl) {
+                    for (size_t i = 0; i < fdecl->params.size(); ++i) {
+                        if (fdecl->params[i].isVariadic) { variadicIdx = i; break; }
+                    }
+                }
+                // 变长参数：其位置及之后所有实参归入变长数组，故实参数量无上限。
+                size_t maxArgs = nParams;
+                if (variadicIdx != (size_t)-1) maxArgs = (size_t)-1;
+                if (c->arguments.size() > maxArgs) {
                     hadError_ = true;
-                    diags_.reportError("too many arguments in call (expected " +
-                                       std::to_string(callee->elements.size()) + ", got " +
+                    diags_.reportError("too many arguments in call (expected at most " +
+                                       std::to_string(maxArgs) + ", got " +
                                        std::to_string(c->arguments.size()) + ")", rangeOf(e));
                 }
-                // Match provided args to parameters (ignoring a trailing closure
-                // and defaulted params).
-                size_t fixed = c->hasTrailingClosure && !c->arguments.empty()
-                    ? c->arguments.size() - 1 : c->arguments.size();
-                for (size_t i = 0; i < fixed && i < callee->elements.size(); ++i) {
+                for (size_t i = 0; i < c->arguments.size(); ++i) {
+                    const Type* paramType = nullptr;
+                    if (variadicIdx != (size_t)-1 && i >= variadicIdx) {
+                        // 变长参数：逐个实参按元素类型校验，而非整个数组类型。
+                        const Type* arrT = callee->elements[variadicIdx];
+                        paramType = (arrT && arrT->element) ? arrT->element
+                                                           : types_.unknownType();
+                    } else if (i < nParams) {
+                        paramType = callee->elements[i];
+                    } else {
+                        paramType = types_.unknownType();
+                    }
                     const Type* at2 = checkExpr(c->arguments[i].get(), context);
-                    requireAssignable(callee->elements[i], at2, c->arguments[i].get(), "argument");
+                    if (paramType) requireAssignable(paramType, at2, c->arguments[i].get(), "argument");
                 }
                 return callee->ret ? callee->ret : types_.unknownType();
             }

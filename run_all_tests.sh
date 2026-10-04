@@ -60,10 +60,7 @@ KNOWN_PENDING=(
     "examples/memory.suki|owned-pool: Owned / MemoryPool / Collection / pool protocol family"
     "examples/concurrency.suki|concurrency: Channel / Task / TaskGroup / withTaskGroup"
 
-    "moduleTest/pending/subscript_inout.suki|calling-convention: inout / 默认参数 / 变长参数 / 下标"
     "moduleTest/pending/generic_type.suki|generics: 泛型类型的实例化与约束求解"
-    "moduleTest/pending/switch_exhaustive.suki|sema: switch 对枚举的穷举检查|negative"
-    "moduleTest/pending/access_override.suki|sema: override / final / 访问控制的语义校验|negative"
 )
 
 # pending_reason <relative-path> -> prints the owning task, or nothing if known.
@@ -224,6 +221,8 @@ D="$PROJECT_DIR/moduleTest/diagnostics"
     run_negative "$D/missing_return.suki"     "missing return" "missing_return"
     run_negative "$D/tuple_index_range.suki"  "out of range"  "tuple_index_range"
     run_negative "$D/enum_arity.suki"          "expects"       "enum_arity"
+    run_negative "$D/switch_exhaustive.suki"   "exhaustive"   "switch_exhaustive"
+    run_negative "$D/access_override.suki"      "final"         "access_override"
 }
 
 # ── 4. 待实现特性用例：登记过的缺口允许失败，意外通过则报警 ──────────────────

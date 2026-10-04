@@ -1,60 +1,71 @@
 #pragma once
-// Diagnostic engine for the SukiCode compiler.
-// Collects errors, warnings, and notes during compilation.
 
-#include "compiler/lexer/Token.h"
+#include <cstdint>
 #include <string>
-#include <string_view>
 #include <vector>
-#include <functional>
 
 namespace suki {
 
-enum class DiagnosticLevel : uint8_t {
-    Error,
-    Warning,
+// ─── Source location ──────────────────────────────────────────────────────
+// Lightweight source position. A full SourceManager (for multi-file,
+// source-line rendering) is added when diagnostics need caret rendering.
+struct SourceLocation {
+    uint32_t line   = 1;
+    uint32_t column = 1;
+    uint32_t offset = 0; // byte offset from start of source
+
+    bool isValid() const { return offset != 0u; }
+    bool operator==(const SourceLocation& o) const {
+        return line == o.line && column == o.column && offset == o.offset;
+    }
+};
+
+struct SourceRange {
+    SourceLocation start;
+    SourceLocation end;
+
+    bool isValid() const { return start.isValid() || end.isValid(); }
+};
+
+// ─── Severity ─────────────────────────────────────────────────────────────
+enum class DiagnosticSeverity {
     Note,
+    Warning,
+    Error,
+    Fatal,
 };
 
-struct Diagnostic {
-    DiagnosticLevel level;
-    SourceLocation loc;
-    std::string_view filename;
-    std::string message;
-};
-
-class DiagnosticEngine {
+// ─── Diagnostic ─────────────────────────────────────────────────────────────
+// A single diagnostic message bound to an optional source range.
+// Designed to be cheap to construct and carry by value.
+class Diagnostic {
 public:
-    using Handler = std::function<void(const Diagnostic&)>;
+    Diagnostic(DiagnosticSeverity severity, std::string message, SourceRange range = {})
+        : severity_(severity), message_(std::move(message)), range_(range) {}
 
-    DiagnosticEngine();
+    DiagnosticSeverity severity() const { return severity_; }
+    const std::string& message() const { return message_; }
+    const SourceRange& range() const { return range_; }
 
-    // Report diagnostics
-    void error(SourceLocation loc, std::string_view filename, std::string_view message);
-    void warning(SourceLocation loc, std::string_view filename, std::string_view message);
-    void note(SourceLocation loc, std::string_view filename, std::string_view message);
+    bool isError() const {
+        return severity_ == DiagnosticSeverity::Error ||
+               severity_ == DiagnosticSeverity::Fatal;
+    }
 
-    // Error count
-    bool hadErrors() const { return errorCount_ > 0; }
-    int errorCount() const { return errorCount_; }
-    int warningCount() const { return warningCount_; }
-
-    // Access diagnostics
-    const std::vector<Diagnostic>& diagnostics() const { return diagnostics_; }
-
-    // Set custom handler (e.g., for LSP)
-    void setHandler(Handler handler) { handler_ = std::move(handler); }
-
-    // Print all diagnostics to stderr
-    void printAll(std::string_view source, std::string_view filename) const;
+    const char* severityName() const {
+        switch (severity_) {
+            case DiagnosticSeverity::Note:    return "note";
+            case DiagnosticSeverity::Warning: return "warning";
+            case DiagnosticSeverity::Error:   return "error";
+            case DiagnosticSeverity::Fatal:   return "fatal error";
+        }
+        return "error";
+    }
 
 private:
-    void report(DiagnosticLevel level, SourceLocation loc, std::string_view filename, std::string_view message);
-
-    std::vector<Diagnostic> diagnostics_;
-    Handler handler_;
-    int errorCount_ = 0;
-    int warningCount_ = 0;
+    DiagnosticSeverity severity_;
+    std::string message_;
+    SourceRange range_;
 };
 
 } // namespace suki

@@ -1,275 +1,274 @@
 #pragma once
-// Token definitions for the SukiCode lexer.
-// Each token carries its kind, source location, and optional literal value.
 
-#include <cstdint>
+#include "compiler/diag/Diagnostic.h"
 #include <string>
-#include <string_view>
+#include <vector>
 
 namespace suki {
 
-// Source location in a .suki file
-struct SourceLocation {
-    uint32_t line;
-    uint32_t column;
-    uint32_t offset; // byte offset from start of file
-
-    SourceLocation() : line(1), column(1), offset(0) {}
-    SourceLocation(uint32_t l, uint32_t c, uint32_t o) : line(l), column(c), offset(o) {}
+// ─── Token kinds ──────────────────────────────────────────────────────────
+enum class TokenKind {
+    TK_EOF,
+    TK_Error,
+    TK_Identifier,
+    TK_IntLiteral,
+    TK_FloatLiteral,
+    TK_StringLiteral,   // whole string without interpolation
+    TK_StringFragment,  // text fragment of an interpolated string
+    TK_StringEnd,       // marks the end of an interpolated string
+    TK_CharLiteral,
+    TK_Keyword,
+    TK_Punctuator,
 };
 
-// Token kind enumeration
-enum class TokenKind : uint16_t {
-    // ─── End of file ──────────────────────────────────────────────────────
-    Eof,
-
-    // ─── Literals ─────────────────────────────────────────────────────────
-    IntegerLiteral,    // 42, 0xFF, 0b1010, 1_000_000
-    FloatLiteral,      // 3.14, 1.0e10, 0x1.Ap5
-    StringLiteral,     // "hello", "interpolated \(expr)"
-    CharLiteral,       // 'A', '\n'
-    True,              // true
-    False,             // false
-    Nil,               // nil
-
-    // ─── Identifiers ──────────────────────────────────────────────────────
-    Identifier,        // foo, myVar, _count
-    EscapedIdentifier, // `keyword` (backtick-escaped keyword used as identifier)
-
-    // ─── Keywords ─────────────────────────────────────────────────────────
-    // Declarations
-    KwModule,
-    KwImport,
-    KwLet,
-    KwVar,
-    KwFunc,
-    KwReturn,
-    KwStruct,
-    KwClass,
-    KwEnum,
-    KwProtocol,
-    KwExtension,
-    KwInit,
-    KwDeinit,
-    KwSubscript,
-    KwOverride,
-    KwFinal,
-    KwRequired,
-    KwConvenience,
-    KwTypealias,
-    KwAssociatedtype,
-
-    // Control flow
-    KwIf,
-    KwElse,
-    KwGuard,
-    KwSwitch,
-    KwCase,
-    KwDefault,
-    KwFor,
-    KwIn,
-    KwWhile,
-    KwRepeat,
-    KwBreak,
-    KwContinue,
-    KwFallthrough,
-    KwDefer,
-    KwSelect,
-
-    // Error handling
-    KwDo,
-    KwCatch,
-    KwThrows,
-    KwThrow,
-    KwTry,
-    KwAs,
-    KwIs,
-
-    // Concurrency
-    KwAsync,
-    KwAwait,
-    KwActor,
-    KwNonisolated,
-
-    // Memory / ownership
-    KwWeak,
-    KwUnowned,
-    KwMove,
-    KwUnsafe,
-    KwAsm,          // asm (inline assembly)
-    KwExtern,       // extern "C" { ... }
-
-    // Type-related
-    KwSelf,
-    KwSelfType,     // Self (capital S, type context)
-    KwSuper,
-    KwSome,         // some Protocol (opaque return type)
-    KwAny,          // any Protocol (existential)
-    KwWhere,
-
-    // Access control
-    KwPublic,
-    KwInternal,
-    KwFileprivate,
-    KwPrivate,
-    KwOpen,
-    KwStatic,
-    KwMutating,
-    KwInOut,
-
-    // Properties
-    KwGet,
-    KwSet,
-    KwWillSet,
-    KwDidSet,
-
-    // Boolean logic (not used as standalone keywords in expressions,
-    // but reserved for future use)
-    KwAnd,           // 'and' as alternative to &&
-    KwOr,            // 'or' as alternative to ||
-    KwNot,           // 'not' as alternative to !
-
-    // ─── Attributes ───────────────────────────────────────────────────────
-    AtMain,          // @main
-    AtCImport,       // @cImport
-    AtCDecl,         // @_cdecl
-    AtMacro,         // @macro
-    AtEscaping,      // @escaping
-    AtAutoclosure,   // @autoclosure
-    AtMainActor,     // @MainActor
-    AtExecutor,      // @executor
-    AtEnumC,         // @enum(C)
-    AtNoMangle,      // @no_mangle
-    AtPanicHandler,  // @panic_handler
-    AtDepends,       // @depends(on:)
-    AtFreestanding,  // @freestanding
-    AtAttached,      // @attached
-    AtTest,          // @test
-    AtAttribute,     // @<identifier> (generic attribute)
-
-    // ─── Punctuation ──────────────────────────────────────────────────────
-    LParen,          // (
-    RParen,          // )
-    LBrace,          // {
-    RBrace,          // }
-    LBracket,        // [
-    RBracket,        // ]
-    Dot,             // .
-    Comma,           // ,
-    Colon,           // :
-    Semicolon,       // ;
-    At,              // @
-    Hash,            // #
-    Arrow,           // ->
-    FatArrow,        // =>
-    Underscore,      // _
-    Ellipsis,        // ...
-    Range,           // ..<
-    Backslash,       // \ (used in string interpolation)
-
-    // ─── Operators ────────────────────────────────────────────────────────
-    // Assignment
-    Assign,          // =
-    PlusAssign,      // +=
-    MinusAssign,     // -=
-    StarAssign,      // *=
-    SlashAssign,     // /=
-    PercentAssign,   // %=
-    AmpAssign,       // &=
-    PipeAssign,      // |=
-    CaretAssign,     // ^=
-    LShiftAssign,    // <<=
-    RShiftAssign,    // >>=
-
-    // Arithmetic
-    Plus,            // +
-    Minus,           // -
-    Star,            // *
-    Slash,           // /
-    Percent,         // %
-
-    // Comparison
-    Equal,           // ==
-    NotEqual,        // !=
-    Less,            // <
-    Greater,         // >
-    LessEqual,       // <=
-    GreaterEqual,    // >=
-
-    // Logical
-    AmpAmp,          // &&
-    PipePipe,        // ||
-    Bang,            // !
-
-    // Bitwise
-    Amp,             // &
-    Pipe,            // |
-    Caret,           // ^
-    Tilde,           // ~
-    LShift,          // <<
-    RShift,          // >>
-
-    // Question mark
-    Question,        // ?
-
-    // Null coalescing
-    QuestionQuestion, // ??
-
-    // Channel
-    LeftArrow,       // <- (used in channel send/receive and select)
-
-    // ─── Error ────────────────────────────────────────────────────────────
-    Error,           // Lexer error token
-};
-
-// Token literal value variant
-enum class LiteralKind : uint8_t {
+// ─── Keywords (subset of Swift-like SukiCode surface syntax) ────────────────
+enum class KeywordID {
     None,
-    Integer,
-    Float,
-    String,
-    Char,
+    // declarations
+    Module, Import, Let, Var, Func, Struct, Enum, Class, Protocol, Extension,
+    Typealias, Associatedtype, Init, Deinit, Subscript,
+    // control flow
+    If, Else, Guard, Switch, Case, Default, For, In, While, Repeat,
+    Break, Continue, Fallthrough, Return,
+    // patterns / literals / self
+    Where, As, Is, Nil, True, False, Self, Super,
+    // error handling
+    Throw, Throws, Rethrows, Try, Catch, Do,
+    // access & modifiers
+    Public, Private, Internal, Fileprivate, Open, Static, Final, Override,
+    Required, Convenience, Lazy, Inout, Mutating, Nonmutating,
+    Get, Set, WillSet, DidSet,
+    // memory model
+    Weak, Unowned, Owned, Unsafe, Move,
+    // concurrency
+    Async, Await, Actor, Channel, Select, Spawn, Task,
+    // generics / meta programming
+    Some, Macro,
+    // attributes / ffi
+    Foreign, Extern, Defer,
+    // NOTE: memory-model directives (memory/model/gc/arc/pool) are intentionally
+    // NOT reserved as keywords here; they are regular identifiers so that names
+    // like `pool` / `Arc` / `MemoryPool` parse as identifiers. They may become
+    // contextual keywords when that syntax is implemented in Sema.
 };
 
-// A single token from the lexer
+// ─── Punctuators / operators ───────────────────────────────────────────────
+enum class PunctuatorID {
+    None,
+    Plus, Minus, Star, Slash, Percent,
+    PlusEqual, MinusEqual, StarEqual, SlashEqual, PercentEqual,
+    Equal, EqualEqual, BangEqual, Less, Greater, LessEqual, GreaterEqual,
+    LeftArrow,                  // <-  channel send / receive
+    AmpAmp, PipePipe, Bang, Amp, Pipe, Caret, Tilde,
+    LessLess, GreaterGreater,
+    DotDotLess, DotDot,        // ..<   ...
+    QuestionQuestion,          // ??
+    Question, Colon, Semicolon, Comma, Dot,
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
+    At, Hash, Arrow, FatArrow, // ->  =>
+};
+
+// ─── Token ──────────────────────────────────────────────────────────────────
 struct Token {
-    TokenKind kind;
+    TokenKind kind = TokenKind::TK_EOF;
     SourceLocation loc;
-    uint32_t length;      // byte length of the token text in source
+    std::string text;            // raw source text
 
-    // Literal value (for numeric/string/char literals)
-    LiteralKind literalKind;
-    union {
-        int64_t intValue;
-        double floatValue;
-        uint32_t charValue;  // Unicode scalar
-    } literal;
-    std::string stringValue; // for string literals and identifiers
+    // literal payload
+    std::string stringValue;     // decoded text (StringLiteral/Fragment/Char)
+    std::string numberText;      // original numeric text, including suffix
 
-    Token()
-        : kind(TokenKind::Eof), loc(), length(0), literalKind(LiteralKind::None) {
-        literal.intValue = 0;
-    }
+    // keyword / punctuator discriminant
+    KeywordID keyword = KeywordID::None;
+    PunctuatorID punct = PunctuatorID::None;
 
-    bool is(TokenKind k) const { return kind == k; }
-    bool isNot(TokenKind k) const { return kind != k; }
-    bool isOneOf(std::initializer_list<TokenKind> kinds) const;
-    bool isKeyword() const;
-    bool isLiteral() const;
-    bool isOperator() const;
-    bool isAssignmentOperator() const;
+    // doc comment accumulated from preceding /// or /** */ lines
+    std::string docComment;
 
-    // Get the text of this token from the source
-    std::string_view text(std::string_view source) const;
-
-    // Human-readable name for the token kind
-    static const char* kindName(TokenKind kind);
-
-    // Check if an identifier string is a keyword
-    static TokenKind keywordLookup(std::string_view name);
-
-    // Check if a string is an attribute (starts with @)
-    static TokenKind attributeLookup(std::string_view name);
+    bool isKeyword(KeywordID k) const { return kind == TokenKind::TK_Keyword && keyword == k; }
+    bool isPunct(PunctuatorID p) const { return kind == TokenKind::TK_Punctuator && punct == p; }
 };
+
+// ─── Keyword mapping ─────────────────────────────────────────────────────────
+inline KeywordID keywordFromString(const std::string& s) {
+    static const std::vector<std::pair<std::string, KeywordID>> table = {
+        {"module", KeywordID::Module}, {"import", KeywordID::Import},
+        {"let", KeywordID::Let}, {"var", KeywordID::Var}, {"func", KeywordID::Func},
+        {"struct", KeywordID::Struct}, {"enum", KeywordID::Enum}, {"class", KeywordID::Class},
+        {"protocol", KeywordID::Protocol}, {"extension", KeywordID::Extension},
+        {"typealias", KeywordID::Typealias}, {"associatedtype", KeywordID::Associatedtype},
+        {"init", KeywordID::Init}, {"deinit", KeywordID::Deinit}, {"subscript", KeywordID::Subscript},
+        {"if", KeywordID::If}, {"else", KeywordID::Else}, {"guard", KeywordID::Guard},
+        {"switch", KeywordID::Switch}, {"case", KeywordID::Case}, {"default", KeywordID::Default},
+        {"for", KeywordID::For}, {"in", KeywordID::In}, {"while", KeywordID::While},
+        {"repeat", KeywordID::Repeat}, {"break", KeywordID::Break}, {"continue", KeywordID::Continue},
+        {"fallthrough", KeywordID::Fallthrough}, {"return", KeywordID::Return},
+        {"where", KeywordID::Where}, {"as", KeywordID::As}, {"is", KeywordID::Is},
+        {"nil", KeywordID::Nil}, {"true", KeywordID::True}, {"false", KeywordID::False},
+        {"self", KeywordID::Self}, {"Self", KeywordID::Self}, {"super", KeywordID::Super},
+        {"throw", KeywordID::Throw}, {"throws", KeywordID::Throws}, {"rethrows", KeywordID::Rethrows},
+        {"try", KeywordID::Try}, {"catch", KeywordID::Catch}, {"do", KeywordID::Do},
+        {"public", KeywordID::Public}, {"private", KeywordID::Private},
+        {"internal", KeywordID::Internal}, {"fileprivate", KeywordID::Fileprivate},
+        // NOTE: `open` is deliberately *not* reserved. The spec (§10.1) defines
+        // only four access levels (public / internal / fileprivate / private),
+        // so reserving it would make a perfectly ordinary identifier such as
+        // `var open = 0` fail to parse.
+        {"static", KeywordID::Static}, {"final", KeywordID::Final},
+        {"override", KeywordID::Override}, {"required", KeywordID::Required},
+        {"convenience", KeywordID::Convenience}, {"lazy", KeywordID::Lazy},
+        {"inout", KeywordID::Inout}, {"mutating", KeywordID::Mutating},
+        {"nonmutating", KeywordID::Nonmutating}, {"get", KeywordID::Get},
+        {"set", KeywordID::Set}, {"willSet", KeywordID::WillSet}, {"didSet", KeywordID::DidSet},
+        {"weak", KeywordID::Weak},
+        {"unsafe", KeywordID::Unsafe}, {"move", KeywordID::Move},
+        {"async", KeywordID::Async}, {"await", KeywordID::Await}, {"actor", KeywordID::Actor},
+        {"select", KeywordID::Select},
+        // NOTE: `owned` / `unowned` / `channel` / `spawn` / `task` are intentionally
+        // NOT reserved; they are common identifiers and may be used as names.
+        // Type-level ownership annotations are recognised contextually in Sema.
+        {"some", KeywordID::Some}, {"macro", KeywordID::Macro},
+        {"foreign", KeywordID::Foreign}, {"extern", KeywordID::Extern}, {"defer", KeywordID::Defer},
+    };
+    for (const auto& kv : table) {
+        if (kv.first == s) return kv.second;
+    }
+    return KeywordID::None;
+}
+
+inline const char* keywordToString(KeywordID k) {
+    switch (k) {
+        case KeywordID::Module: return "module";
+        case KeywordID::Import: return "import";
+        case KeywordID::Let: return "let";
+        case KeywordID::Var: return "var";
+        case KeywordID::Func: return "func";
+        case KeywordID::Struct: return "struct";
+        case KeywordID::Enum: return "enum";
+        case KeywordID::Class: return "class";
+        case KeywordID::Protocol: return "protocol";
+        case KeywordID::Extension: return "extension";
+        case KeywordID::Typealias: return "typealias";
+        case KeywordID::Associatedtype: return "associatedtype";
+        case KeywordID::Init: return "init";
+        case KeywordID::Deinit: return "deinit";
+        case KeywordID::Subscript: return "subscript";
+        case KeywordID::If: return "if";
+        case KeywordID::Else: return "else";
+        case KeywordID::Guard: return "guard";
+        case KeywordID::Switch: return "switch";
+        case KeywordID::Case: return "case";
+        case KeywordID::Default: return "default";
+        case KeywordID::For: return "for";
+        case KeywordID::In: return "in";
+        case KeywordID::While: return "while";
+        case KeywordID::Repeat: return "repeat";
+        case KeywordID::Break: return "break";
+        case KeywordID::Continue: return "continue";
+        case KeywordID::Fallthrough: return "fallthrough";
+        case KeywordID::Return: return "return";
+        case KeywordID::Where: return "where";
+        case KeywordID::As: return "as";
+        case KeywordID::Is: return "is";
+        case KeywordID::Nil: return "nil";
+        case KeywordID::True: return "true";
+        case KeywordID::False: return "false";
+        case KeywordID::Self: return "self";
+        case KeywordID::Super: return "super";
+        case KeywordID::Throw: return "throw";
+        case KeywordID::Throws: return "throws";
+        case KeywordID::Rethrows: return "rethrows";
+        case KeywordID::Try: return "try";
+        case KeywordID::Catch: return "catch";
+        case KeywordID::Do: return "do";
+        case KeywordID::Public: return "public";
+        case KeywordID::Private: return "private";
+        case KeywordID::Internal: return "internal";
+        case KeywordID::Fileprivate: return "fileprivate";
+        case KeywordID::Open: return "open";
+        case KeywordID::Static: return "static";
+        case KeywordID::Final: return "final";
+        case KeywordID::Override: return "override";
+        case KeywordID::Required: return "required";
+        case KeywordID::Convenience: return "convenience";
+        case KeywordID::Lazy: return "lazy";
+        case KeywordID::Inout: return "inout";
+        case KeywordID::Mutating: return "mutating";
+        case KeywordID::Nonmutating: return "nonmutating";
+        case KeywordID::Get: return "get";
+        case KeywordID::Set: return "set";
+        case KeywordID::WillSet: return "willSet";
+        case KeywordID::DidSet: return "didSet";
+        case KeywordID::Weak: return "weak";
+        case KeywordID::Unowned: return "unowned";
+        case KeywordID::Owned: return "owned";
+        case KeywordID::Unsafe: return "unsafe";
+        case KeywordID::Move: return "move";
+        case KeywordID::Async: return "async";
+        case KeywordID::Await: return "await";
+        case KeywordID::Actor: return "actor";
+        case KeywordID::Channel: return "channel";
+        case KeywordID::Select: return "select";
+        case KeywordID::Spawn: return "spawn";
+        case KeywordID::Task: return "task";
+        case KeywordID::Some: return "some";
+        case KeywordID::Macro: return "macro";
+        case KeywordID::Foreign: return "foreign";
+        case KeywordID::Extern: return "extern";
+        case KeywordID::Defer: return "defer";
+        default: return "<unknown-keyword>";
+    }
+}
+
+inline const char* punctToString(PunctuatorID p) {
+    switch (p) {
+        case PunctuatorID::Plus: return "+";
+        case PunctuatorID::Minus: return "-";
+        case PunctuatorID::Star: return "*";
+        case PunctuatorID::Slash: return "/";
+        case PunctuatorID::Percent: return "%";
+        case PunctuatorID::PlusEqual: return "+=";
+        case PunctuatorID::MinusEqual: return "-=";
+        case PunctuatorID::StarEqual: return "*=";
+        case PunctuatorID::SlashEqual: return "/=";
+        case PunctuatorID::PercentEqual: return "%=";
+        case PunctuatorID::Equal: return "=";
+        case PunctuatorID::EqualEqual: return "==";
+        case PunctuatorID::BangEqual: return "!=";
+        case PunctuatorID::Less: return "<";
+        case PunctuatorID::Greater: return ">";
+        case PunctuatorID::LessEqual: return "<=";
+        case PunctuatorID::GreaterEqual: return ">=";
+        case PunctuatorID::LeftArrow: return "<-";
+        case PunctuatorID::AmpAmp: return "&&";
+        case PunctuatorID::PipePipe: return "||";
+        case PunctuatorID::Bang: return "!";
+        case PunctuatorID::Amp: return "&";
+        case PunctuatorID::Pipe: return "|";
+        case PunctuatorID::Caret: return "^";
+        case PunctuatorID::Tilde: return "~";
+        case PunctuatorID::LessLess: return "<<";
+        case PunctuatorID::GreaterGreater: return ">>";
+        case PunctuatorID::DotDotLess: return "..<";
+        case PunctuatorID::DotDot: return "...";
+        case PunctuatorID::QuestionQuestion: return "??";
+        case PunctuatorID::Question: return "?";
+        case PunctuatorID::Colon: return ":";
+        case PunctuatorID::Semicolon: return ";";
+        case PunctuatorID::Comma: return ",";
+        case PunctuatorID::Dot: return ".";
+        case PunctuatorID::LParen: return "(";
+        case PunctuatorID::RParen: return ")";
+        case PunctuatorID::LBrace: return "{";
+        case PunctuatorID::RBrace: return "}";
+        case PunctuatorID::LBracket: return "[";
+        case PunctuatorID::RBracket: return "]";
+        case PunctuatorID::At: return "@";
+        case PunctuatorID::Hash: return "#";
+        case PunctuatorID::Arrow: return "->";
+        case PunctuatorID::FatArrow: return "=>";
+        default: return "<unknown-punct>";
+    }
+}
 
 } // namespace suki

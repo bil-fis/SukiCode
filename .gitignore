@@ -10,6 +10,7 @@ moduleTest/build/
 # Claude session memory (not for version control)
 MEMORY.md
 .claude/
+.codebuddy/
 
 # IDE
 .vs/
@@ -30,6 +31,7 @@ MEMORY.md
 *.exe
 *.pdb
 *.ilk
+*.out
 
 # LLVM/Clang generated
 *.bc

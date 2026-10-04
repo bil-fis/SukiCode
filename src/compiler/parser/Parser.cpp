@@ -4,6 +4,80 @@
 
 namespace suki {
 
+namespace {
+
+// Deep-copy a type representation. A grouped binding shares one annotation —
+// `var x, y: Double` — and every binding needs a node of its own: handing the
+// same pointer to two declarations would be a double free.
+NodePtr cloneTypeRepr(Node* t) {
+    if (!t) return nullptr;
+    switch (t->kind) {
+        case NodeKind::NamedType: {
+            auto* s = static_cast<NamedType*>(t);
+            auto c = std::make_unique<NamedType>();
+            c->name = s->name;
+            for (auto& a : s->genericArgs)
+                c->genericArgs.push_back(cloneTypeRepr(a.get()));
+            return c;
+        }
+        case NodeKind::OptionalType: {
+            auto c = std::make_unique<OptionalType>();
+            c->wrapped = cloneTypeRepr(static_cast<OptionalType*>(t)->wrapped.get());
+            return c;
+        }
+        case NodeKind::ArrayType: {
+            auto c = std::make_unique<ArrayType>();
+            c->element = cloneTypeRepr(static_cast<ArrayType*>(t)->element.get());
+            return c;
+        }
+        case NodeKind::DictType: {
+            auto* s = static_cast<DictType*>(t);
+            auto c = std::make_unique<DictType>();
+            c->key = cloneTypeRepr(s->key.get());
+            c->value = cloneTypeRepr(s->value.get());
+            return c;
+        }
+        case NodeKind::TupleType: {
+            auto* s = static_cast<TupleType*>(t);
+            auto c = std::make_unique<TupleType>();
+            c->labels = s->labels;
+            for (auto& e : s->elements) c->elements.push_back(cloneTypeRepr(e.get()));
+            return c;
+        }
+        case NodeKind::FuncType: {
+            auto* s = static_cast<FuncType*>(t);
+            auto c = std::make_unique<FuncType>();
+            for (auto& p : s->params) c->params.push_back(cloneTypeRepr(p.get()));
+            c->ret = cloneTypeRepr(s->ret.get());
+            return c;
+        }
+        case NodeKind::RefType: {
+            auto* s = static_cast<RefType*>(t);
+            auto c = std::make_unique<RefType>();
+            c->refKind = s->refKind;
+            c->pointee = cloneTypeRepr(s->pointee.get());
+            return c;
+        }
+        case NodeKind::InoutType: {
+            auto c = std::make_unique<InoutType>();
+            c->pointee = cloneTypeRepr(static_cast<InoutType*>(t)->pointee.get());
+            return c;
+        }
+        case NodeKind::MetatypeType: {
+            auto* s = static_cast<MetatypeType*>(t);
+            auto c = std::make_unique<MetatypeType>();
+            c->base = cloneTypeRepr(s->base.get());
+            c->isMeta = s->isMeta;
+            return c;
+        }
+        case NodeKind::NeverType:       return std::make_unique<NeverType>();
+        case NodeKind::PlaceholderType: return std::make_unique<PlaceholderType>();
+        default: return nullptr;
+    }
+}
+
+} // namespace
+
 // ─── construction & token helpers ────────────────────────────────────────────
 Parser::Parser(std::vector<Token> tokens, DiagnosticEngine& diags)
     : tokens_(std::move(tokens)), diags_(diags) {}
@@ -270,6 +344,8 @@ std::vector<Param> Parser::parseParameterList() {
     while (!atEnd()) {
         Param p;
         if (matchKw(KeywordID::Inout)) p.isInout = true;
+        // `var` 前缀参数（规范 3.1）：函数内可改写形参副本，不影响调用者。
+        if (matchKw(KeywordID::Var)) p.isVar = true;
         if (check(TokenKind::TK_Identifier) && cur().text == "_") {
             advance(); p.externalName = "";
         } else if (check(TokenKind::TK_Identifier)) {
@@ -278,6 +354,8 @@ std::vector<Param> Parser::parseParameterList() {
         if (check(TokenKind::TK_Identifier)) { p.internalName = cur().text; advance(); }
         else p.internalName = p.externalName;
         expectPunct(PunctuatorID::Colon, "expected ':' in parameter");
+        // `var` 前缀参数（规范 3.1）：`_ v: var Int` 表示函数内可改写形参副本。
+        if (matchKw(KeywordID::Var)) p.isVar = true;
         p.type = parseType();
         if (matchPunct(PunctuatorID::DotDot)) p.isVariadic = true; // `T...`
         if (matchPunct(PunctuatorID::Equal)) p.defaultValue = parseExpr();
@@ -392,6 +470,23 @@ NodePtr Parser::parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers)
             // enum case (only valid inside enum)
             NodePtr c = parseEnumCase();
             if (c) td->members.push_back(std::move(c));
+        } else if (checkKw(KeywordID::Struct) || checkKw(KeywordID::Enum) ||
+                   checkKw(KeywordID::Class) || checkKw(KeywordID::Protocol) ||
+                   checkKw(KeywordID::Actor)) {
+            // 类型嵌套（规范 4.6）：类/结构体/枚举内部可定义子类型，
+            // 通过 `Outer.Inner` 访问。
+            NodeKind nested = NodeKind::StructDecl;
+            if (checkKw(KeywordID::Enum)) nested = NodeKind::EnumDecl;
+            else if (checkKw(KeywordID::Class)) nested = NodeKind::ClassDecl;
+            else if (checkKw(KeywordID::Protocol)) nested = NodeKind::ProtocolDecl;
+            else if (checkKw(KeywordID::Actor)) nested = NodeKind::ActorDecl;
+            NodePtr inner = parseTypeDecl(nested, mmods);
+            if (inner) {
+                inner->attributes = memberAttrs;
+                // 记录宿主类型，供 Sema 建立 Outer.Inner 的成员查找路径。
+                static_cast<TypeDecl*>(inner.get())->enclosingType = td->name;
+                td->members.push_back(std::move(inner));
+            }
         } else {
             errorAt(cur(), "unexpected member declaration");
             advance();
@@ -507,14 +602,35 @@ NodePtr Parser::parseVarDecl(bool isLet, std::vector<std::string> modifiers, boo
     if (std::find(modifiers.begin(), modifiers.end(), "unowned") != modifiers.end())
         first->isUnowned = true;
     advance(); // let/var
-    if (check(TokenKind::TK_Identifier)) { first->name = cur().text; advance(); }
+    // 元组解构绑定：`let (a, b) = (1, 2)`、`let (x, y) = point`。
+    if (checkPunct(PunctuatorID::LParen)) {
+        advance(); // (
+        std::vector<std::string> names;
+        while (!atEnd() && !checkPunct(PunctuatorID::RParen)) {
+            // `let x` / `var x` 标记是可选的
+            if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) advance();
+            if (check(TokenKind::TK_Identifier)) { names.push_back(cur().text); advance(); }
+            else { errorAt(cur(), "expected a name in tuple pattern"); break; }
+            if (!matchPunct(PunctuatorID::Comma)) break;
+        }
+        expectPunct(PunctuatorID::RParen, "expected ')'");
+        first->tupleNames = names;
+        if (!names.empty()) first->name = names.front();
+    } else if (check(TokenKind::TK_Identifier)) {
+        first->name = cur().text; advance();
+    }
     if (matchPunct(PunctuatorID::Colon)) first->type = parseType();
     if (matchPunct(PunctuatorID::Equal)) {
-        // Suppress a trailing closure on the initialiser so that a `{`
-        // immediately after it is recognised as an accessor block.
-        ++suppressTrailingClosure_;
+        // A `{` right after a *property* initialiser opens an accessor block
+        // (`var x: Int = 0 { didSet { } }`), which is why a trailing closure
+        // has to be suppressed there. Only a property can have that shape, and
+        // only when the initialiser does not itself start with a brace — a
+        // leading `{` is the initialiser (`var f: (Int) -> Int = { x in x }`).
+        const bool braceAhead = checkPunct(PunctuatorID::LBrace);
+        const bool suppress = member && !braceAhead;
+        if (suppress) ++suppressTrailingClosure_;
         first->initializer = parseExpr();
-        --suppressTrailingClosure_;
+        if (suppress) --suppressTrailingClosure_;
     }
     // A `{` right after a *property declaration* is a computed-property body or
     // an observer block. In an ordinary local binding the brace belongs to the
@@ -528,11 +644,19 @@ NodePtr Parser::parseVarDecl(bool isLet, std::vector<std::string> modifiers, boo
     // multiple bindings: collect into a BlockStmt
     auto block = std::make_unique<BlockStmt>();
     block->statements.push_back(std::move(first));
+    // A type annotation belongs to the whole group, not to the name it happens
+    // to follow: in `var x, y: Double` both bindings are Double (Swift 语义).
+    // The annotation is therefore remembered and filled into every binding that
+    // does not spell out its own.
+    NodePtr shared = cloneTypeRepr(
+        static_cast<VarDecl*>(block->statements.front().get())->type.get());
     while (matchPunct(PunctuatorID::Comma)) {
         auto v = std::make_unique<VarDecl>();
         v->isLet = isLet;
         if (check(TokenKind::TK_Identifier)) { v->name = cur().text; advance(); }
         if (matchPunct(PunctuatorID::Colon)) v->type = parseType();
+        if (!v->type && shared) v->type = cloneTypeRepr(shared.get());
+        else if (v->type && !shared) shared = cloneTypeRepr(v->type.get());
         if (matchPunct(PunctuatorID::Equal)) {
             // A literal initialiser can never take a trailing closure, so a `{`
             // right after it is an accessor block (`var x: Int = 0 { didSet { } }`).
@@ -554,6 +678,10 @@ NodePtr Parser::parseVarDecl(bool isLet, std::vector<std::string> modifiers, boo
         block->statements.push_back(std::move(v));
         if (checkPunct(PunctuatorID::Semicolon)) advance();
     }
+    // Fill the first binding too: in `var x, y: Double` the annotation is
+    // written after the *last* name, so it is only known once the group ends.
+    auto* head = static_cast<VarDecl*>(block->statements.front().get());
+    if (!head->type && shared) head->type = cloneTypeRepr(shared.get());
     return block;
 }
 
@@ -577,6 +705,8 @@ NodePtr Parser::parseStatement() {
     if (checkKw(KeywordID::Switch)) return parseSwitchStmt();
     if (checkKw(KeywordID::Break)) { advance(); auto b=std::make_unique<BreakStmt>(); if(check(TokenKind::TK_Identifier)){b->label=cur().text;advance();} if(checkPunct(PunctuatorID::Semicolon))advance(); return b; }
     if (checkKw(KeywordID::Continue)) { advance(); auto c=std::make_unique<ContinueStmt>(); if(check(TokenKind::TK_Identifier)){c->label=cur().text;advance();} if(checkPunct(PunctuatorID::Semicolon))advance(); return c; }
+    // `fallthrough` 只允许出现在 switch 的 case 体内（语义检查在 Sema 中做）。
+    if (checkKw(KeywordID::Fallthrough)) { advance(); if (checkPunct(PunctuatorID::Semicolon)) advance(); return std::make_unique<FallthroughStmt>(); }
     if (checkKw(KeywordID::Defer)) return parseDeferStmt();
     if (checkKw(KeywordID::Do)) return parseDoStmt();
     if (checkKw(KeywordID::Throw)) return parseThrowStmt();
@@ -740,7 +870,10 @@ NodePtr Parser::parseSwitchStmt() {
             c->isDefault = true;
         } else {
             expectKw(KeywordID::Case, "expected 'case'");
+            // `case let v` 是值绑定模式：不比较，只绑定。
+            bool bindPattern = checkKw(KeywordID::Let) || checkKw(KeywordID::Var);
             c->pattern = parseCasePatternExpr(c->bindings);
+            c->isBindingPattern = bindPattern;
             // `case 1, 2, 3:` — additional patterns for the same arm. They are
             // alternatives, so any of them selects this body.
             while (matchPunct(PunctuatorID::Comma)) {
@@ -798,7 +931,10 @@ NodePtr Parser::parseSelectStmt() {
             c->isDefault = true;
         } else {
             expectKw(KeywordID::Case, "expected 'case'");
+            // `case let v` 是值绑定模式：不比较，只绑定。
+            bool bindPattern = checkKw(KeywordID::Let) || checkKw(KeywordID::Var);
             c->pattern = parseCasePatternExpr(c->bindings);
+            c->isBindingPattern = bindPattern;
             // `case 1, 2, 3:` — additional patterns for the same arm. They are
             // alternatives, so any of them selects this body.
             while (matchPunct(PunctuatorID::Comma)) {
@@ -860,6 +996,21 @@ NodePtr Parser::parseExprNoTrailingClosure() {
 }
 
 NodePtr Parser::parseCasePatternExpr(std::vector<std::string>& bindings) {
+    // `case let v` / `case var v` —— 值绑定模式：匹配任意值并把 subject 绑定
+    // 到 v（可再接 `where` 过滤）。用 IdentExpr 作为 pattern 占位，语义阶段
+    // 据此知道"不做相等比较，只做绑定"。
+    if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+        advance();
+        if (check(TokenKind::TK_Identifier)) {
+            auto id = std::make_unique<IdentExpr>();
+            id->name = cur().text; id->range = SourceRange{cur().loc, cur().loc};
+            bindings.push_back(cur().text);
+            advance();
+            return id;
+        }
+        errorAt(cur(), "expected a name after 'let' in case pattern");
+        return nullptr;
+    }
     // A `(` here introduces a payload binding list (`case E.c(let x, let y)`),
     // not a call, so call parsing is suppressed for the subject expression.
     ++suppressCall_;
@@ -1114,6 +1265,16 @@ NodePtr Parser::parseUnary() {
         auto u = std::make_unique<UnaryExpr>();
         u->isTry = true; // dedicated flag, not an operator marker
         u->isPostfix = false;
+        // `try?` converts a thrown error to nil, `try!` asserts none is thrown
+        // (规范 9.2). Both markers are consumed here: left to the postfix loop
+        // they would be read as a conditional `?` or a force unwrap `!`.
+        if (checkPunct(PunctuatorID::Question)) {
+            u->isOptionalTry = true;
+            advance();
+        } else if (checkPunct(PunctuatorID::Bang)) {
+            u->isForcedTry = true;
+            advance();
+        }
         u->operand = parseUnary();
         return u;
     }
@@ -1397,6 +1558,25 @@ NodePtr Parser::parsePrimary() {
             return p;
         }
         // tuple or parenthesized expr
+        // A labelled element (`code: 200`) can only appear in a tuple literal,
+        // so it is recognised before the first element is parsed.
+        if (check(TokenKind::TK_Identifier) && peek(1).kind == TokenKind::TK_Punctuator &&
+            peek(1).punct == PunctuatorID::Colon) {
+            auto tup = std::make_unique<TupleExpr>();
+            while (!atEnd() && !checkPunct(PunctuatorID::RParen)) {
+                std::string label;
+                if (check(TokenKind::TK_Identifier) && peek(1).kind == TokenKind::TK_Punctuator &&
+                    peek(1).punct == PunctuatorID::Colon) {
+                    label = cur().text; advance(); advance(); // name:
+                }
+                tup->labels.push_back(label);
+                tup->elements.push_back(parseExpr());
+                if (!matchPunct(PunctuatorID::Comma)) break;
+            }
+            expectPunct(PunctuatorID::RParen, "expected ')'");
+            tup->range = SourceRange{t.loc, t.loc};
+            return tup; // 后缀（`.0`、下标、调用）由 parsePostfix 的循环接手
+        }
         NodePtr first = parseExpr();
         if (matchPunct(PunctuatorID::Comma)) {
             auto tup = std::make_unique<TupleExpr>();
@@ -1424,6 +1604,10 @@ NodePtr Parser::parsePrimary() {
         // list, never a set literal. The `in` may follow several names, so the
         // whole run is scanned.
         if (closureParamsAhead())
+            return parseClosure(/*arrowSyntax=*/false);
+        // 捕获列表（`{ [weak self] in ... }`）：`{` 之后是 `[` 时既可能是
+        // Set/Array 字面量的元素，也可能是捕获列表，以 `in` 收尾者为捕获列表。
+        if (captureListAhead())
             return parseClosure(/*arrowSyntax=*/false);
         const Token& nxt = peek(1);
         bool setLiteral = nxt.kind == TokenKind::TK_IntLiteral ||
@@ -1529,6 +1713,35 @@ NodePtr Parser::parseSetLiteral() {
     return set;
 }
 
+// True when the tokens after the current `{` open a closure capture list rather
+// than a collection literal. The distinguishing feature is the `in` that must
+// follow the closing bracket (`{ [weak self] in ... }`); `[1, 2]` is an array
+// literal and is therefore not a capture list.
+bool Parser::captureListAhead() {
+    if (!(peek(1).kind == TokenKind::TK_Punctuator &&
+          peek(1).punct == PunctuatorID::LBracket))
+        return false;
+    size_t off = 1; // the '[' itself
+    int depth = 0;
+    // Walk to the matching ']' allowing one level of nesting.
+    for (; off < 64; ++off) {
+        const Token& t = peek(off);
+        if (t.kind == TokenKind::TK_EOF) return false;
+        if (t.kind == TokenKind::TK_Punctuator) {
+            if (t.punct == PunctuatorID::LBracket) ++depth;
+            else if (t.punct == PunctuatorID::RBracket) {
+                if (--depth == 0) {
+                    ++off;
+                    const Token& after = peek(off);
+                    return after.kind == TokenKind::TK_Keyword &&
+                           after.keyword == KeywordID::In;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 NodePtr Parser::parseCollectionLiteral() {
     expectPunct(PunctuatorID::LBracket, "expected '['");
     if (matchPunct(PunctuatorID::RBracket)) {
@@ -1602,6 +1815,34 @@ NodePtr Parser::parseClosure(bool arrowSyntax) {
     }
     // block closure: { (params) -> Ret in ... }
     expectPunct(PunctuatorID::LBrace, "expected '{'");
+    // 捕获列表：`{ [weak self] in ... }`、`{ [unowned owner, x] in ... }`。
+    // 判定条件是 `]` 之后紧跟 `in` —— 否则 `[1, 2]` 只能是数组字面量表达式。
+    if (checkPunct(PunctuatorID::LBracket)) {
+        size_t save = pos_;
+        advance(); // [
+        std::vector<ClosureCapture> caps;
+        bool ok = true;
+        while (!atEnd() && !checkPunct(PunctuatorID::RBracket)) {
+            ClosureCapture cap;
+            // `weak` 是保留关键字；`unowned` / `owned` 是上下文标识符（它们
+            // 常被用作普通名字，因此不能进关键字表），按文本识别。
+            if (matchKw(KeywordID::Weak)) cap.mode = ClosureCapture::Mode::Weak;
+            else if (check(TokenKind::TK_Identifier) && cur().text == "unowned") {
+                cap.mode = ClosureCapture::Mode::Unowned; advance();
+            } else if (check(TokenKind::TK_Identifier) && cur().text == "weak") {
+                cap.mode = ClosureCapture::Mode::Weak; advance();
+            }
+            if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) { cap.isLet = true; advance(); }
+            if (check(TokenKind::TK_Identifier)) { cap.name = cur().text; advance(); }
+            else { ok = false; break; }
+            caps.push_back(std::move(cap));
+            if (!matchPunct(PunctuatorID::Comma)) break;
+        }
+        if (ok && matchPunct(PunctuatorID::RBracket) && checkKw(KeywordID::In))
+            c->captures = std::move(caps);
+        else
+            pos_ = save; // 不是捕获列表，回退交给表达式解析
+    }
     // optional parameter clause before `in`
     if (checkPunct(PunctuatorID::LParen)) {
         advance();
@@ -1757,6 +1998,20 @@ NodePtr Parser::parseType() {
     return parseTypePostfix(std::move(base));
 }
 
+NodePtr Parser::parseTypeArgsUntilGreater() {
+    // 解析泛型实参列表，`<` 已被消费。成功时返回一个 TupleType，其元素即为
+    // 各类型实参（借用容器类型以复用既有节点表示）；失败（没有匹配的 `>`）
+    // 返回 nullptr，由调用方回退 token 流。
+    auto holder = std::make_unique<TupleType>();
+    while (!atEnd() && !checkPunct(PunctuatorID::Greater)) {
+        holder->elements.push_back(parseType());
+        if (!matchPunct(PunctuatorID::Comma)) break;
+    }
+    if (!checkPunct(PunctuatorID::Greater)) return nullptr;
+    advance(); // >
+    return holder;
+}
+
 NodePtr Parser::parseTypePostfix(NodePtr base) {
     while (true) {
         if (checkPunct(PunctuatorID::Question)) {
@@ -1794,10 +2049,31 @@ NodePtr Parser::parseTypePostfix(NodePtr base) {
         } else if (checkPunct(PunctuatorID::Arrow)) {
             advance();
             auto ft = std::make_unique<FuncType>();
-            // base could be a single param type or tuple
-            ft->params.push_back(std::move(base));
+            // 左侧是元组类型时展开为多个参数：`(Int, Int) -> Bool` 是两个参数，
+            // 而不是"一个元组参数"；`() -> Void` 则是零参数。
+            if (base && base->kind == NodeKind::TupleType) {
+                auto* tup = static_cast<TupleType*>(base.get());
+                for (auto& el : tup->elements) ft->params.push_back(std::move(el));
+            } else {
+                ft->params.push_back(std::move(base));
+            }
             ft->ret = parseType();
             base = std::move(ft);
+        } else if (checkPunct(PunctuatorID::Less) &&
+                   (base->kind == NodeKind::NamedType)) {
+            // 泛型实参：`Dictionary<String, T>`、`Stack<Int>`。类型位置上 `<`
+            // 只能是泛型实参列表的开始，不存在与比较运算的歧义。
+            auto* nt = static_cast<NamedType*>(base.get());
+            size_t save = pos_;
+            advance(); // <
+            NodePtr args = parseTypeArgsUntilGreater();
+            if (args) {
+                for (auto& a : static_cast<TupleType*>(args.get())->elements)
+                    nt->genericArgs.push_back(std::move(a));
+                continue;
+            }
+            pos_ = save; // 不是泛型实参，交还外层
+            break;
         } else if (checkPunct(PunctuatorID::Amp)) {
             advance();
             auto r = std::make_unique<RefType>();
@@ -1805,6 +2081,17 @@ NodePtr Parser::parseTypePostfix(NodePtr base) {
             r->pointee = parseType();
             base = std::move(r);
         } else if (checkPunct(PunctuatorID::At)) {
+            // 类型属性：`@Sendable () -> Void`、`@escaping (Int) -> Int`。
+            // 必须看到 `@` + 属性名 + `(`/`{`/`->` 才认定，否则会吞掉紧跟在
+            // 声明之后的 `@main`（例如 `typealias Num = Int` 后换行的属性）。
+            const Token& afterName = peek(2);
+            bool attributeForm =
+                peek(1).kind == TokenKind::TK_Identifier &&
+                afterName.kind == TokenKind::TK_Punctuator &&
+                (afterName.punct == PunctuatorID::LParen ||
+                 afterName.punct == PunctuatorID::LBrace ||
+                 afterName.punct == PunctuatorID::Arrow);
+            if (!attributeForm) break;
             advance();
             std::string kind;
             if (check(TokenKind::TK_Identifier)) { kind = cur().text; advance(); }

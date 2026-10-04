@@ -1,897 +1,499 @@
-// SukiCode Lexer implementation.
-// Scans UTF-8 source code into tokens.
+#include "compiler/lexer/Lexer.h"
 
-#include "Lexer.h"
 #include <cctype>
-#include <cstdlib>
-#include <charconv>
-#include <algorithm>
 
 namespace suki {
 
-Lexer::Lexer(std::string_view source, std::string_view filename, DiagnosticEngine& diag)
-    : source_(source), filename_(filename), pos_(0), line_(1), lineStart_(0), diag_(diag) {}
+namespace {
 
-Lexer::~Lexer() = default;
+bool isHexDigit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
 
-std::vector<Token> Lexer::lexAll() {
-    std::vector<Token> tokens;
-    while (true) {
-        Token tok = next();
-        tokens.push_back(tok);
-        if (tok.is(TokenKind::Eof)) break;
+std::string cleanDocBlock(const std::string& raw) {
+    std::string out;
+    size_t i = 0;
+    bool atLineStart = true;
+    while (i < raw.size()) {
+        char c = raw[i];
+        if (c == '\n') {
+            out += c;
+            atLineStart = true;
+            ++i;
+            continue;
+        }
+        if (atLineStart) {
+            // skip leading whitespace
+            if (c == ' ' || c == '\t') { ++i; continue; }
+            // skip a leading '*'
+            if (c == '*') { ++i; if (i < raw.size() && raw[i] == ' ') ++i; continue; }
+            atLineStart = false;
+        }
+        out += c;
+        ++i;
     }
-    return tokens;
+    return out;
+}
+
+} // namespace
+
+bool Lexer::isIdentStart(char c) {
+    return std::isalpha((unsigned char)c) != 0 || c == '_' || c == '$';
+}
+bool Lexer::isIdentCont(char c) {
+    return std::isalnum((unsigned char)c) != 0 || c == '_' || c == '$';
+}
+bool Lexer::isDigit(char c) { return c >= '0' && c <= '9'; }
+
+Lexer::Lexer(std::string source, DiagnosticEngine& diags)
+    : source_(std::move(source)), diags_(diags) {}
+
+std::vector<Token> Lexer::tokenizeAll() {
+    std::vector<Token> toks;
+    for (;;) {
+        Token t = next();
+        toks.push_back(t);
+        if (t.kind == TokenKind::TK_EOF) break;
+    }
+    return toks;
+}
+
+void Lexer::advance() {
+    if (atEnd()) return;
+    if (source_[pos_] == '\n') { ++line_; col_ = 1; }
+    else ++col_;
+    ++pos_;
+}
+
+char Lexer::peek(size_t off) const {
+    if (pos_ + off >= source_.size()) return '\0';
+    return source_[pos_ + off];
+}
+bool Lexer::atEnd() const { return pos_ >= source_.size(); }
+
+Token Lexer::makeToken(TokenKind kind) {
+    Token t;
+    t.kind = kind;
+    t.loc = SourceLocation{(uint32_t)line_, (uint32_t)col_, (uint32_t)pos_};
+    return t;
+}
+
+Token Lexer::makeError(const std::string& msg) {
+    SourceLocation here{(uint32_t)line_, (uint32_t)col_, (uint32_t)pos_};
+    SourceRange r{here, here};
+    diags_.reportError(msg, r);
+    return makeToken(TokenKind::TK_Error);
+}
+
+Token Lexer::stringEndToken() {
+    Token t = makeToken(TokenKind::TK_StringEnd);
+    t.text = "";
+    return t;
+}
+
+void Lexer::skipTrivia() {
+    while (!atEnd()) {
+        char c = peek();
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f') {
+            advance();
+            continue;
+        }
+        if (c == '\n') { advance(); continue; }
+
+        // line comment
+        if (c == '/' && peek(1) == '/') {
+            bool isDoc = (peek(2) == '/');
+            advance(); advance(); // consume //
+            if (isDoc) {
+                while (!atEnd() && peek() == '/') advance(); // consume extra '/'
+                if (!atEnd() && peek() == ' ') advance();
+                std::string line;
+                while (!atEnd() && peek() != '\n') { line += peek(); advance(); }
+                if (!pendingDoc_.empty()) pendingDoc_ += "\n";
+                pendingDoc_ += line;
+            } else {
+                while (!atEnd() && peek() != '\n') advance();
+            }
+            continue;
+        }
+
+        // block comment
+        if (c == '/' && peek(1) == '*') {
+            bool isDoc = (peek(2) == '*');
+            advance(); advance(); // consume /*
+            std::string content;
+            while (!atEnd() && !(peek() == '*' && peek(1) == '/')) {
+                if (peek() == '\n') { content += '\n'; advance(); continue; }
+                content += peek(); advance();
+            }
+            if (!atEnd()) advance(); // consume '*'
+            if (!atEnd()) advance(); // consume '/'
+            if (isDoc) {
+                if (!pendingDoc_.empty()) pendingDoc_ += "\n";
+                pendingDoc_ += cleanDocBlock(content);
+            }
+            continue;
+        }
+
+        break; // not trivia
+    }
 }
 
 Token Lexer::next() {
-    skipWhitespace();
-    if (pos_ >= source_.size()) {
-        Token tok;
-        tok.kind = TokenKind::Eof;
-        tok.loc = {line_, pos_ - lineStart_ + 1, pos_};
-        tok.length = 0;
-        return tok;
+    if (pendingStringEnd_) {
+        pendingStringEnd_ = false;
+        return stringEndToken();
     }
-    return scanToken();
+    skipTrivia();
+    if (atEnd()) return makeToken(TokenKind::TK_EOF);
+
+    Token t = lexSingle();
+
+    if (interpDepth_ > 0 && t.isPunct(PunctuatorID::RParen)) {
+        interpDepth_--;
+        if (interpDepth_ == 0) {
+            return resumeString();
+        }
+        return t;
+    }
+    if (interpDepth_ > 0 && t.isPunct(PunctuatorID::LParen)) {
+        interpDepth_++;
+    }
+
+    if (!pendingDoc_.empty() && t.kind != TokenKind::TK_EOF) {
+        t.docComment = pendingDoc_;
+        pendingDoc_.clear();
+    }
+    return t;
 }
 
-// ─── Source navigation ─────────────────────────────────────────────────────
-
-char Lexer::peek() const {
-    if (pos_ >= source_.size()) return 0;
-    return source_[pos_];
-}
-
-char Lexer::peekAt(uint32_t offset) const {
-    uint32_t p = pos_ + offset;
-    if (p >= source_.size()) return 0;
-    return source_[p];
-}
-
-char Lexer::advance() {
+Token Lexer::lexSingle() {
     char c = peek();
-    if (c == '\n') {
-        line_++;
-        lineStart_ = pos_ + 1;
+    if (isIdentStart(c)) return lexIdentifierOrKeyword();
+    if (isDigit(c)) return lexNumber();
+    if (c == '"') {
+        if (peek(1) == '"' && peek(2) == '"') return lexString(false, true);
+        return lexString(false, false);
     }
-    pos_++;
-    return c;
+    if (c == '\'') return lexChar();
+    // `.5` starts a float literal only at a token boundary. In `t.0` the dot is
+    // member access and the digits are a separate integer token, so require the
+    // preceding character not to be an identifier continuation.
+    if (c == '.' && isDigit(peek(1)) &&
+        (pos_ == 0 || !isIdentCont(source_[pos_ - 1])))
+        return lexNumber();
+    return lexPunctuator();
 }
 
-void Lexer::skipWhitespace() {
-    while (pos_ < source_.size()) {
-        char c = peek();
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            advance();
-        } else if (c == '/' && peekAt(1) == '/') {
-            scanLineComment();
-        } else if (c == '/' && peekAt(1) == '*') {
-            scanBlockComment();
-        } else {
-            break;
-        }
+Token Lexer::lexIdentifierOrKeyword() {
+    size_t start = pos_;
+    Token t = makeToken(TokenKind::TK_Identifier);
+    std::string txt;
+    txt += peek(); advance();
+    while (!atEnd() && isIdentCont(peek())) { txt += peek(); advance(); }
+    t.text = source_.substr(start, pos_ - start);
+
+    // raw string literal: r"..."
+    if (txt == "r" && !atEnd() && peek() == '"') {
+        return lexString(true, false);
     }
-}
 
-bool Lexer::match(char expected) {
-    if (pos_ < source_.size() && source_[pos_] == expected) {
-        advance();
-        return true;
+    KeywordID kw = keywordFromString(txt);
+    if (kw != KeywordID::None) {
+        t.kind = TokenKind::TK_Keyword;
+        t.keyword = kw;
     }
-    return false;
+    return t;
 }
 
-// ─── Character classification ──────────────────────────────────────────────
-
-bool Lexer::isHexDigit(char c) const {
-    return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
-
-bool Lexer::isAlpha(char c) const {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-bool Lexer::isAlphaNumeric(char c) const {
-    return isAlpha(c) || isDigit(c);
-}
-
-bool Lexer::isIdentStart(char c) const {
-    // Allow Unicode letters and underscore as identifier start
-    return isAlpha(c) || c == '_';
-}
-
-bool Lexer::isIdentContinue(char c) const {
-    return isAlphaNumeric(c) || c == '_';
-}
-
-// ─── Token creation ───────────────────────────────────────────────────────
-
-Token Lexer::makeToken(TokenKind kind, uint32_t startPos) {
-    Token tok;
-    tok.kind = kind;
-    tok.loc = {line_, startPos - lineStart_ + 1, startPos};
-    tok.length = pos_ - startPos;
-    tok.literalKind = LiteralKind::None;
-    tok.literal.intValue = 0;
-    return tok;
-}
-
-Token Lexer::makeErrorToken(std::string_view message, uint32_t startPos) {
-    diag_.error({line_, startPos - lineStart_ + 1, startPos}, filename_, message);
-    return makeToken(TokenKind::Error, startPos);
-}
-
-// ─── Main scan dispatch ───────────────────────────────────────────────────
-
-Token Lexer::scanToken() {
-    uint32_t startPos = pos_;
-    char c = advance();
-
-    switch (c) {
-        // Single-character tokens
-        case '(': return makeToken(TokenKind::LParen, startPos);
-        case ')': return makeToken(TokenKind::RParen, startPos);
-        case '{': return makeToken(TokenKind::LBrace, startPos);
-        case '}': return makeToken(TokenKind::RBrace, startPos);
-        case '[': return makeToken(TokenKind::LBracket, startPos);
-        case ']': return makeToken(TokenKind::RBracket, startPos);
-        case ',': return makeToken(TokenKind::Comma, startPos);
-        case ';': return makeToken(TokenKind::Semicolon, startPos);
-        case '#': {
-            // 条件编译指令 / Conditional compilation directives
-            // 检查是否是 #if, #else, #endif
-            uint32_t hashPos = startPos;
-            if (peek() == 'i' && peekAt(1) == 'f') {
-                // #if condition
-                advance(); advance(); // skip 'if'
-                skipWhitespace();
-                bool condition = evaluateCondition();
-                if (!condition) {
-                    skipUntilHashEndOrNext();
-                }
-                return next();
-            }
-            if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e' &&
-                peekAt(4) == 'i' && peekAt(5) == 'f') {
-                // #elseif — 在 #if 块内，跳过到 #endif
-                advance(); advance(); advance(); advance(); advance(); advance(); // skip 'elseif'
-                skipUntilHashEnd();
-                return next();
-            }
-            if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
-                // #else — 在 #if 块内，跳过到 #endif
-                advance(); advance(); advance(); advance(); // skip 'else'
-                skipUntilHashEnd();
-                return next();
-            }
-            if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' && peekAt(3) == 'i' && peekAt(4) == 'f') {
-                // #endif — 正常跳过
-                advance(); advance(); advance(); advance(); advance(); // skip 'endif'
-                return next();
-            }
-            return makeToken(TokenKind::Hash, hashPos);
-        }
-        case '~': return makeToken(TokenKind::Tilde, startPos);
-
-        case '.':
-            if (peek() == '.' && peekAt(1) == '.') {
-                advance(); advance();
-                return makeToken(TokenKind::Ellipsis, startPos);
-            }
-            if (peek() == '.' && peekAt(1) == '<') {
-                advance(); advance();
-                return makeToken(TokenKind::Range, startPos);
-            }
-            return makeToken(TokenKind::Dot, startPos);
-
-        case ':': return makeToken(TokenKind::Colon, startPos);
-
-        case '@': return scanAttribute();
-
-        case '_':
-            // Check if this is just an underscore token or start of identifier
-            if (isIdentContinue(peek())) {
-                pos_--; // un-advance to rescan the underscore
-                return scanIdentifier(); // _foo is an identifier
-            }
-            return makeToken(TokenKind::Underscore, startPos);
-
-        // Arrow operators
-        case '-':
-            if (match('>')) return makeToken(TokenKind::Arrow, startPos);
-            if (match('=')) return makeToken(TokenKind::MinusAssign, startPos);
-            return makeToken(TokenKind::Minus, startPos);
-
-        case '=':
-            if (match('=')) return makeToken(TokenKind::Equal, startPos);
-            if (match('>')) return makeToken(TokenKind::FatArrow, startPos);
-            return makeToken(TokenKind::Assign, startPos);
-
-        case '!':
-            if (match('=')) return makeToken(TokenKind::NotEqual, startPos);
-            return makeToken(TokenKind::Bang, startPos);
-
-        case '+':
-            if (match('=')) return makeToken(TokenKind::PlusAssign, startPos);
-            return makeToken(TokenKind::Plus, startPos);
-
-        case '*':
-            if (match('=')) return makeToken(TokenKind::StarAssign, startPos);
-            return makeToken(TokenKind::Star, startPos);
-
-        case '%':
-            if (match('=')) return makeToken(TokenKind::PercentAssign, startPos);
-            return makeToken(TokenKind::Percent, startPos);
-
-        case '&':
-            if (match('&')) return makeToken(TokenKind::AmpAmp, startPos);
-            if (match('=')) return makeToken(TokenKind::AmpAssign, startPos);
-            return makeToken(TokenKind::Amp, startPos);
-
-        case '|':
-            if (match('|')) return makeToken(TokenKind::PipePipe, startPos);
-            if (match('=')) return makeToken(TokenKind::PipeAssign, startPos);
-            return makeToken(TokenKind::Pipe, startPos);
-
-        case '^':
-            if (match('=')) return makeToken(TokenKind::CaretAssign, startPos);
-            return makeToken(TokenKind::Caret, startPos);
-
-        case '<':
-            if (match('<')) {
-                if (match('=')) return makeToken(TokenKind::LShiftAssign, startPos);
-                return makeToken(TokenKind::LShift, startPos);
-            }
-            if (match('=')) return makeToken(TokenKind::LessEqual, startPos);
-            // '<-' is the channel send/receive operator
-            if (match('-')) return makeToken(TokenKind::LeftArrow, startPos);
-            return makeToken(TokenKind::Less, startPos);
-
-        case '>':
-            if (match('>')) {
-                if (match('=')) return makeToken(TokenKind::RShiftAssign, startPos);
-                return makeToken(TokenKind::RShift, startPos);
-            }
-            if (match('=')) return makeToken(TokenKind::GreaterEqual, startPos);
-            return makeToken(TokenKind::Greater, startPos);
-
-        case '?':
-            if (match('?')) return makeToken(TokenKind::QuestionQuestion, startPos);
-            return makeToken(TokenKind::Question, startPos);
-
-        case '/':
-            if (match('=')) return makeToken(TokenKind::SlashAssign, startPos);
-            return makeToken(TokenKind::Slash, startPos);
-
-        case '\\':
-            // Backslash is used for string interpolation \(...)
-            // Outside strings, it's an error
-            return makeToken(TokenKind::Backslash, startPos);
-
-        // Literals
-        case '"':
-            // Check for raw string: r"..."
-            // (raw strings start with 'r', handled in scanIdentifier)
-            if (peek() == '"' && peekAt(1) == '"') {
-                // Start of multiline string """
-                advance(); advance();
-                return scanMultilineString();
-            }
-            return scanString();
-
-        case '\'':
-            return scanChar();
-
-        default:
-            // Numbers
-            if (isDigit(c)) {
-                pos_--; // un-advance to rescan the digit
-                return scanNumber();
-            }
-            // Identifiers and keywords
-            if (isIdentStart(c) || (unsigned char)c > 0x7F) {
-                pos_--; // un-advance to rescan
-                return scanIdentifier();
-            }
-            return makeErrorToken("unexpected character", startPos);
-    }
-}
-
-// ─── Number scanning ──────────────────────────────────────────────────────
-
-Token Lexer::scanNumber() {
-    uint32_t startPos = pos_;
+Token Lexer::lexNumber() {
+    size_t start = pos_;
+    Token t = makeToken(TokenKind::TK_IntLiteral);
+    std::string txt;
     bool isFloat = false;
-    int base = 10;
+    char c = peek();
 
-    // Check for base prefix: 0x, 0b, 0o
-    if (peek() == '0') {
-        char next = peekAt(1);
-        if (next == 'x' || next == 'X') {
-            base = 16;
-            advance(); advance(); // skip 0x
-        } else if (next == 'b' || next == 'B') {
-            base = 2;
-            advance(); advance(); // skip 0b
-        } else if (next == 'o' || next == 'O') {
-            base = 8;
-            advance(); advance(); // skip 0o
+    if (c == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
+        txt += '0'; advance(); txt += peek(); advance();
+        while (!atEnd() && (isHexDigit(peek()) || peek() == '_')) {
+            if (peek() != '_') txt += peek();
+            advance();
+        }
+    } else if (c == '0' && (peek(1) == 'b' || peek(1) == 'B')) {
+        txt += '0'; advance(); txt += peek(); advance();
+        while (!atEnd() && ((peek() >= '0' && peek() <= '1') || peek() == '_')) {
+            if (peek() != '_') txt += peek();
+            advance();
+        }
+    } else if (c == '0' && (peek(1) == 'o' || peek(1) == 'O')) {
+        txt += '0'; advance(); txt += peek(); advance();
+        while (!atEnd() && ((peek() >= '0' && peek() <= '7') || peek() == '_')) {
+            if (peek() != '_') txt += peek();
+            advance();
+        }
+    } else {
+        while (!atEnd() && (isDigit(peek()) || peek() == '_')) {
+            if (peek() != '_') txt += peek();
+            advance();
         }
     }
 
-    // Scan digits
-    while (pos_ < source_.size()) {
+    // fractional part
+    if (!atEnd() && peek() == '.' && isDigit(peek(1))) {
+        isFloat = true;
+        txt += '.'; advance();
+        while (!atEnd() && (isDigit(peek()) || peek() == '_')) {
+            if (peek() != '_') txt += peek();
+            advance();
+        }
+    }
+    // exponent
+    if (!atEnd() && (peek() == 'e' || peek() == 'E')) {
+        isFloat = true;
+        txt += peek(); advance();
+        if (!atEnd() && (peek() == '+' || peek() == '-')) { txt += peek(); advance(); }
+        while (!atEnd() && (isDigit(peek()) || peek() == '_')) {
+            if (peek() != '_') txt += peek();
+            advance();
+        }
+    }
+    // type suffix (e.g., u8, i32, f64) — identifier-like suffix (may contain digits)
+    if (!atEnd() && std::isalpha((unsigned char)peek())) {
+        while (!atEnd() && (std::isalnum((unsigned char)peek()) || peek() == '_')) {
+            txt += peek(); advance();
+        }
+    }
+
+    t.kind = isFloat ? TokenKind::TK_FloatLiteral : TokenKind::TK_IntLiteral;
+    t.numberText = txt;
+    t.text = source_.substr(start, pos_ - start);
+    return t;
+}
+
+Token Lexer::lexString(bool raw, bool multiline) {
+    // current char is the opening quote
+    curOpenStart_ = pos_;
+    curOpenLoc_   = SourceLocation{(uint32_t)line_, (uint32_t)col_, (uint32_t)pos_};
+    interpolatedString_ = false; // reset per-string state
+    advance(); // consume opening quote
+    if (!raw && multiline) {
+        if (!atEnd() && peek() == '"') advance();
+        if (!atEnd() && peek() == '"') advance();
+    }
+    curRaw_ = raw;
+    curMultiline_ = multiline;
+    return lexStringBody(raw, multiline);
+}
+
+Token Lexer::lexStringBody(bool raw, bool multiline) {
+    std::string fragment;
+    while (!atEnd()) {
         char c = peek();
-        if (c == '_') {
-            advance(); // skip underscores in numbers: 1_000_000
+        if (c == '\\' && !raw) {
+            if (peek(1) == '(') {
+                advance(); advance(); // consume '\('
+                interpolatedString_ = true;
+                interpDepth_++;
+                Token frag = makeToken(TokenKind::TK_StringFragment);
+                frag.stringValue = fragment;
+                frag.text = fragment;
+                return frag;
+            }
+            advance(); // consume backslash
+            char e = peek();
+            switch (e) {
+                case 'n': fragment += '\n'; break;
+                case 't': fragment += '\t'; break;
+                case 'r': fragment += '\r'; break;
+                case '0': fragment += '\0'; break;
+                case '\\': fragment += '\\'; break;
+                case '\'': fragment += '\''; break;
+                case '"': fragment += '"'; break;
+                default: fragment += e; break;
+            }
+            advance();
             continue;
         }
-        if (base == 16) {
-            if (!isHexDigit(c)) break;
-        } else if (base == 2) {
-            if (c != '0' && c != '1') break;
-        } else if (base == 8) {
-            if (c < '0' || c > '7') break;
-        } else {
-            if (!isDigit(c)) break;
-        }
-        advance();
-    }
-
-    // Check for decimal point (only for base 10 and 16)
-    if (base == 10 && peek() == '.' && isDigit(peekAt(1))) {
-        isFloat = true;
-        advance(); // skip '.'
-        while (pos_ < source_.size() && (isDigit(peek()) || peek() == '_')) {
-            advance();
-        }
-    }
-
-    // Check for exponent: e+, e-, E+, E-, e, E
-    if ((base == 10 || base == 16) && (peek() == 'e' || peek() == 'E' ||
-        (base == 16 && (peek() == 'p' || peek() == 'P')))) {
-        isFloat = true;
-        advance();
-        if (peek() == '+' || peek() == '-') advance();
-        while (pos_ < source_.size() && (isDigit(peek()) || peek() == '_')) {
-            advance();
-        }
-    }
-
-    // Type suffixes: f (Float), d (Double), u (UInt)
-    if (peek() == 'f' || peek() == 'F') {
-        isFloat = true;
-        advance();
-    } else if (peek() == 'd' || peek() == 'D') {
-        isFloat = true;
-        advance();
-    } else if (peek() == 'u' || peek() == 'U') {
-        advance(); // unsigned suffix
-    }
-
-    Token tok = makeToken(isFloat ? TokenKind::FloatLiteral : TokenKind::IntegerLiteral, startPos);
-
-    // Parse the literal value
-    std::string_view text = tok.text(source_);
-    std::string cleanText(text);
-    cleanText.erase(std::remove(cleanText.begin(), cleanText.end(), '_'), cleanText.end());
-
-    if (isFloat) {
-        tok.literalKind = LiteralKind::Float;
-        tok.literal.floatValue = std::strtod(cleanText.c_str(), nullptr);
-    } else {
-        tok.literalKind = LiteralKind::Integer;
-        // MSVC's strtoll may not support 0b/0o prefixes; strip them
-        const char* numStart = cleanText.c_str();
-        if (base == 2 && cleanText.size() > 2 && cleanText[0] == '0' &&
-            (cleanText[1] == 'b' || cleanText[1] == 'B')) {
-            numStart += 2; // skip "0b"
-        } else if (base == 8 && cleanText.size() > 2 && cleanText[0] == '0' &&
-                   (cleanText[1] == 'o' || cleanText[1] == 'O')) {
-            numStart += 2; // skip "0o"
-        }
-        tok.literal.intValue = std::strtoll(numStart, nullptr, base);
-    }
-
-    return tok;
-}
-
-// ─── String scanning ──────────────────────────────────────────────────────
-
-Token Lexer::scanString() {
-    uint32_t startPos = pos_ - 1; // include opening "
-    std::string value;
-
-    while (pos_ < source_.size()) {
-        char c = peek();
-
         if (c == '"') {
-            advance(); // closing "
-            Token tok = makeToken(TokenKind::StringLiteral, startPos);
-            tok.literalKind = LiteralKind::String;
-            tok.stringValue = std::move(value);
-            return tok;
-        }
-
-        if (c == '\\') {
-            advance(); // skip backslash
-            if (pos_ >= source_.size()) break;
-            char esc = advance();
-            switch (esc) {
-                case 'n':  value += '\n'; break;
-                case 't':  value += '\t'; break;
-                case 'r':  value += '\r'; break;
-                case '\\': value += '\\'; break;
-                case '"':  value += '"';  break;
-                case '\'': value += '\''; break;
-                case '0':  value += '\0'; break;
-                case '(': {
-                    // String interpolation \(expr)
-                    // 词法分析器保留 \( 作为字面量文本，由解析器处理插值表达式
-                    // Lexer preserves \( as literal text, parser handles interpolation expressions
-                    value += "\\(";
-                    break;
+            if (multiline) {
+                if (peek(1) == '"' && peek(2) == '"') {
+                    size_t closePos = pos_;
+                    advance(); advance(); advance(); // consume """
+                    return finishString(fragment, closePos, 3);
                 }
-                case 'u': {
-                    // Unicode escape: \u{XXXX}
-                    if (match('{')) {
-                        uint32_t codepoint = 0;
-                        while (pos_ < source_.size() && peek() != '}') {
-                            char h = advance();
-                            codepoint <<= 4;
-                            if (isHexDigit(h)) {
-                                codepoint += (h >= 'a') ? (h - 'a' + 10) :
-                                             (h >= 'A') ? (h - 'A' + 10) : (h - '0');
-                            }
-                        }
-                        match('}'); // consume closing brace
-                        // Encode as UTF-8
-                        if (codepoint < 0x80) {
-                            value += static_cast<char>(codepoint);
-                        } else if (codepoint < 0x800) {
-                            value += static_cast<char>(0xC0 | (codepoint >> 6));
-                            value += static_cast<char>(0x80 | (codepoint & 0x3F));
-                        } else if (codepoint < 0x10000) {
-                            value += static_cast<char>(0xE0 | (codepoint >> 12));
-                            value += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
-                            value += static_cast<char>(0x80 | (codepoint & 0x3F));
-                        } else {
-                            value += static_cast<char>(0xF0 | (codepoint >> 18));
-                            value += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
-                            value += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
-                            value += static_cast<char>(0x80 | (codepoint & 0x3F));
-                        }
-                    }
-                    break;
-                }
-                default:
-                    value += esc;
-                    break;
+                fragment += '"'; advance();
+                continue;
             }
-        } else if (c == '\n') {
-            // Newline in single-line string is an error
-            return makeErrorToken("unterminated string literal", startPos);
-        } else {
-            advance();
-            value += c;
+            size_t closePos = pos_;
+            advance(); // consume closing quote
+            return finishString(fragment, closePos, 1);
         }
+        if (c == '\n' && !multiline) {
+            SourceRange r{curOpenLoc_, curOpenLoc_};
+            diags_.reportError("unterminated string literal", r);
+            return makeToken(TokenKind::TK_Error);
+        }
+        fragment += c; advance();
     }
-
-    return makeErrorToken("unterminated string literal", startPos);
+    SourceRange r{curOpenLoc_, curOpenLoc_};
+    diags_.reportError("unterminated string literal", r);
+    return makeToken(TokenKind::TK_Error);
 }
 
-// ─── Multiline string scanning ────────────────────────────────────────────
-
-Token Lexer::scanMultilineString() {
-    uint32_t startPos = pos_ - 3; // include opening """
-    std::string value;
-
-    while (pos_ < source_.size()) {
-        if (peek() == '"' && peekAt(1) == '"' && peekAt(2) == '"') {
-            advance(); advance(); advance(); // closing """
-            Token tok = makeToken(TokenKind::StringLiteral, startPos);
-            tok.literalKind = LiteralKind::String;
-            tok.stringValue = std::move(value);
-            return tok;
-        }
-        char c = advance();
-        if (c == '\\') {
-            if (pos_ < source_.size()) {
-                char esc = advance();
-                switch (esc) {
-                    case 'n':  value += '\n'; break;
-                    case 't':  value += '\t'; break;
-                    case '\\': value += '\\'; break;
-                    case '"':  value += '"'; break;
-                    default:   value += esc; break;
-                }
-            }
-        } else {
-            value += c;
-        }
+Token Lexer::finishString(const std::string& fragment, size_t closePos, size_t quoteLen) {
+    if (!interpolatedString_) {
+        Token t;
+        t.kind = TokenKind::TK_StringLiteral;
+        t.loc = curOpenLoc_;
+        t.stringValue = fragment;
+        t.text = source_.substr(curOpenStart_, closePos + quoteLen - curOpenStart_);
+        if (!pendingDoc_.empty()) { t.docComment = pendingDoc_; pendingDoc_.clear(); }
+        return t;
     }
-
-    return makeErrorToken("unterminated multiline string literal", startPos);
+    Token frag;
+    frag.kind = TokenKind::TK_StringFragment;
+    frag.loc = curOpenLoc_;
+    frag.stringValue = fragment;
+    frag.text = fragment;
+    pendingStringEnd_ = true;
+    if (!pendingDoc_.empty()) { frag.docComment = pendingDoc_; pendingDoc_.clear(); }
+    return frag;
 }
 
-// ─── Raw string scanning ──────────────────────────────────────────────────
+Token Lexer::resumeString() {
+    return lexStringBody(curRaw_, curMultiline_);
+}
 
-Token Lexer::scanRawString() {
-    uint32_t startPos = pos_ - 2; // include r"
-    std::string value;
-
-    while (pos_ < source_.size()) {
-        char c = peek();
-        if (c == '"') {
-            advance(); // closing "
-            Token tok = makeToken(TokenKind::StringLiteral, startPos);
-            tok.literalKind = LiteralKind::String;
-            tok.stringValue = std::move(value);
-            return tok;
-        }
-        if (c == '\n') {
-            return makeErrorToken("unterminated raw string literal", startPos);
+Token Lexer::lexChar() {
+    size_t start = pos_;
+    Token t = makeToken(TokenKind::TK_CharLiteral);
+    advance(); // consume opening '
+    std::string val;
+    if (!atEnd() && peek() == '\\') {
+        advance();
+        char e = peek();
+        switch (e) {
+            case 'n': val += '\n'; break;
+            case 't': val += '\t'; break;
+            case 'r': val += '\r'; break;
+            case '0': val += '\0'; break;
+            case '\\': val += '\\'; break;
+            case '\'': val += '\''; break;
+            case '"': val += '"'; break;
+            default: val += e; break;
         }
         advance();
-        value += c; // no escape processing in raw strings
+    } else if (!atEnd()) {
+        val += peek(); advance();
     }
-
-    return makeErrorToken("unterminated raw string literal", startPos);
+    if (!atEnd() && peek() == '\'') advance();
+    else diags_.reportError("unterminated character literal");
+    t.stringValue = val;
+    t.text = source_.substr(start, pos_ - start);
+    return t;
 }
 
-// ─── Character literal scanning ───────────────────────────────────────────
+Token Lexer::lexPunctuator() {
+    size_t start = pos_;
+    SourceLocation sloc{(uint32_t)line_, (uint32_t)col_, (uint32_t)pos_};
+    char c = peek();
+    char n = peek(1);
+    PunctuatorID pid = PunctuatorID::None;
+    int consume = 1;
 
-Token Lexer::scanChar() {
-    uint32_t startPos = pos_ - 1; // include opening '
-    uint32_t codepoint = 0;
-
-    if (peek() == '\\') {
-        advance(); // skip backslash
-        char esc = advance();
-        switch (esc) {
-            case 'n':  codepoint = '\n'; break;
-            case 't':  codepoint = '\t'; break;
-            case 'r':  codepoint = '\r'; break;
-            case '\\': codepoint = '\\'; break;
-            case '\'': codepoint = '\''; break;
-            case '0':  codepoint = '\0'; break;
-            case 'u': {
-                if (match('{')) {
-                    codepoint = 0;
-                    while (pos_ < source_.size() && peek() != '}') {
-                        char h = advance();
-                        codepoint <<= 4;
-                        if (isHexDigit(h)) {
-                            codepoint += (h >= 'a') ? (h - 'a' + 10) :
-                                         (h >= 'A') ? (h - 'A' + 10) : (h - '0');
-                        }
-                    }
-                    match('}');
-                }
-                break;
-            }
-            default:
-                codepoint = esc;
-                break;
-        }
-    } else {
-        codepoint = decodeUTF8();
-    }
-
-    if (!match('\'')) {
-        return makeErrorToken("expected closing single quote for character literal", startPos);
-    }
-
-    Token tok = makeToken(TokenKind::CharLiteral, startPos);
-    tok.literalKind = LiteralKind::Char;
-    tok.literal.charValue = codepoint;
-    return tok;
-}
-
-// ─── Identifier scanning ──────────────────────────────────────────────────
-
-Token Lexer::scanIdentifier() {
-    uint32_t startPos = pos_;
-
-    while (pos_ < source_.size()) {
-        char c = peek();
-        if (isIdentContinue(c)) {
-            advance();
-        } else if ((unsigned char)c > 0x7F) {
-            // Unicode character — accept as identifier continuation
-            decodeUTF8();
-        } else {
+    switch (c) {
+        case '+':
+            if (n == '=') { pid = PunctuatorID::PlusEqual; consume = 2; }
+            else pid = PunctuatorID::Plus;
             break;
-        }
-    }
-
-    std::string_view name(&source_[startPos], pos_ - startPos);
-
-    // Check if it's a raw string prefix
-    if (name == "r" && peek() == '"') {
-        advance(); // skip the "
-        return scanRawString();
-    }
-
-    // Check for keyword
-    TokenKind kwKind = Token::keywordLookup(name);
-    if (kwKind != TokenKind::Identifier) {
-        return makeToken(kwKind, startPos);
-    }
-
-    Token tok = makeToken(TokenKind::Identifier, startPos);
-    tok.stringValue = std::string(name);
-    return tok;
-}
-
-// ─── Attribute scanning ──────────────────────────────────────────────────
-
-Token Lexer::scanAttribute() {
-    uint32_t startPos = pos_ - 1; // include @
-
-    // If @ is not followed by an identifier character, it's just the @ token
-    if (!isIdentStart(peek())) {
-        return makeToken(TokenKind::At, startPos);
-    }
-
-    // Scan the attribute name
-    while (pos_ < source_.size() && (isIdentContinue(peek()) || peek() == '.')) {
-        advance();
-    }
-
-    std::string_view attrName(&source_[startPos], pos_ - startPos);
-
-    // Special case: @enum(C) — peek ahead for the parenthetical
-    if (attrName == "@enum" && peek() == '(') {
-        advance(); // skip (
-        if (peek() == 'C') {
-            advance(); // skip C
-            if (match(')')) {
-                return makeToken(TokenKind::AtEnumC, startPos);
-            }
-        }
-        // If not @enum(C), backtrack is hard — just treat as generic attribute
-        // For simplicity, we'll handle it differently in the parser
-    }
-
-    // Check for known attributes
-    TokenKind kind = Token::attributeLookup(attrName);
-    if (kind != TokenKind::AtAttribute) {
-        return makeToken(kind, startPos);
-    }
-
-    return makeToken(TokenKind::AtAttribute, startPos);
-}
-
-// ─── Comment scanning ─────────────────────────────────────────────────────
-
-Token Lexer::scanLineComment() {
-    uint32_t startPos = pos_;
-    // Skip //
-    advance(); advance();
-
-    bool isDoc = false;
-    if (peek() == '/') {
-        // /// doc comment
-        isDoc = true;
-        advance();
-    }
-
-    while (pos_ < source_.size() && peek() != '\n') {
-        advance();
-    }
-    // At this point, pos_ should be at '\n' or at end of source.
-    // Don't consume the '\n' — skipWhitespace() will handle it.
-
-    // Line comments are skipped (not returned as tokens).
-    // Return an error token as a placeholder; skipWhitespace() ignores the return value.
-    return makeToken(TokenKind::Error, startPos);
-}
-
-Token Lexer::scanBlockComment() {
-    uint32_t startPos = pos_;
-    // Skip /*
-    advance(); advance();
-
-    bool isDoc = false;
-    if (peek() == '*') {
-        // /** doc comment */
-        isDoc = true;
-        advance();
-    }
-
-    int depth = 1;
-    while (pos_ < source_.size() && depth > 0) {
-        if (peek() == '/' && peekAt(1) == '*') {
-            depth++;
-            advance(); advance();
-        } else if (peek() == '*' && peekAt(1) == '/') {
-            depth--;
-            advance(); advance();
-        } else {
-            advance();
-        }
-    }
-
-    if (depth > 0) {
-        return makeErrorToken("unterminated block comment", startPos);
-    }
-
-    // Block comments are skipped (not returned as tokens).
-    // Return an error token as a placeholder; skipWhitespace() ignores the return value.
-    return makeToken(TokenKind::Error, startPos);
-}
-
-// ─── UTF-8 decoding ──────────────────────────────────────────────────────
-
-uint32_t Lexer::decodeUTF8() {
-    if (pos_ >= source_.size()) return 0;
-
-    unsigned char c = static_cast<unsigned char>(source_[pos_]);
-    uint32_t codepoint = 0;
-    int bytes = 0;
-
-    if (c < 0x80) {
-        codepoint = c;
-        bytes = 1;
-    } else if ((c & 0xE0) == 0xC0) {
-        codepoint = c & 0x1F;
-        bytes = 2;
-    } else if ((c & 0xF0) == 0xE0) {
-        codepoint = c & 0x0F;
-        bytes = 3;
-    } else if ((c & 0xF8) == 0xF0) {
-        codepoint = c & 0x07;
-        bytes = 4;
-    } else {
-        // Invalid UTF-8 lead byte
-        advance();
-        return 0xFFFD; // replacement character
-    }
-
-    advance(); // consume lead byte
-
-    for (int i = 1; i < bytes; i++) {
-        if (pos_ >= source_.size()) break;
-        unsigned char b = static_cast<unsigned char>(source_[pos_]);
-        if ((b & 0xC0) != 0x80) break;
-        codepoint = (codepoint << 6) | (b & 0x3F);
-        advance();
-    }
-
-    return codepoint;
-}
-
-// ─── Conditional compilation ────────────────────────────────────────────
-
-bool Lexer::evaluateCondition() {
-    // 评估 #if 条件
-    // 支持: os(Linux), os(Windows), os(macOS), arch(x86_64), arch(arm64), FLAG, !FLAG
-    skipWhitespace();
-
-    bool negate = false;
-    if (peek() == '!') {
-        negate = true;
-        advance();
-    }
-
-    // 读取条件标识符
-    std::string cond;
-    while (pos_ < source_.size() && (isAlphaNumeric(peek()) || peek() == '_')) {
-        cond += advance();
-    }
-
-    bool result = false;
-
-    // os() 条件
-    if (cond == "os") {
-        if (match('(')) {
-            std::string osName;
-            while (pos_ < source_.size() && peek() != ')') {
-                osName += advance();
-            }
-            match(')');
-#ifdef _WIN32
-            result = (osName == "Windows");
-#elif defined(__APPLE__)
-            result = (osName == "macOS" || osName == "iOS");
-#elif defined(__linux__)
-            result = (osName == "Linux" || osName == "Android");
-#elif defined(__FreeBSD__)
-            result = (osName == "FreeBSD");
-#endif
-        }
-    }
-    // arch() 条件
-    else if (cond == "arch") {
-        if (match('(')) {
-            std::string archName;
-            while (pos_ < source_.size() && peek() != ')') {
-                archName += advance();
-            }
-            match(')');
-#if defined(_M_X64) || defined(__x86_64__)
-            result = (archName == "x86_64");
-#elif defined(_M_ARM64) || defined(__aarch64__)
-            result = (archName == "arm64");
-#elif defined(_M_IX86) || defined(__i386__)
-            result = (archName == "x86");
-#elif defined(__arm__)
-            result = (archName == "arm");
-#endif
-        }
-    }
-    // 自定义标志
-    else {
-        // 检查是否在 defines_ 列表中
-        for (const auto& def : defines_) {
-            if (def == cond) {
-                result = true;
-                break;
-            }
-        }
-    }
-
-    return negate ? !result : result;
-}
-
-void Lexer::skipUntilHashEnd() {
-    // 跳过到匹配的 #endif，处理嵌套 #if
-    int depth = 1;
-    while (pos_ < source_.size() && depth > 0) {
-        // 跳过到行首的 #
-        while (pos_ < source_.size() && peek() != '\n') {
-            advance();
-        }
-        if (peek() == '\n') advance(); // skip newline
-
-        skipWhitespace();
-        if (peek() == '#') {
-            advance(); // skip #
-            if (peek() == 'i' && peekAt(1) == 'f') {
-                depth++;
-                advance(); advance();
-
-            } else if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' &&
-                       peekAt(3) == 'i' && peekAt(4) == 'f') {
-                depth--;
-                advance(); advance(); advance(); advance(); advance();
-            }
-        }
-    }
-}
-
-void Lexer::skipUntilHashEndOrNext() {
-    // 跳过到下一个 #elseif, #else, 或 #endif
-    int depth = 1;
-    while (pos_ < source_.size() && depth > 0) {
-        // 跳过到行首的 #
-        while (pos_ < source_.size() && peek() != '\n') {
-            advance();
-        }
-        if (peek() == '\n') advance(); // skip newline
-
-        skipWhitespace();
-        if (peek() == '#') {
-            advance(); // skip #
-            if (peek() == 'i' && peekAt(1) == 'f') {
-                depth++;
-                advance(); advance();
-            } else if (peek() == 'e' && peekAt(1) == 'l' && peekAt(2) == 's' && peekAt(3) == 'e') {
-                if (depth == 1) {
-                    // Found #else or #elseif at the same level — stop here
-                    return;
+        case '-':
+            if (n == '>') { pid = PunctuatorID::Arrow; consume = 2; }
+            else if (n == '=') { pid = PunctuatorID::MinusEqual; consume = 2; }
+            else pid = PunctuatorID::Minus;
+            break;
+        case '*':
+            if (n == '=') { pid = PunctuatorID::StarEqual; consume = 2; }
+            else pid = PunctuatorID::Star;
+            break;
+        case '/':
+            if (n == '=') { pid = PunctuatorID::SlashEqual; consume = 2; }
+            else pid = PunctuatorID::Slash;
+            break;
+        case '%':
+            if (n == '=') { pid = PunctuatorID::PercentEqual; consume = 2; }
+            else pid = PunctuatorID::Percent;
+            break;
+        case '=':
+            if (n == '=') { pid = PunctuatorID::EqualEqual; consume = 2; }
+            else if (n == '>') { pid = PunctuatorID::FatArrow; consume = 2; }
+            else pid = PunctuatorID::Equal;
+            break;
+        case '!':
+            if (n == '=') { pid = PunctuatorID::BangEqual; consume = 2; }
+            else pid = PunctuatorID::Bang;
+            break;
+        case '<':
+            if (n == '<') { pid = PunctuatorID::LessLess; consume = 2; }
+            else if (n == '=') { pid = PunctuatorID::LessEqual; consume = 2; }
+            else if (n == '-') { pid = PunctuatorID::LeftArrow; consume = 2; }
+            else pid = PunctuatorID::Less;
+            break;
+        case '>':
+            if (n == '>') { pid = PunctuatorID::GreaterGreater; consume = 2; }
+            else if (n == '=') { pid = PunctuatorID::GreaterEqual; consume = 2; }
+            else pid = PunctuatorID::Greater;
+            break;
+        case '&':
+            if (n == '&') { pid = PunctuatorID::AmpAmp; consume = 2; }
+            else pid = PunctuatorID::Amp;
+            break;
+        case '|':
+            if (n == '|') { pid = PunctuatorID::PipePipe; consume = 2; }
+            else pid = PunctuatorID::Pipe;
+            break;
+        case '^': pid = PunctuatorID::Caret; break;
+        case '~': pid = PunctuatorID::Tilde; break;
+        case '.':
+            if (n == '.' ) {
+                if (peek(2) == '<') { pid = PunctuatorID::DotDotLess; consume = 3; }
+                else if (peek(2) == '.') { pid = PunctuatorID::DotDot; consume = 3; }
+                else {
+                    advance(); advance();
+                    diags_.reportError("invalid token '..' (use '..<' or '...')",
+                        SourceRange{sloc, sloc});
+                    return makeToken(TokenKind::TK_Error);
                 }
-                advance(); advance(); advance(); advance();
-            } else if (peek() == 'e' && peekAt(1) == 'n' && peekAt(2) == 'd' &&
-                       peekAt(3) == 'i' && peekAt(4) == 'f') {
-                depth--;
-                if (depth == 0) return; // Found #endif — stop here
-                advance(); advance(); advance(); advance(); advance();
-            }
-        }
+            } else pid = PunctuatorID::Dot;
+            break;
+        case '?':
+            if (n == '?') { pid = PunctuatorID::QuestionQuestion; consume = 2; }
+            else pid = PunctuatorID::Question;
+            break;
+        case ':': pid = PunctuatorID::Colon; break;
+        case ';': pid = PunctuatorID::Semicolon; break;
+        case ',': pid = PunctuatorID::Comma; break;
+        case '(': pid = PunctuatorID::LParen; break;
+        case ')': pid = PunctuatorID::RParen; break;
+        case '{': pid = PunctuatorID::LBrace; break;
+        case '}': pid = PunctuatorID::RBrace; break;
+        case '[': pid = PunctuatorID::LBracket; break;
+        case ']': pid = PunctuatorID::RBracket; break;
+        case '@': pid = PunctuatorID::At; break;
+        case '#': pid = PunctuatorID::Hash; break;
+        default:
+            advance();
+            diags_.reportError(std::string("unexpected character '") + c + "'",
+                SourceRange{sloc, sloc});
+            return makeToken(TokenKind::TK_Error);
     }
+
+    Token t;
+    t.kind = TokenKind::TK_Punctuator;
+    t.punct = pid;
+    t.loc = sloc;
+    for (int i = 0; i < consume; ++i) advance();
+    t.text = source_.substr(start, pos_ - start);
+    return t;
 }
 
 } // namespace suki

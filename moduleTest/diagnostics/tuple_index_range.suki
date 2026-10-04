@@ -1,0 +1,7 @@
+// 负例：元组索引越界，应报越界
+// Negative: an out-of-range tuple index must be diagnosed.
+@main
+func main() -> Int {
+    let t = (1, 2)
+    return t.5
+}
