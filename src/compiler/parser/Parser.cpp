@@ -1,2512 +1,1834 @@
-// SukiCode recursive descent parser implementation.
-// Parses tokens into an AST. Handles all SukiCode syntax including
-// expressions, statements, declarations, types, and patterns.
+#include "compiler/parser/Parser.h"
 
-#include "Parser.h"
-#include "compiler/lexer/Lexer.h"
-#include <cassert>
+#include <algorithm>
 
 namespace suki {
 
-Parser::Parser(std::vector<Token> tokens, std::string_view source,
-               std::string_view filename, DiagnosticEngine& diag)
-    : tokens_(std::move(tokens)), pos_(0), source_(source),
-      filename_(filename), diag_(diag) {}
+// ─── construction & token helpers ────────────────────────────────────────────
+Parser::Parser(std::vector<Token> tokens, DiagnosticEngine& diags)
+    : tokens_(std::move(tokens)), diags_(diags) {}
 
-// ─── Token navigation ─────────────────────────────────────────────────────
-
-const Token& Parser::peek() const {
-    if (pos_ >= tokens_.size()) return tokens_.back(); // Eof
+const Token& Parser::cur() const {
+    if (pos_ >= tokens_.size()) return tokens_.back();
     return tokens_[pos_];
 }
-
-const Token& Parser::peekAt(size_t offset) const {
-    size_t idx = pos_ + offset;
-    if (idx >= tokens_.size()) return tokens_.back();
-    return tokens_[idx];
+const Token& Parser::peek(size_t off) const {
+    size_t i = pos_ + off;
+    if (i >= tokens_.size()) return tokens_.back();
+    return tokens_[i];
 }
-
-const Token& Parser::advance() {
-    const Token& tok = peek();
-    if (pos_ < tokens_.size() - 1) pos_++;
-    return tok;
+bool Parser::atEnd() const {
+    return pos_ >= tokens_.size() || tokens_[pos_].kind == TokenKind::TK_EOF;
 }
-
-bool Parser::check(TokenKind kind) const {
-    return peek().is(kind);
+bool Parser::check(TokenKind k) const { return cur().kind == k; }
+bool Parser::checkPunct(PunctuatorID p) const {
+    return cur().kind == TokenKind::TK_Punctuator && cur().punct == p;
 }
-
-bool Parser::match(TokenKind kind) {
-    if (check(kind)) {
-        advance();
-        return true;
-    }
+bool Parser::checkKw(KeywordID k) const {
+    return cur().kind == TokenKind::TK_Keyword && cur().keyword == k;
+}
+bool Parser::match(TokenKind k) {
+    if (check(k)) { advance(); return true; }
     return false;
 }
-
-bool Parser::expect(TokenKind kind) {
-    if (check(kind)) {
-        advance();
-        return true;
-    }
-    std::string msg = "expected ";
-    msg += Token::kindName(kind);
-    msg += ", got ";
-    msg += Token::kindName(peek().kind);
-    error(msg);
+bool Parser::matchPunct(PunctuatorID p) {
+    if (checkPunct(p)) { advance(); return true; }
     return false;
 }
-
-bool Parser::isAtEnd() const {
-    return check(TokenKind::Eof);
+bool Parser::matchKw(KeywordID k) {
+    if (checkKw(k)) { advance(); return true; }
+    return false;
 }
-
-SourceLocation Parser::loc() const {
-    return peek().loc;
+Token Parser::advance() {
+    Token t = cur();
+    if (!atEnd()) ++pos_;
+    return t;
 }
-
-void Parser::error(std::string_view message) {
-    diag_.error(loc(), filename_, message);
+Token Parser::expect(TokenKind k, const char* msg) {
+    if (check(k)) return advance();
+    errorAt(cur(), msg);
+    return cur();
 }
-
+Token Parser::expectPunct(PunctuatorID p, const char* msg) {
+    if (checkPunct(p)) return advance();
+    errorAt(cur(), msg);
+    return cur();
+}
+Token Parser::expectKw(KeywordID k, const char* msg) {
+    if (checkKw(k)) return advance();
+    errorAt(cur(), msg);
+    return cur();
+}
+void Parser::errorAt(const Token& t, const std::string& msg) {
+    SourceRange r{t.loc, t.loc};
+    diags_.reportError(msg, r);
+}
 void Parser::synchronize() {
-    // Skip tokens until we find a statement boundary
-    while (!isAtEnd()) {
-        if (peek().is(TokenKind::Semicolon)) {
-            advance();
-            return;
-        }
-        // Check for tokens that typically start a new statement
-        if (peek().isOneOf({
-            TokenKind::KwFunc, TokenKind::KwLet, TokenKind::KwVar,
-            TokenKind::KwReturn, TokenKind::KwIf, TokenKind::KwFor,
-            TokenKind::KwWhile, TokenKind::KwSwitch, TokenKind::KwClass,
-            TokenKind::KwStruct, TokenKind::KwEnum, TokenKind::KwProtocol,
-            TokenKind::KwImport, TokenKind::KwModule,
-        })) {
-            return;
+    advance();
+    while (!atEnd()) {
+        if (checkPunct(PunctuatorID::RBrace)) return;
+        switch (cur().kind) {
+            case TokenKind::TK_Keyword:
+                switch (cur().keyword) {
+                    case KeywordID::Func: case KeywordID::Struct:
+                    case KeywordID::Enum: case KeywordID::Class:
+                    case KeywordID::Protocol: case KeywordID::Extension:
+                    case KeywordID::Let: case KeywordID::Var:
+                    case KeywordID::Typealias: case KeywordID::Init:
+                    case KeywordID::Deinit: case KeywordID::Subscript:
+                    case KeywordID::Import: case KeywordID::Module:
+                    case KeywordID::Return: case KeywordID::If:
+                    case KeywordID::Guard: case KeywordID::While:
+                    case KeywordID::For: case KeywordID::Switch:
+                    case KeywordID::Do: case KeywordID::Throw:
+                        return;
+                    default: break;
+                }
+                break;
+            default: break;
         }
         advance();
     }
 }
 
-// ─── Top-level parsing ────────────────────────────────────────────────────
-
-std::unique_ptr<CompilationUnit> Parser::parse() {
-    auto cu = makeNode<CompilationUnit>();
-    cu->filename = std::string(filename_);
-
-    // Optional module declaration
-    if (match(TokenKind::KwModule)) {
-        auto mod = makeNode<ModuleDecl>();
-        if (check(TokenKind::Identifier)) {
-            mod->name = std::string(advance().stringValue);
-        } else {
-            error("expected module name after 'module'");
-        }
-        // 分号检查：module 声明后的分号是允许的（不是语句终止符）
-        // Semicolons after module declaration are allowed (not a statement terminator)
-        match(TokenKind::Semicolon);
-        cu->moduleDecl = mod.get();
-        cu->declarations.push_back(std::move(mod));
+// ─── module ───────────────────────────────────────────────────────────────────
+NodeList Parser::parseModule() {
+    NodeList decls;
+    // optional module declaration
+    if (checkKw(KeywordID::Module)) {
+        auto m = std::make_unique<ModuleDecl>();
+        advance();
+        if (check(TokenKind::TK_Identifier)) { m->name = cur().text; advance(); }
+        if (checkPunct(PunctuatorID::Semicolon)) advance();
+        decls.push_back(std::move(m));
     }
-
-    // Parse declarations
-    while (!isAtEnd()) {
-        try {
-            parseDeclarationInto(cu->declarations);
-        } catch (...) {
-            synchronize();
-        }
-    }
-
-    return cu;
-}
-
-// ─── Declaration parsing ──────────────────────────────────────────────────
-
-void Parser::parseDeclarationInto(std::vector<DeclPtr>& out) {
-    auto decl = parseDeclaration();
-    if (decl) {
-        out.push_back(std::move(decl));
-        for (auto& extra : multiDecls_) {
-            out.push_back(std::move(extra));
-        }
-        multiDecls_.clear();
-    }
-}
-
-DeclPtr Parser::parseDeclaration() {
-    // Check for attributes
-    // (Attributes are parsed inline where needed for now)
-
-    // Access level modifiers
-    AccessLevel access = AccessLevel::Internal;
-    bool isStatic = false;
-
-    // Parse access modifiers and other modifiers
-    bool isOverride = false;
-    bool isMutating = false;
-    bool isConvenience = false;
-    bool isRequired = false;
-    bool isFinal = false;
-    while (true) {
-        if (match(TokenKind::KwPublic)) { access = AccessLevel::Public; continue; }
-        if (match(TokenKind::KwInternal)) { access = AccessLevel::Internal; continue; }
-        if (match(TokenKind::KwFileprivate)) { access = AccessLevel::FilePrivate; continue; }
-        if (match(TokenKind::KwPrivate)) { access = AccessLevel::Private; continue; }
-        if (match(TokenKind::KwOpen)) { access = AccessLevel::Open; continue; }
-        if (match(TokenKind::KwStatic)) { isStatic = true; continue; }
-        if (match(TokenKind::KwOverride)) { isOverride = true; continue; }
-        if (match(TokenKind::KwMutating)) { isMutating = true; continue; }
-        if (match(TokenKind::KwConvenience)) { isConvenience = true; continue; }
-        if (match(TokenKind::KwRequired)) { isRequired = true; continue; }
-        if (match(TokenKind::KwFinal)) { isFinal = true; continue; }
-        if (match(TokenKind::KwAsync)) { continue; } // async modifier (consumed, stored later)
-        break;
-    }
-
-    // Collect attributes
-    std::vector<Attribute> attrs;
-    while (true) {
-        if (check(TokenKind::AtMain) || check(TokenKind::AtCImport) ||
-            check(TokenKind::AtCDecl) || check(TokenKind::AtMacro) ||
-            check(TokenKind::AtTest) || check(TokenKind::AtEnumC) ||
-            check(TokenKind::AtNoMangle) || check(TokenKind::AtPanicHandler) ||
-            check(TokenKind::AtAttribute)) {
-            Attribute attr;
-            attr.loc = loc();
-            // 属性名从 token 文本中提取（去掉 @ 前缀）
-            Token attrToken = advance();
-            std::string_view attrText = attrToken.text(source_);
-            if (!attrText.empty() && attrText[0] == '@') {
-                attr.name = std::string(attrText.substr(1));
-            } else {
-                attr.name = std::string(attrText);
-            }
-            // Handle parenthesized arguments: @attr(args)
-            if (check(TokenKind::LParen)) {
-                advance(); // (
-                while (!check(TokenKind::RParen) && !isAtEnd()) {
-                    if (check(TokenKind::Identifier)) {
-                        attr.args.push_back(std::string(advance().stringValue));
-                    } else {
-                        advance(); // skip
-                    }
-                    match(TokenKind::Comma);
-                }
-                match(TokenKind::RParen);
-            }
-            attrs.push_back(std::move(attr));
+    while (!atEnd()) {
+        // import
+        if (checkKw(KeywordID::Import)) {
+            auto imp = std::make_unique<ImportDecl>();
+            advance();
+            if (check(TokenKind::TK_Identifier)) { imp->moduleName = cur().text; advance(); }
+            if (checkPunct(PunctuatorID::Semicolon)) advance();
+            decls.push_back(std::move(imp));
             continue;
         }
-        break;
+        // top-level statements (e.g. do/catch blocks, control-flow, throw)
+        if (checkKw(KeywordID::Do) || checkKw(KeywordID::Return) ||
+            checkKw(KeywordID::If) || checkKw(KeywordID::Guard) ||
+            checkKw(KeywordID::While) || checkKw(KeywordID::Repeat) ||
+            checkKw(KeywordID::For) || checkKw(KeywordID::Switch) ||
+            checkKw(KeywordID::Break) || checkKw(KeywordID::Continue) ||
+            checkKw(KeywordID::Defer) || checkKw(KeywordID::Throw) ||
+            checkKw(KeywordID::Unsafe) || checkKw(KeywordID::Select)) {
+            NodePtr s = parseStatement();
+            if (s) decls.push_back(std::move(s));
+            else synchronize();
+            continue;
+        }
+        NodePtr d = parseDecl();
+        if (d) decls.push_back(std::move(d));
+        else synchronize();
+    }
+    return decls;
+}
+
+// ─── declarations ──────────────────────────────────────────────────────────────
+NodePtr Parser::parseDecl() {
+    std::vector<std::string> attrs;
+    while (checkPunct(PunctuatorID::At)) {
+        advance();
+        if (check(TokenKind::TK_Identifier)) attrs.push_back(cur().text);
+        advance();
+        if (checkPunct(PunctuatorID::LParen)) {
+            // @attr(...) — skip contents
+            int depth = 0;
+            do {
+                if (checkPunct(PunctuatorID::LParen)) ++depth;
+                else if (checkPunct(PunctuatorID::RParen)) --depth;
+                advance();
+            } while (!atEnd() && depth > 0);
+        }
     }
 
-    DeclPtr decl;
-
-    // 检查是否是宏声明 / Check if this is a macro declaration
-    bool isMacro = false;
-    MacroKind macroKind = MacroKind::Freestanding;
-    for (const auto& attr : attrs) {
-        if (attr.name == "macro") { isMacro = true; break; }
-    }
-    for (const auto& attr : attrs) {
-        if (attr.name == "freestanding") { macroKind = MacroKind::Freestanding; break; }
-        if (attr.name == "attached") { macroKind = MacroKind::Attached; break; }
-    }
-
-    if (isMacro) {
-        decl = parseMacroDecl(macroKind);
-    } else switch (peek().kind) {
-        case TokenKind::KwModule:    decl = parseModuleDecl(); break;
-        case TokenKind::KwImport:    decl = parseImportDecl(); break;
-        case TokenKind::KwLet:
-        case TokenKind::KwVar:       decl = parseVariableDecl(); break;
-        case TokenKind::KwFunc:      decl = parseFunctionDecl(); break;
-        case TokenKind::KwStruct:    decl = parseStructDecl(); break;
-        case TokenKind::KwClass:     decl = parseClassDecl(); break;
-        case TokenKind::KwEnum:      decl = parseEnumDecl(); break;
-        case TokenKind::KwProtocol:  decl = parseProtocolDecl(); break;
-        case TokenKind::KwActor:     decl = parseActorDecl(); break;
-        case TokenKind::KwExtension: decl = parseExtensionDecl(); break;
-        case TokenKind::KwTypealias: decl = parseTypealiasDecl(); break;
-        case TokenKind::KwAssociatedtype: decl = parseAssociatedTypeDecl(); break;
-        case TokenKind::KwInit:      decl = parseInitDecl(); break;
-        case TokenKind::KwDeinit:    decl = parseDeinitDecl(); break;
-        case TokenKind::KwSubscript: decl = parseSubscriptDecl(); break;
-
-        // Control flow
-        case TokenKind::KwIf:        decl = parseIfDecl(); break;
-        case TokenKind::KwGuard:     decl = parseGuardDecl(); break;
-        case TokenKind::KwSwitch:    decl = parseSwitchDecl(); break;
-        case TokenKind::KwFor:       decl = parseForInDecl(); break;
-        case TokenKind::KwWhile:     decl = parseWhileDecl(); break;
-        case TokenKind::KwRepeat:    decl = parseRepeatWhileDecl(); break;
-        case TokenKind::KwDo:        decl = parseDoCatchDecl(); break;
-        case TokenKind::KwSelect:    decl = parseSelectDecl(); break;
-        case TokenKind::KwUnsafe:    decl = parseUnsafeDecl(); break;
-        case TokenKind::KwAsm:       decl = parseAsmDecl(); break;
-        case TokenKind::KwExtern:    decl = parseExternDecl(); break;
-
-        default: {
-            // Try to parse as expression statement
-            ExprPtr expr = parseExpression();
-            if (expr) {
-                auto stmt = makeNode<ExpressionStmt>();
-                stmt->expression = std::move(expr);
-                // 顶层不允许裸表达式，必须是声明
-                // Bare expressions are not allowed at top level, must be declarations
-                error("unexpected expression at top level");
-            } else {
-                error("expected declaration");
-                advance(); // skip unknown token
+    auto attach = [&](NodePtr n) {
+        if (n) {
+            n->attributes = attrs;
+            if (!attrs.empty() && !cur().docComment.empty()) {
+                // doc comment belongs to the previous token; attach via attribute handling
             }
-            return nullptr;
+        }
+        return n;
+    };
+
+    std::vector<std::string> modifiers = parseModifiers();
+
+    if (checkKw(KeywordID::Func)) return attach(parseFunctionDecl(modifiers));
+    if (checkKw(KeywordID::Init)) return attach(parseInitializerDecl(modifiers));
+    if (checkKw(KeywordID::Deinit)) return attach(parseDeinitializerDecl());
+    if (checkKw(KeywordID::Subscript)) return attach(parseSubscriptDecl(modifiers));
+    if (checkKw(KeywordID::Struct))   return attach(parseTypeDecl(NodeKind::StructDecl, modifiers));
+    if (checkKw(KeywordID::Enum))     return attach(parseTypeDecl(NodeKind::EnumDecl, modifiers));
+    if (checkKw(KeywordID::Class))    return attach(parseTypeDecl(NodeKind::ClassDecl, modifiers));
+    if (checkKw(KeywordID::Actor))    return attach(parseTypeDecl(NodeKind::ActorDecl, modifiers));
+    if (checkKw(KeywordID::Protocol)) return attach(parseTypeDecl(NodeKind::ProtocolDecl, modifiers));
+    if (checkKw(KeywordID::Extension))return attach(parseTypeDecl(NodeKind::ExtensionDecl, modifiers));
+    if (checkKw(KeywordID::Typealias))return attach(parseTypealiasDecl());
+    if (checkKw(KeywordID::Associatedtype)) return attach(parseAssociatedTypeDecl());
+    if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+        bool isLet = checkKw(KeywordID::Let);
+        return attach(parseVarDecl(isLet, modifiers, /*member=*/false));
+    }
+
+    errorAt(cur(), "unexpected token at top level");
+    advance();
+    return nullptr;
+}
+
+std::vector<std::string> Parser::parseModifiers() {
+    std::vector<std::string> mods;
+    static const KeywordID modKw[] = {
+        KeywordID::Public, KeywordID::Private, KeywordID::Internal,
+        KeywordID::Fileprivate, KeywordID::Open, KeywordID::Static,
+        KeywordID::Final, KeywordID::Override, KeywordID::Required,
+        KeywordID::Convenience, KeywordID::Lazy, KeywordID::Mutating,
+        KeywordID::Nonmutating, KeywordID::Async, KeywordID::Foreign,
+        KeywordID::Extern, KeywordID::Weak, KeywordID::Inout,
+    };
+    bool again = true;
+    while (again) {
+        again = false;
+        for (KeywordID k : modKw) {
+            if (checkKw(k)) { mods.push_back(keywordToString(k)); advance(); again = true; break; }
         }
     }
+    return mods;
+}
 
-    if (decl) {
-        decl->access = access;
-        decl->isStatic = isStatic;
-        decl->isOverride = isOverride;
-        decl->isMutating = isMutating;
-        decl->isFinal = isFinal;
-        decl->attributes = std::move(attrs);
-
-        // 传播 convenience/required 到 InitDecl
-        if (decl->declKind == DeclKind::Init) {
-            auto& initDecl = static_cast<InitDecl&>(*decl);
-            initDecl.isConvenience = isConvenience;
-            initDecl.isRequired = isRequired;
+NodePtr Parser::parseFunctionDecl(std::vector<std::string> modifiers) {
+    auto fn = std::make_unique<FunctionDecl>();
+    fn->modifiers = modifiers;
+    advance(); // consume func
+    // `get`/`set` are contextual keywords (property accessors). A function may
+    // legitimately be named `get`, so accept the keyword when a parameter
+    // list follows.
+    if (check(TokenKind::TK_Identifier) ||
+        ((checkKw(KeywordID::Get) || checkKw(KeywordID::Set)) &&
+         peek(1).kind == TokenKind::TK_Punctuator && peek(1).punct == PunctuatorID::LParen)) {
+        fn->name = cur().text;
+        advance();
+    }
+    if (checkPunct(PunctuatorID::Less)) fn->genericParams = parseGenericParamNames();
+    fn->params = parseParameterList();
+    // `async` / `throws` / `rethrows` and `-> RetType` may appear in any order
+    while (true) {
+        if (matchPunct(PunctuatorID::Arrow)) {
+            fn->returnType = parseType();
+        } else if (matchKw(KeywordID::Throws) || matchKw(KeywordID::Rethrows)) {
+            fn->isThrows = true;
+        } else if (matchKw(KeywordID::Async)) {
+            fn->isAsync = true;
+        } else {
+            break;
         }
     }
-    return decl;
-}
-
-// ─── Module / Import ──────────────────────────────────────────────────────
-
-DeclPtr Parser::parseModuleDecl() {
-    expect(TokenKind::KwModule);
-    auto decl = makeNode<ModuleDecl>();
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected module name");
+    if (std::find(modifiers.begin(), modifiers.end(), "async") != modifiers.end()) fn->isAsync = true;
+    if (std::find(modifiers.begin(), modifiers.end(), "mutating") != modifiers.end()) fn->isMutating = true;
+    if (std::find(modifiers.begin(), modifiers.end(), "foreign") != modifiers.end() ||
+        std::find(modifiers.begin(), modifiers.end(), "extern") != modifiers.end()) {
+        fn->isForeign = true;
     }
-    // module 声明后的分号是允许的
-    match(TokenKind::Semicolon);
-    return decl;
-}
-
-DeclPtr Parser::parseImportDecl() {
-    expect(TokenKind::KwImport);
-    auto decl = makeNode<ImportDecl>();
-    if (check(TokenKind::Identifier)) {
-        decl->moduleName = std::string(advance().stringValue);
-    } else {
-        error("expected module name after 'import'");
+    if (fn->isForeign) {
+        if (checkPunct(PunctuatorID::Semicolon)) advance();
+        return fn;
     }
-    // import 声明后的分号是允许的
-    match(TokenKind::Semicolon);
-    return decl;
+    if (checkPunct(PunctuatorID::LBrace)) {
+        fn->body = parseBlockStatements();
+    } else if (checkPunct(PunctuatorID::Semicolon)) {
+        advance();
+    }
+    // else: declaration only (protocol method / foreign) — body stays empty
+    return fn;
 }
 
-// ─── Variable declaration ─────────────────────────────────────────────────
-
-DeclPtr Parser::parseVariableDecl() {
-    bool isLet = peek().is(TokenKind::KwLet);
-    advance(); // consume let/var
-
-    // Parse first variable name
-    // Allow keywords like 'set', 'get' as variable names (context-sensitive)
+std::vector<std::string> Parser::parseGenericParamNames() {
     std::vector<std::string> names;
-    if (check(TokenKind::Identifier)) {
-        names.push_back(std::string(advance().stringValue));
-    } else if (check(TokenKind::KwSet) || check(TokenKind::KwGet)) {
-        names.push_back(std::string(advance().stringValue));
-    } else if (match(TokenKind::Underscore)) {
-        names.push_back("_");
-    } else {
-        error("expected variable name");
+    expectPunct(PunctuatorID::Less, "expected '<'");
+    while (!atEnd() && !checkPunct(PunctuatorID::Greater)) {
+        if (check(TokenKind::TK_Identifier)) { names.push_back(cur().text); advance(); }
+        else break;
+        if (matchPunct(PunctuatorID::Colon)) { parseType(); } // discard constraint
+        if (!matchPunct(PunctuatorID::Comma)) break;
     }
+    expectPunct(PunctuatorID::Greater, "expected '>'");
+    return names;
+}
 
-    // Check for multi-variable declaration: var x, y, z: Type
-    while (match(TokenKind::Comma)) {
-        if (check(TokenKind::Identifier)) {
-            names.push_back(std::string(advance().stringValue));
-        } else if (match(TokenKind::Underscore)) {
-            names.push_back("_");
-        } else {
-            error("expected variable name after ','");
+std::vector<Param> Parser::parseParameterList() {
+    std::vector<Param> params;
+    expectPunct(PunctuatorID::LParen, "expected '('");
+    if (checkPunct(PunctuatorID::RParen)) { advance(); return params; }
+    while (!atEnd()) {
+        Param p;
+        if (matchKw(KeywordID::Inout)) p.isInout = true;
+        if (check(TokenKind::TK_Identifier) && cur().text == "_") {
+            advance(); p.externalName = "";
+        } else if (check(TokenKind::TK_Identifier)) {
+            p.externalName = cur().text; advance();
+        } else { errorAt(cur(), "expected parameter name"); break; }
+        if (check(TokenKind::TK_Identifier)) { p.internalName = cur().text; advance(); }
+        else p.internalName = p.externalName;
+        expectPunct(PunctuatorID::Colon, "expected ':' in parameter");
+        p.type = parseType();
+        if (matchPunct(PunctuatorID::DotDot)) p.isVariadic = true; // `T...`
+        if (matchPunct(PunctuatorID::Equal)) p.defaultValue = parseExpr();
+        params.push_back(std::move(p));
+        if (!matchPunct(PunctuatorID::Comma)) break;
+    }
+    expectPunct(PunctuatorID::RParen, "expected ')'");
+    return params;
+}
+
+NodePtr Parser::parseInitializerDecl(std::vector<std::string> modifiers) {
+    auto init = std::make_unique<InitDecl>();
+    init->modifiers = modifiers;
+    advance(); // init
+    if (std::find(modifiers.begin(), modifiers.end(), "convenience") != modifiers.end())
+        init->isConvenience = true;
+    if (std::find(modifiers.begin(), modifiers.end(), "required") != modifiers.end())
+        init->isRequired = true;
+    init->params = parseParameterList();
+    init->body = parseBlockStatements();
+    return init;
+}
+
+NodePtr Parser::parseDeinitializerDecl() {
+    auto de = std::make_unique<DeinitDecl>();
+    advance(); // deinit
+    // A destructor takes no parameters, so the empty parens are optional:
+    // accept both `deinit { ... }` and `deinit() { ... }`.
+    if (checkPunct(PunctuatorID::LParen)) {
+        advance();
+        expectPunct(PunctuatorID::RParen, "expected ')'");
+    }
+    de->body = parseBlockStatements();
+    return de;
+}
+
+NodePtr Parser::parseSubscriptDecl(std::vector<std::string> modifiers) {
+    (void)modifiers;
+    auto sub = std::make_unique<SubscriptDecl>();
+    advance(); // subscript
+    sub->params = parseParameterList();
+    expectPunct(PunctuatorID::Arrow, "expected '->'");
+    sub->elementType = parseType();
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    // getter/setter
+    while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        if (matchKw(KeywordID::Get)) {
+            sub->getter = parseBlockStatements();
+        } else if (matchKw(KeywordID::Set)) {
+            sub->setter = parseBlockStatements();
+        } else { errorAt(cur(), "expected getter or setter"); advance(); }
+    }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return sub;
+}
+
+NodePtr Parser::parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers) {
+    auto decl = std::make_unique<StructDecl>(); // placeholder; retyped below
+    NodePtr node;
+    switch (kind) {
+        case NodeKind::StructDecl:    node = std::make_unique<StructDecl>(); break;
+        case NodeKind::EnumDecl:      node = std::make_unique<EnumDecl>(); break;
+        case NodeKind::ClassDecl:     node = std::make_unique<ClassDecl>(); break;
+        case NodeKind::ActorDecl:     node = std::make_unique<ActorDecl>(); break;
+        case NodeKind::ProtocolDecl:  node = std::make_unique<ProtocolDecl>(); break;
+        case NodeKind::ExtensionDecl:  node = std::make_unique<ExtensionDecl>(); break;
+        default: node = std::make_unique<StructDecl>(); break;
+    }
+    (void)decl;
+    auto* td = static_cast<TypeDecl*>(node.get());
+    td->modifiers = modifiers;
+    advance(); // struct/enum/...
+    if (check(TokenKind::TK_Identifier)) { td->name = cur().text; advance(); }
+    if (checkPunct(PunctuatorID::Less)) td->genericParams = parseGenericParamNames();
+    if (matchPunct(PunctuatorID::Colon)) td->inherited = parseInheritedTypes();
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        // member declarations
+        std::vector<std::string> memberAttrs;
+        while (checkPunct(PunctuatorID::At)) {
+            advance();
+            if (check(TokenKind::TK_Identifier)) memberAttrs.push_back(cur().text);
+            advance();
         }
-    }
-
-    // Shared type annotation
-    TypeReprPtr sharedType;
-    if (match(TokenKind::Colon)) {
-        sharedType = parseType();
-    }
-
-    // Shared initializer
-    ExprPtr sharedInit;
-    if (match(TokenKind::Assign)) {
-        sharedInit = parseExpression();
-    }
-
-    // Property accessors or computed property getter:
-    // { get }, { get set } (protocol requirements)
-    // { return expr } (computed property getter body)
-    // Only check if no '=' was found AND no type annotation with initializer
-    std::vector<StmtPtr> getterBody;
-    std::vector<StmtPtr> setterBody;
-    if (!sharedInit && check(TokenKind::LBrace)) {
-        if (peekAt(1).is(TokenKind::KwGet) || peekAt(1).is(TokenKind::KwSet)) {
-            // Accessor block: { get { ... } set { ... } }
-            advance(); // {
-            while (!check(TokenKind::RBrace) && !isAtEnd()) {
-                if (match(TokenKind::KwGet)) {
-                    getterBody = parseBlock();
-                } else if (match(TokenKind::KwSet)) {
-                    setterBody = parseBlock();
-                } else {
-                    advance(); // skip unknown
-                }
+        std::vector<std::string> mmods = parseModifiers();
+        if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+            bool isLet = checkKw(KeywordID::Let);
+            NodePtr v = parseVarDecl(isLet, mmods, /*member=*/true);
+            if (v) {
+                v->attributes = memberAttrs;
+                td->members.push_back(std::move(v));
             }
-            match(TokenKind::RBrace); // }
+        } else if (checkKw(KeywordID::Func)) {
+            NodePtr f = parseFunctionDecl(mmods);
+            if (f) { f->attributes = memberAttrs; td->members.push_back(std::move(f)); }
+        } else if (checkKw(KeywordID::Init)) {
+            NodePtr i = parseInitializerDecl(mmods);
+            if (i) td->members.push_back(std::move(i));
+        } else if (checkKw(KeywordID::Deinit)) {
+            NodePtr d = parseDeinitializerDecl();
+            if (d) td->members.push_back(std::move(d));
+        } else if (checkKw(KeywordID::Subscript)) {
+            NodePtr s = parseSubscriptDecl(mmods);
+            if (s) td->members.push_back(std::move(s));
+        } else if (checkKw(KeywordID::Typealias)) {
+            NodePtr t = parseTypealiasDecl();
+            if (t) td->members.push_back(std::move(t));
+        } else if (checkKw(KeywordID::Associatedtype)) {
+            NodePtr a = parseAssociatedTypeDecl();
+            if (a) td->members.push_back(std::move(a));
+        } else if (checkKw(KeywordID::Case)) {
+            // enum case (only valid inside enum)
+            NodePtr c = parseEnumCase();
+            if (c) td->members.push_back(std::move(c));
         } else {
-            // Computed property getter body: { statements }
-            getterBody = parseBlock();
+            errorAt(cur(), "unexpected member declaration");
+            advance();
         }
     }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return node;
+}
 
-    // Create the first VariableDecl (returned as primary)
-    auto primary = makeNode<VariableDecl>();
-    primary->isLet = isLet;
-    auto pat = makeNode<IdentifierPattern>();
-    pat->name = names[0];
-    pat->isLet = isLet;
-    primary->pattern = std::move(pat);
-    primary->typeAnnotation = std::move(sharedType);
-    primary->initializer = std::move(sharedInit);
-    primary->getterBody = std::move(getterBody);
-    primary->setterBody = std::move(setterBody);
-
-    // Create additional VariableDecls for remaining names (same type/init)
-    multiDecls_.clear();
-    for (size_t i = 1; i < names.size(); i++) {
-        auto extra = makeNode<VariableDecl>();
-        extra->isLet = isLet;
-        auto extraPat = makeNode<IdentifierPattern>();
-        extraPat->name = names[i];
-        extraPat->isLet = isLet;
-        extra->pattern = std::move(extraPat);
-        multiDecls_.push_back(std::move(extra));
+NodePtr Parser::parseEnumCase() {
+    auto c = std::make_unique<EnumCaseDecl>();
+    advance(); // case
+    if (check(TokenKind::TK_Identifier)) { c->name = cur().text; advance(); }
+    if (matchPunct(PunctuatorID::LParen)) {
+        c->hasAssociated = true;
+        if (!checkPunct(PunctuatorID::RParen)) {
+            while (!atEnd()) {
+                // associated value: either `Type` or `label: Type`
+                std::string label;
+                if (check(TokenKind::TK_Identifier) && peek(1).kind == TokenKind::TK_Punctuator && peek(1).punct == PunctuatorID::Colon) {
+                    label = cur().text; advance(); advance(); // consume ':'
+                }
+                NodePtr ty = parseType();
+                c->associatedTypes.push_back(std::move(ty));
+                (void)label;
+                if (!matchPunct(PunctuatorID::Comma)) break;
+            }
+        }
+        expectPunct(PunctuatorID::RParen, "expected ')'");
     }
+    return c;
+}
 
-    // 解析 willSet/didSet 属性观察器 / Parse willSet/didSet property observers
-    if (check(TokenKind::LBrace)) {
-        // 检查是否是 willSet/didSet（而不是计算属性）
-        if (peekAt(1).is(TokenKind::KwWillSet) || peekAt(1).is(TokenKind::KwDidSet)) {
-            advance(); // {
-            while (!check(TokenKind::RBrace) && !isAtEnd()) {
-                if (match(TokenKind::KwWillSet)) {
-                    primary->hasWillSet = true;
-                    // 可选参数名: willSet(newX) { ... }
-                    if (check(TokenKind::LParen)) {
-                        advance(); // (
-                        if (check(TokenKind::Identifier)) advance(); // 参数名
-                        expect(TokenKind::RParen);
-                    }
-                    primary->willSetBody = parseBlock();
-                } else if (match(TokenKind::KwDidSet)) {
-                    primary->hasDidSet = true;
-                    // 可选参数名: didSet(oldX) { ... }
-                    if (check(TokenKind::LParen)) {
-                        advance(); // (
-                        if (check(TokenKind::Identifier)) advance(); // 参数名
-                        expect(TokenKind::RParen);
-                    }
-                    primary->didSetBody = parseBlock();
-                } else {
-                    error("expected 'willSet' or 'didSet' in property observer block");
+NodePtr Parser::parseTypealiasDecl() {
+    auto t = std::make_unique<TypealiasDecl>();
+    advance(); // typealias
+    if (check(TokenKind::TK_Identifier)) { t->name = cur().text; advance(); }
+    if (checkPunct(PunctuatorID::Less)) t->genericParams = parseGenericParamNames();
+    expectPunct(PunctuatorID::Equal, "expected '='");
+    t->underlying = parseType();
+    if (checkPunct(PunctuatorID::Semicolon)) advance();
+    return t;
+}
+
+NodePtr Parser::parseAssociatedTypeDecl() {
+    auto a = std::make_unique<AssociatedTypeDecl>();
+    advance(); // associatedtype
+    if (check(TokenKind::TK_Identifier)) { a->name = cur().text; advance(); }
+    if (matchPunct(PunctuatorID::Colon)) a->inherited = parseInheritedTypes();
+    if (matchPunct(PunctuatorID::Equal)) a->defaultType = parseType();
+    return a;
+}
+
+// Parse the body of a computed property:
+//
+//     var total: Int { self.x + self.y }        // implicit getter
+//     var total: Int { get { ... } set { ... } }
+//     var x: Int = 0 { willSet { ... } didSet { ... } }
+//
+// Explicit accessors are returned as AccessorDecl nodes so each keeps its kind;
+// statements written directly in the braces form an implicit getter.
+std::vector<NodePtr> Parser::parseAccessors() {
+    std::vector<NodePtr> accessors;
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        AccessorDecl::Kind kind;
+        bool explicitKind = true;
+        if (checkKw(KeywordID::Get)) kind = AccessorDecl::Kind::Getter;
+        else if (checkKw(KeywordID::Set)) kind = AccessorDecl::Kind::Setter;
+        else if (checkKw(KeywordID::WillSet)) kind = AccessorDecl::Kind::WillSet;
+        else if (checkKw(KeywordID::DidSet)) kind = AccessorDecl::Kind::DidSet;
+        else { kind = AccessorDecl::Kind::Getter; explicitKind = false; }
+
+        if (explicitKind) {
+            advance(); // get / set / willSet / didSet
+            auto acc = std::make_unique<AccessorDecl>();
+            acc->kind = kind;
+            // A setter (and the observers) may name their value parameter:
+            // `set(newValue) { ... }`.
+            if (checkPunct(PunctuatorID::LParen)) {
+                advance();
+                if (check(TokenKind::TK_Identifier)) {
+                    acc->valueParam = cur().text;
+                    advance();
+                }
+                expectPunct(PunctuatorID::RParen, "expected ')'");
+            }
+            if (checkPunct(PunctuatorID::LBrace))
+                acc->body = parseBlockStatements();
+            accessors.push_back(std::move(acc));
+            continue;
+        }
+        // Statements written directly in the braces: an implicit getter.
+        auto acc = std::make_unique<AccessorDecl>();
+        acc->kind = AccessorDecl::Kind::Getter;
+        NodePtr st = parseStatement();
+        if (st) acc->body.push_back(std::move(st));
+        else synchronize();
+        accessors.push_back(std::move(acc));
+    }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return accessors;
+}
+
+NodePtr Parser::parseVarDecl(bool isLet, std::vector<std::string> modifiers, bool member) {
+    auto first = std::make_unique<VarDecl>();
+    first->isLet = isLet;
+    first->modifiers = modifiers;
+    if (std::find(modifiers.begin(), modifiers.end(), "weak") != modifiers.end())
+        first->isWeak = true;
+    // `unowned` is an ordinary identifier lexically (it is a common local name),
+    // so it is recognised as a contextual modifier here.
+    if (std::find(modifiers.begin(), modifiers.end(), "unowned") != modifiers.end())
+        first->isUnowned = true;
+    advance(); // let/var
+    if (check(TokenKind::TK_Identifier)) { first->name = cur().text; advance(); }
+    if (matchPunct(PunctuatorID::Colon)) first->type = parseType();
+    if (matchPunct(PunctuatorID::Equal)) {
+        // Suppress a trailing closure on the initialiser so that a `{`
+        // immediately after it is recognised as an accessor block.
+        ++suppressTrailingClosure_;
+        first->initializer = parseExpr();
+        --suppressTrailingClosure_;
+    }
+    // A `{` right after a *property declaration* is a computed-property body or
+    // an observer block. In an ordinary local binding the brace belongs to the
+    // enclosing statement, so only a member declaration takes it.
+    if (member && checkPunct(PunctuatorID::LBrace))
+        first->accessors = parseAccessors();
+    if (checkPunct(PunctuatorID::Semicolon)) advance();
+
+    if (!checkPunct(PunctuatorID::Comma)) return first;
+
+    // multiple bindings: collect into a BlockStmt
+    auto block = std::make_unique<BlockStmt>();
+    block->statements.push_back(std::move(first));
+    while (matchPunct(PunctuatorID::Comma)) {
+        auto v = std::make_unique<VarDecl>();
+        v->isLet = isLet;
+        if (check(TokenKind::TK_Identifier)) { v->name = cur().text; advance(); }
+        if (matchPunct(PunctuatorID::Colon)) v->type = parseType();
+        if (matchPunct(PunctuatorID::Equal)) {
+            // A literal initialiser can never take a trailing closure, so a `{`
+            // right after it is an accessor block (`var x: Int = 0 { didSet { } }`).
+            // Any other initialiser keeps the brace for the expression parser.
+            // Only true literals qualify: an identifier may be a call taking a
+            // trailing closure (`Task { ... }`), which must keep its brace.
+            bool lit = check(TokenKind::TK_IntLiteral) ||
+                       check(TokenKind::TK_FloatLiteral) ||
+                       check(TokenKind::TK_StringLiteral) ||
+                       check(TokenKind::TK_StringFragment) ||
+                       check(TokenKind::TK_CharLiteral);
+            if (lit) ++suppressTrailingClosure_;
+            v->initializer = parseExpr();
+            if (lit) --suppressTrailingClosure_;
+        }
+        // Only a property declaration takes a following brace as accessors.
+        if (member && checkPunct(PunctuatorID::LBrace))
+            v->accessors = parseAccessors();
+        block->statements.push_back(std::move(v));
+        if (checkPunct(PunctuatorID::Semicolon)) advance();
+    }
+    return block;
+}
+
+NodeList Parser::parseInheritedTypes() {
+    NodeList list;
+    while (!atEnd()) {
+        list.push_back(parseType());
+        if (!matchPunct(PunctuatorID::Comma)) break;
+    }
+    return list;
+}
+
+// ─── statements ───────────────────────────────────────────────────────────────
+NodePtr Parser::parseStatement() {
+    if (checkKw(KeywordID::Return)) return parseReturnStmt();
+    if (checkKw(KeywordID::If)) return parseIfStmt();
+    if (checkKw(KeywordID::Guard)) return parseGuardStmt();
+    if (checkKw(KeywordID::While)) return parseWhileStmt();
+    if (checkKw(KeywordID::Repeat)) return parseRepeatStmt();
+    if (checkKw(KeywordID::For)) return parseForInStmt();
+    if (checkKw(KeywordID::Switch)) return parseSwitchStmt();
+    if (checkKw(KeywordID::Break)) { advance(); auto b=std::make_unique<BreakStmt>(); if(check(TokenKind::TK_Identifier)){b->label=cur().text;advance();} if(checkPunct(PunctuatorID::Semicolon))advance(); return b; }
+    if (checkKw(KeywordID::Continue)) { advance(); auto c=std::make_unique<ContinueStmt>(); if(check(TokenKind::TK_Identifier)){c->label=cur().text;advance();} if(checkPunct(PunctuatorID::Semicolon))advance(); return c; }
+    if (checkKw(KeywordID::Defer)) return parseDeferStmt();
+    if (checkKw(KeywordID::Do)) return parseDoStmt();
+    if (checkKw(KeywordID::Throw)) return parseThrowStmt();
+    if (checkKw(KeywordID::Unsafe)) return parseUnsafeStmt();
+    if (checkKw(KeywordID::Select)) return parseSelectStmt();
+    if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+        bool isLet = checkKw(KeywordID::Let);
+        return parseVarDecl(isLet, /*modifiers=*/{}, /*member=*/false);
+    }
+    // expression statement
+    auto e = std::make_unique<ExprStmt>();
+    e->expr = parseExpr();
+    if (checkPunct(PunctuatorID::Semicolon)) advance();
+    return e;
+}
+
+NodePtr Parser::parseBlock() {
+    auto b = std::make_unique<BlockStmt>();
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        // 兜底：任何一条语句都必须推进 token 流。若某个 token 让语句解析器
+        // 无所消耗（例如后缀链缺少终止分支），这里会强制前进并报错，
+        // 把"挂死"降级为"一条诊断 + 跳过该 token"。
+        size_t before = pos_;
+        NodePtr s = parseStatement();
+        if (pos_ == before) {
+            errorAt(cur(), "无法解析的 token，已跳过");
+            advance();
+            continue;
+        }
+        if (s) b->statements.push_back(std::move(s));
+        else synchronize();
+    }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return b;
+}
+
+NodeList Parser::parseBlockStatements() {
+    auto b = parseBlock();
+    return std::move(static_cast<BlockStmt*>(b.get())->statements);
+}
+
+NodePtr Parser::parseReturnStmt() {
+    auto r = std::make_unique<ReturnStmt>();
+    advance(); // return
+    if (!checkPunct(PunctuatorID::Semicolon) && !checkPunct(PunctuatorID::RBrace) &&
+        !checkKw(KeywordID::Else) && !atEnd()) {
+        r->value = parseExpr();
+    }
+    if (checkPunct(PunctuatorID::Semicolon)) advance();
+    return r;
+}
+
+NodePtr Parser::parseIfStmt() {
+    auto ifs = std::make_unique<IfStmt>();
+    advance(); // if
+    // optional condition in parens
+    if (checkPunct(PunctuatorID::LParen)) { advance(); ifs->condition = parseCondition(); expectPunct(PunctuatorID::RParen, "expected ')'"); }
+    else ifs->condition = parseCondition();
+    ifs->thenBody = parseBlockStatements();
+    if (matchKw(KeywordID::Else)) {
+        if (checkKw(KeywordID::If)) ifs->elseBranch = parseIfStmt();
+        else ifs->elseBranch = parseBlock();
+    }
+    return ifs;
+}
+
+NodePtr Parser::parseGuardStmt() {
+    auto g = std::make_unique<GuardStmt>();
+    advance(); // guard
+    if (checkPunct(PunctuatorID::LParen)) { advance(); g->condition = parseCondition(); expectPunct(PunctuatorID::RParen, "expected ')'"); }
+    else g->condition = parseCondition();
+    expectKw(KeywordID::Else, "expected 'else'");
+    g->elseBody = parseBlockStatements();
+    return g;
+}
+
+NodePtr Parser::parseWhileStmt() {
+    auto w = std::make_unique<WhileStmt>();
+    advance(); // while
+    if (checkPunct(PunctuatorID::LParen)) { advance(); w->condition = parseCondition(); expectPunct(PunctuatorID::RParen, "expected ')'"); }
+    else w->condition = parseCondition();
+    w->body = parseBlockStatements();
+    return w;
+}
+
+NodePtr Parser::parseRepeatStmt() {
+    auto r = std::make_unique<RepeatWhileStmt>();
+    advance(); // repeat
+    r->body = parseBlockStatements();
+    expectKw(KeywordID::While, "expected 'while'");
+    if (checkPunct(PunctuatorID::LParen)) { advance(); r->condition = parseExpr(); expectPunct(PunctuatorID::RParen, "expected ')'"); }
+    else r->condition = parseExpr();
+    return r;
+}
+
+NodePtr Parser::parseForInStmt() {
+    auto f = std::make_unique<ForInStmt>();
+    advance(); // for
+    if (matchKw(KeywordID::Await)) f->isAsync = true;
+    // pattern: `let x` / `var x` / bare `x` (implicitly a `let`) / tuple `(k, v)`
+    if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+        f->pattern = parseVarDecl(checkKw(KeywordID::Let), {}, /*member=*/false);
+    } else if (checkPunct(PunctuatorID::LParen)) {
+        auto tup = std::make_unique<TupleExpr>();
+        advance(); // (
+        while (!checkPunct(PunctuatorID::RParen) && !atEnd()) {
+            if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+                tup->elements.push_back(
+                    parseVarDecl(checkKw(KeywordID::Let), {}, /*member=*/false));
+            } else if (check(TokenKind::TK_Identifier)) {
+                auto id = std::make_unique<IdentExpr>();
+                id->name = cur().text; id->range = SourceRange{cur().loc, cur().loc};
+                advance();
+                tup->elements.push_back(std::move(id));
+            } else {
+                errorAt(cur(), "expected binding pattern in tuple");
+                break;
+            }
+            if (!matchPunct(PunctuatorID::Comma)) break;
+        }
+        expectPunct(PunctuatorID::RParen, "expected ')'");
+        f->pattern = std::move(tup);
+    } else {
+        auto v = std::make_unique<VarDecl>();
+        v->isLet = true;
+        if (check(TokenKind::TK_Identifier)) { v->name = cur().text; advance(); }
+        if (matchPunct(PunctuatorID::Colon)) v->type = parseType();
+        f->pattern = std::move(v);
+    }
+    expectKw(KeywordID::In, "expected 'in'");
+    f->sequence = parseExprNoTrailingClosure();
+    f->body = parseBlockStatements();
+    return f;
+}
+
+// Parse a condition that may be a binding pattern (`let x = expr`) or an expression.
+NodePtr Parser::parseCondition() {
+    // A `{` after the condition opens the statement block, not a trailing closure.
+    ++suppressTrailingClosure_;
+    NodePtr result;
+    if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) {
+        bool isLet = checkKw(KeywordID::Let);
+        result = parseVarDecl(isLet, {}, /*member=*/false);
+    } else {
+        result = parseExpr();
+    }
+    --suppressTrailingClosure_;
+    return result;
+}
+
+NodePtr Parser::parseSwitchStmt() {
+    auto s = std::make_unique<SwitchStmt>();
+    advance(); // switch
+    if (checkPunct(PunctuatorID::LParen)) { advance(); s->subject = parseExprNoTrailingClosure(); expectPunct(PunctuatorID::RParen, "expected ')'"); }
+    else s->subject = parseExprNoTrailingClosure();
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        auto c = std::make_unique<CaseClause>();
+        if (matchKw(KeywordID::Default)) {
+            c->isDefault = true;
+        } else {
+            expectKw(KeywordID::Case, "expected 'case'");
+            c->pattern = parseCasePatternExpr(c->bindings);
+            // `case 1, 2, 3:` — additional patterns for the same arm. They are
+            // alternatives, so any of them selects this body.
+            while (matchPunct(PunctuatorID::Comma)) {
+                auto alt = std::make_unique<CaseClause>();
+                alt->bindings = c->bindings;
+                alt->pattern = parseCasePatternExpr(alt->bindings);
+                c->alternatives.push_back(std::move(alt));
+            }
+            if (matchKw(KeywordID::Where)) c->whereExpr = parseExpr();
+        }
+        expectPunct(PunctuatorID::Colon, "expected ':'");
+        // case body: statements until next case/default or '}'
+        while (!atEnd() && !checkKw(KeywordID::Case) && !checkKw(KeywordID::Default) &&
+               !checkPunct(PunctuatorID::RBrace)) {
+            NodePtr st = parseStatement();
+            if (st) c->body.push_back(std::move(st));
+            else synchronize();
+        }
+        s->cases.push_back(std::move(c));
+    }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return s;
+}
+
+NodePtr Parser::parseDeferStmt() {
+    auto d = std::make_unique<DeferStmt>();
+    advance(); // defer
+    d->body = parseStatement();
+    return d;
+}
+
+NodePtr Parser::parseThrowStmt() {
+    auto t = std::make_unique<ThrowStmt>();
+    advance(); // throw
+    t->value = parseExpr();
+    return t;
+}
+
+NodePtr Parser::parseUnsafeStmt() {
+    auto u = std::make_unique<UnsafeStmt>();
+    advance(); // unsafe
+    u->body = parseBlockStatements();
+    return u;
+}
+
+NodePtr Parser::parseSelectStmt() {
+    // `select { case <pat> <- <chan>: ... default: ... }` — structurally a
+    // SwitchStmt without a subject; each case pattern is a `<-` channel expression.
+    auto s = std::make_unique<SwitchStmt>();
+    advance(); // select
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        auto c = std::make_unique<CaseClause>();
+        if (matchKw(KeywordID::Default)) {
+            c->isDefault = true;
+        } else {
+            expectKw(KeywordID::Case, "expected 'case'");
+            c->pattern = parseCasePatternExpr(c->bindings);
+            // `case 1, 2, 3:` — additional patterns for the same arm. They are
+            // alternatives, so any of them selects this body.
+            while (matchPunct(PunctuatorID::Comma)) {
+                auto alt = std::make_unique<CaseClause>();
+                alt->bindings = c->bindings;
+                alt->pattern = parseCasePatternExpr(alt->bindings);
+                c->alternatives.push_back(std::move(alt));
+            }
+            if (matchKw(KeywordID::Where)) c->whereExpr = parseExpr();
+        }
+        expectPunct(PunctuatorID::Colon, "expected ':'");
+        while (!atEnd() && !checkKw(KeywordID::Case) && !checkKw(KeywordID::Default) &&
+               !checkPunct(PunctuatorID::RBrace)) {
+            NodePtr st = parseStatement();
+            if (st) c->body.push_back(std::move(st));
+            else synchronize();
+        }
+        s->cases.push_back(std::move(c));
+    }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return s;
+}
+
+NodePtr Parser::parseDoStmt() {
+    auto d = std::make_unique<DoStmt>();
+    advance(); // do
+    d->body = parseBlockStatements();
+    while (matchKw(KeywordID::Catch)) {
+        auto c = std::make_unique<CatchClause>();
+        // catch [let error as Type] or [pattern]
+        if (!checkPunct(PunctuatorID::LBrace)) {
+            // `catch let error as FileError` / `catch let error` / `catch let error where ...`
+            if (matchKw(KeywordID::Let) && check(TokenKind::TK_Identifier)) {
+                auto v = std::make_unique<VarDecl>();
+                v->isLet = true; v->name = cur().text; advance();
+                if (matchKw(KeywordID::As)) v->type = parseType();
+                c->pattern = std::move(v);
+            } else {
+                c->pattern = parseExpr();
+            }
+            if (matchKw(KeywordID::Where)) c->whereExpr = parseExpr();
+        }
+        c->body = parseBlockStatements();
+        d->catches.push_back(std::move(c));
+    }
+    return d;
+}
+
+// ─── expressions ───────────────────────────────────────────────────────────────
+NodePtr Parser::parseExpression() { return parseExpr(); }
+
+NodePtr Parser::parseExpr() { return parseAssignment(); }
+
+NodePtr Parser::parseExprNoTrailingClosure() {
+    ++suppressTrailingClosure_;
+    NodePtr e = parseExpr();
+    --suppressTrailingClosure_;
+    return e;
+}
+
+NodePtr Parser::parseCasePatternExpr(std::vector<std::string>& bindings) {
+    // A `(` here introduces a payload binding list (`case E.c(let x, let y)`),
+    // not a call, so call parsing is suppressed for the subject expression.
+    ++suppressCall_;
+    NodePtr subject = parseExpr();
+    --suppressCall_;
+
+    if (checkPunct(PunctuatorID::LParen)) {
+        advance(); // (
+        while (!checkPunct(PunctuatorID::RParen) && !atEnd()) {
+            // `let` / `var` markers are optional in binding patterns.
+            if (checkKw(KeywordID::Let) || checkKw(KeywordID::Var)) advance();
+            if (check(TokenKind::TK_Identifier)) {
+                bindings.push_back(cur().text);
+                advance();
+            } else {
+                errorAt(cur(), "expected binding name in case pattern");
+                break;
+            }
+            if (!matchPunct(PunctuatorID::Comma)) break;
+        }
+        expectPunct(PunctuatorID::RParen, "expected ')'");
+    }
+    return subject;
+}
+
+// Parse a conditional whose condition is already-parsed. Used for the then
+// branch of `?:`, so that a nested conditional claims its own `:`.
+NodePtr Parser::parseConditionalFromRange() {
+    NodePtr lhs = parseRange();
+    if (!checkPunct(PunctuatorID::Question)) return lhs;
+    advance();                                       // ?
+    auto t = std::make_unique<TernaryExpr>();
+    t->condition = std::move(lhs);
+    t->thenValue = parseConditionalFromRange();
+    expectPunct(PunctuatorID::Colon, "expected ':' in conditional expression");
+    t->elseValue = parseAssignment();
+    return t;
+}
+
+NodePtr Parser::parseAssignment() {
+    NodePtr lhs = parseRange();
+    // `cond ? a : b`. The then-branch is a conditional too, so nesting works;
+    // the else-branch is a full assignment, which makes it right-associative.
+    if (checkPunct(PunctuatorID::Question)) {
+        advance();                                   // ?
+        auto t = std::make_unique<TernaryExpr>();
+        t->condition = std::move(lhs);
+        t->thenValue = parseConditionalFromRange();
+        expectPunct(PunctuatorID::Colon,
+                    "expected ':' in conditional expression");
+        t->elseValue = parseAssignment();
+        return t;
+    }
+    if (checkPunct(PunctuatorID::Equal)) {
+        advance();
+        NodePtr rhs = parseAssignment(); // right associative
+        auto a = std::make_unique<AssignmentExpr>();
+        a->lhs = std::move(lhs);
+        a->rhs = std::move(rhs);
+        return a;
+    }
+    PunctuatorID compound = PunctuatorID::None;
+    if (checkPunct(PunctuatorID::PlusEqual)) compound = PunctuatorID::Plus;
+    else if (checkPunct(PunctuatorID::MinusEqual)) compound = PunctuatorID::Minus;
+    else if (checkPunct(PunctuatorID::StarEqual)) compound = PunctuatorID::Star;
+    else if (checkPunct(PunctuatorID::SlashEqual)) compound = PunctuatorID::Slash;
+    else if (checkPunct(PunctuatorID::PercentEqual)) compound = PunctuatorID::Percent;
+    if (compound != PunctuatorID::None) {
+        advance();
+        NodePtr rhs = parseAssignment(); // right associative
+        auto a = std::make_unique<AssignmentExpr>();
+        a->lhs = std::move(lhs);
+        a->rhs = std::move(rhs);
+        a->isCompound = true;
+        a->compoundOp = compound;
+        return a;
+    }
+    return lhs;
+}
+
+NodePtr Parser::parseRange() {
+    NodePtr lhs = parseNilCoalescing();
+    if (checkPunct(PunctuatorID::DotDotLess) || checkPunct(PunctuatorID::DotDot)) {
+        bool halfOpen = checkPunct(PunctuatorID::DotDotLess);
+        advance();
+        auto r = std::make_unique<RangeExpr>();
+        r->lower = std::move(lhs);
+        r->upper = parseNilCoalescing();
+        r->halfOpen = halfOpen;
+        return r;
+    }
+    return lhs;
+}
+
+// `??` — nil-coalescing, loosest binary operator (right-associative)
+NodePtr Parser::parseNilCoalescing() {
+    NodePtr left = parseLogicalOr();
+    while (checkPunct(PunctuatorID::QuestionQuestion)) {
+        advance();
+        NodePtr right = parseNilCoalescing();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = PunctuatorID::QuestionQuestion;
+        b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseLogicalOr() {
+    NodePtr left = parseLogicalAnd();
+    while (checkPunct(PunctuatorID::PipePipe)) {
+        advance();
+        NodePtr right = parseLogicalAnd();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = PunctuatorID::PipePipe;
+        b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseLogicalAnd() {
+    NodePtr left = parseBitwiseOr();
+    while (checkPunct(PunctuatorID::AmpAmp)) {
+        advance();
+        NodePtr right = parseBitwiseOr();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = PunctuatorID::AmpAmp;
+        b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseBitwiseOr() {
+    NodePtr left = parseBitwiseXor();
+    while (checkPunct(PunctuatorID::Pipe)) {
+        advance();
+        NodePtr right = parseBitwiseXor();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = PunctuatorID::Pipe;
+        b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseBitwiseXor() {
+    NodePtr left = parseBitwiseAnd();
+    while (checkPunct(PunctuatorID::Caret)) {
+        advance();
+        NodePtr right = parseBitwiseAnd();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = PunctuatorID::Caret;
+        b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseBitwiseAnd() {
+    NodePtr left = parseComparison();
+    while (checkPunct(PunctuatorID::Amp)) {
+        advance();
+        NodePtr right = parseComparison();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = PunctuatorID::Amp;
+        b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseComparison() {
+    NodePtr left = parseShift();
+    while (true) {
+        if (checkPunct(PunctuatorID::EqualEqual) || checkPunct(PunctuatorID::BangEqual) ||
+            checkPunct(PunctuatorID::Less) || checkPunct(PunctuatorID::Greater) ||
+            checkPunct(PunctuatorID::LessEqual) || checkPunct(PunctuatorID::GreaterEqual) ||
+            checkPunct(PunctuatorID::LeftArrow)) {
+            PunctuatorID op = cur().punct; advance();
+            NodePtr right = parseShift();
+            auto b = std::make_unique<BinaryExpr>();
+            b->op = op; b->lhs = std::move(left); b->rhs = std::move(right);
+            left = std::move(b);
+        } else if (matchKw(KeywordID::Is)) {
+            auto is = std::make_unique<IsExpr>();
+            is->expr = std::move(left);
+            is->type = parseType();
+            left = std::move(is);
+        } else if (matchKw(KeywordID::As)) {
+            auto as = std::make_unique<AsExpr>();
+            as->expr = std::move(left);
+            as->asKind = AsExpr::As;
+            if (matchPunct(PunctuatorID::Question)) as->asKind = AsExpr::AsQuestion;
+            else if (matchPunct(PunctuatorID::Bang)) as->asKind = AsExpr::AsBang;
+            as->type = parseType();
+            left = std::move(as);
+        } else break;
+    }
+    return left;
+}
+
+NodePtr Parser::parseShift() {
+    NodePtr left = parseAdditive();
+    while (checkPunct(PunctuatorID::LessLess) || checkPunct(PunctuatorID::GreaterGreater)) {
+        PunctuatorID op = cur().punct; advance();
+        NodePtr right = parseAdditive();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = op; b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseAdditive() {
+    NodePtr left = parseMultiplicative();
+    while (checkPunct(PunctuatorID::Plus) || checkPunct(PunctuatorID::Minus)) {
+        PunctuatorID op = cur().punct; advance();
+        NodePtr right = parseMultiplicative();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = op; b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseMultiplicative() {
+    NodePtr left = parseUnary();
+    while (checkPunct(PunctuatorID::Star) || checkPunct(PunctuatorID::Slash) ||
+           checkPunct(PunctuatorID::Percent)) {
+        PunctuatorID op = cur().punct; advance();
+        NodePtr right = parseUnary();
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = op; b->lhs = std::move(left); b->rhs = std::move(right);
+        left = std::move(b);
+    }
+    return left;
+}
+
+NodePtr Parser::parseUnary() {
+    if (checkPunct(PunctuatorID::Minus) || checkPunct(PunctuatorID::Plus) ||
+        checkPunct(PunctuatorID::Bang) || checkPunct(PunctuatorID::Tilde) ||
+        checkPunct(PunctuatorID::Amp)) {
+        PunctuatorID op = cur().punct; advance();
+        auto u = std::make_unique<UnaryExpr>();
+        u->op = op; u->isPostfix = false;
+        u->operand = parseUnary();
+        return u;
+    }
+    if (matchKw(KeywordID::Try)) {
+        auto u = std::make_unique<UnaryExpr>();
+        u->isTry = true; // dedicated flag, not an operator marker
+        u->isPostfix = false;
+        u->operand = parseUnary();
+        return u;
+    }
+    if (matchKw(KeywordID::Await)) {
+        auto u = std::make_unique<UnaryExpr>();
+        u->isAwait = true; // dedicated flag, not an operator marker
+        u->isPostfix = false;
+        u->operand = parseUnary();
+        return u;
+    }
+    if (matchKw(KeywordID::Move)) {
+        auto m = std::make_unique<MoveExpr>();
+        m->operand = parseUnary();
+        return m;
+    }
+    return parsePostfix();
+}
+
+NodePtr Parser::parsePostfix() {
+    NodePtr expr = parsePrimary();
+    while (true) {
+        // 后缀链：调用 / 尾随闭包 / 下标 / 成员访问 / 可选链 / 强制解包 / 泛型实参。
+        //
+        // 每个分支自己判断起始标点，链尾是无条件 `break`，因此任何不构成后缀的
+        // token（例如 `}`、`;`、EOF）都会让循环正常结束。
+        // 注意：这里绝不能在本循环体外再套一层 `if (cur 是 ?/./!)` 之类的守卫
+        // —— 那样守卫为假时整条 if-else 链（含 break）都会被跳过，循环永不推进。
+        if (checkPunct(PunctuatorID::LParen) && suppressCall_ == 0) {
+            expr = parseCallSuffix(std::move(expr));
+        } else if (checkPunct(PunctuatorID::LBrace) && suppressTrailingClosure_ == 0) {
+            // trailing closure without parentheses: `Task { ... }`
+            auto call = std::make_unique<CallExpr>();
+            call->callee = std::move(expr);
+            call->hasTrailingClosure = true;
+            call->arguments.push_back(parseClosure(/*arrowSyntax=*/false));
+            expr = std::move(call);
+        } else if (checkPunct(PunctuatorID::LBracket)) {
+            auto s = std::make_unique<SubscriptExpr>();
+            s->base = std::move(expr);
+            advance(); // [
+            while (!checkPunct(PunctuatorID::RBracket) && !atEnd()) {
+                s->indices.push_back(parseExpr());
+                if (!matchPunct(PunctuatorID::Comma)) break;
+            }
+            expectPunct(PunctuatorID::RBracket, "expected ']'");
+            expr = std::move(s);
+        } else if (checkPunct(PunctuatorID::Dot)) {
+            advance();
+            bool optionalChain = false;
+            if (checkPunct(PunctuatorID::Question)) { optionalChain = true; advance(); }
+            // member name may be an identifier or a contextual keyword
+            bool isName = check(TokenKind::TK_Identifier) ||
+                          checkKw(KeywordID::Get) || checkKw(KeywordID::Set) ||
+                          checkKw(KeywordID::WillSet) || checkKw(KeywordID::DidSet) ||
+                          checkKw(KeywordID::Init) || checkKw(KeywordID::Deinit) ||
+                          checkKw(KeywordID::Self) || checkKw(KeywordID::Super) ||
+                          (check(TokenKind::TK_Identifier) &&
+                           (cur().text == "Type" || cur().text == "Protocol")) ||
+                          // Tuple element access uses a numeric member: `t.0`.
+                          check(TokenKind::TK_IntLiteral);
+            if (isName) {
+                auto m = std::make_unique<MemberExpr>();
+                m->base = std::move(expr);
+                m->member = cur().text; advance();
+                m->optionalChain = optionalChain;
+                expr = std::move(m);
+            } else { errorAt(cur(), "expected member name after '.'"); break; }
+        } else if (checkPunct(PunctuatorID::Question) &&
+                   peek(1).kind == TokenKind::TK_Punctuator &&
+                   peek(1).punct == PunctuatorID::Dot) {
+            // `?.` is optional chaining. A bare `?` is *not* consumed here: it
+            // belongs to the conditional operator `c ? a : b`, which is parsed
+            // one level up. Peeking keeps both spellings working.
+            advance(); // ?
+            advance(); // .
+            if (check(TokenKind::TK_Identifier)) {
+                auto m = std::make_unique<MemberExpr>();
+                m->base = std::move(expr);
+                m->member = cur().text; advance();
+                m->optionalChain = true;
+                expr = std::move(m);
+                continue;
+            }
+            errorAt(cur(), "expected member name after '?.'");
+            break;
+        } else if (checkPunct(PunctuatorID::Question) && !nextStartsExpression()) {
+            // A `?` that is not followed by anything expression-like promotes the
+            // value to an Optional (`Int` -> `Int?`). `?:` and `?.` both have an
+            // expression after them, so they are left to their own rules.
+            advance();
+            auto o = std::make_unique<OptionalChainExpr>();
+            o->expr = std::move(expr);
+            expr = std::move(o);
+        } else if (checkPunct(PunctuatorID::Bang)) {
+            advance();
+            auto f = std::make_unique<ForceUnwrapExpr>();
+            f->expr = std::move(expr);
+            expr = std::move(f);
+        } else if (checkPunct(PunctuatorID::Less) &&
+                   (expr->kind == NodeKind::IdentExpr ||
+                    expr->kind == NodeKind::MemberExpr ||
+                    expr->kind == NodeKind::GenericExpr)) {
+            // Possible generic specialization: Base<Args>. To avoid mistaking a
+            // binary comparison `a < b` for specialization, only attempt it when
+            // the token immediately after '<' can begin a type (identifier,
+            // '[', '(', or '&'). Otherwise this '<' is a real comparison
+            // operator and must be handled by parseComparison.
+            const Token& after = peek(1);
+            bool typeStart =
+                after.kind == TokenKind::TK_Identifier ||
+                (after.kind == TokenKind::TK_Punctuator &&
+                 (after.punct == PunctuatorID::LBracket ||
+                  after.punct == PunctuatorID::LParen ||
+                  after.punct == PunctuatorID::Amp));
+            if (!typeStart) break; // leave '<' for the comparison parser
+
+            size_t save = pos_;
+            advance(); // consume '<'
+            NodeList args;
+            while (!atEnd() && !checkPunct(PunctuatorID::Greater)) {
+                args.push_back(parseType());
+                if (!matchPunct(PunctuatorID::Comma)) break;
+            }
+            if (checkPunct(PunctuatorID::Greater)) {
+                advance(); // consume '>'
+                auto g = std::make_unique<GenericExpr>();
+                g->base = std::move(expr);
+                g->args = std::move(args);
+                expr = std::move(g);
+                continue;
+            }
+            // Not a specialization (no matching '>'); rewind and stop the
+            // postfix loop so the '<' is treated as a binary operator.
+            pos_ = save;
+            break;
+        } else {
+            break;
+        }
+    }
+    return expr;
+}
+
+NodePtr Parser::parseCallSuffix(NodePtr callee) {
+    auto call = std::make_unique<CallExpr>();
+    call->callee = std::move(callee);
+    advance(); // (
+    if (!checkPunct(PunctuatorID::RParen)) {
+        while (!atEnd()) {
+            std::string label;
+            if (check(TokenKind::TK_Identifier) && peek(1).kind == TokenKind::TK_Punctuator && peek(1).punct == PunctuatorID::Colon) {
+                label = cur().text; advance(); advance(); // name:
+            }
+            call->argumentLabels.push_back(label);
+            call->arguments.push_back(parseExpr());
+            if (!matchPunct(PunctuatorID::Comma)) break;
+        }
+    }
+    expectPunct(PunctuatorID::RParen, "expected ')'");
+    // trailing closure (e.g. `withTaskGroup(...) { ... }`), unless we are in a
+    // control-flow condition where a following `{` opens the statement block.
+    if (checkPunct(PunctuatorID::LBrace) && suppressTrailingClosure_ == 0) {
+        call->hasTrailingClosure = true;
+        call->arguments.push_back(parsePrimary()); // closure parsed in parsePrimary
+    }
+    return call;
+}
+
+bool Parser::looksLikeArrowClosure() {
+    if (cur().kind != TokenKind::TK_Punctuator || cur().punct != PunctuatorID::LParen)
+        return false;
+    size_t i = pos_;
+    int depth = 0;
+    for (; i < tokens_.size(); ++i) {
+        const Token& t = tokens_[i];
+        if (t.kind == TokenKind::TK_Punctuator && t.punct == PunctuatorID::LParen) ++depth;
+        else if (t.kind == TokenKind::TK_Punctuator && t.punct == PunctuatorID::RParen) {
+            --depth;
+            if (depth == 0) {
+                if (i + 1 < tokens_.size() &&
+                    tokens_[i + 1].kind == TokenKind::TK_Punctuator &&
+                    tokens_[i + 1].punct == PunctuatorID::FatArrow)
+                    return true;
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+NodePtr Parser::parsePrimary() {
+    Token t = cur();
+    // if used as an expression: `let x = if cond { a } else { b }`
+    if (checkKw(KeywordID::If)) {
+        auto e = std::make_unique<IfExpr>();
+        advance(); // if
+        if (checkPunct(PunctuatorID::LParen)) {
+            advance(); e->condition = parseCondition();
+            expectPunct(PunctuatorID::RParen, "expected ')'");
+        } else {
+            e->condition = parseCondition();
+        }
+        e->thenBody = parseBlockStatements();
+        if (matchKw(KeywordID::Else)) {
+            if (checkKw(KeywordID::If)) e->elseBranch = parsePrimary();
+            else e->elseBranch = parseBlock();
+        }
+        return e;
+    }
+    if (check(TokenKind::TK_IntLiteral)) {
+        advance();
+        auto n = std::make_unique<IntLitExpr>();
+        n->value = t.numberText; n->range = SourceRange{t.loc, t.loc}; return n;
+    }
+    if (check(TokenKind::TK_FloatLiteral)) {
+        advance();
+        auto n = std::make_unique<FloatLitExpr>();
+        n->value = t.numberText; n->range = SourceRange{t.loc, t.loc}; return n;
+    }
+    if (check(TokenKind::TK_CharLiteral)) {
+        advance();
+        auto n = std::make_unique<CharLitExpr>();
+        n->value = t.stringValue; n->range = SourceRange{t.loc, t.loc}; return n;
+    }
+    if (checkKw(KeywordID::True) || checkKw(KeywordID::False)) {
+        advance();
+        auto n = std::make_unique<BoolLitExpr>();
+        n->value = (t.keyword == KeywordID::True); n->range = SourceRange{t.loc, t.loc}; return n;
+    }
+    if (checkKw(KeywordID::Nil)) {
+        advance();
+        auto n = std::make_unique<NilLitExpr>();
+        n->range = SourceRange{t.loc, t.loc}; return n;
+    }
+    if (checkKw(KeywordID::Self) || checkKw(KeywordID::Super)) {
+        advance();
+        auto id = std::make_unique<IdentExpr>();
+        id->name = (t.keyword == KeywordID::Self) ? "self" : "super";
+        id->range = SourceRange{t.loc, t.loc}; return id;
+    }
+    if (check(TokenKind::TK_StringLiteral)) {
+        advance();
+        auto s = std::make_unique<StrLitExpr>();
+        s->isRaw = (t.text.size() >= 2 && t.text[0] == 'r');
+        // strip surrounding quotes
+        std::string inner = t.stringValue;
+        s->segments.push_back(inner);
+        s->range = SourceRange{t.loc, t.loc};
+        return s;
+    }
+    if (check(TokenKind::TK_StringFragment)) {
+        // interpolated string
+        auto s = std::make_unique<StrLitExpr>();
+        s->segments.push_back(t.stringValue);
+        advance();
+        while (!atEnd()) {
+            if (check(TokenKind::TK_StringEnd)) { advance(); break; }
+            if (check(TokenKind::TK_StringFragment)) {
+                s->segments.push_back(cur().stringValue);
+                advance();
+            } else {
+                s->expressions.push_back(parseExpr());
+                if (check(TokenKind::TK_StringFragment)) {
+                    s->segments.push_back(cur().stringValue);
                     advance();
                 }
             }
-            match(TokenKind::RBrace); // }
         }
+        return s;
     }
-    return primary;
-}
-
-// ─── Function declaration ─────────────────────────────────────────────────
-
-DeclPtr Parser::parseFunctionDecl() {
-    expect(TokenKind::KwFunc);
-    auto decl = makeNode<FunctionDecl>();
-
-    // Function name (or operator for operator functions)
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else if (check(TokenKind::KwInit)) {
-        decl->name = "init";
+    if (check(TokenKind::TK_Identifier)) {
         advance();
-    } else {
-        error("expected function name");
+        auto id = std::make_unique<IdentExpr>();
+        id->name = t.text; id->range = SourceRange{t.loc, t.loc}; return id;
     }
-
-    // Generic parameters
-    if (check(TokenKind::Less)) {
-        decl->genericParams = parseGenericParams();
-    }
-
-    // Where clause (泛型约束补充)
-    if (check(TokenKind::KwWhere)) {
-        advance(); // skip 'where'
-        // 解析约束表达式: T: Protocol, U: Protocol & Protocol2
-        do {
-            FunctionDecl::WhereConstraint wc;
-            // 解析类型参数名 / Parse type parameter name
-            if (check(TokenKind::Identifier)) {
-                wc.typeName = std::string(advance().stringValue);
-            }
-            // 期望冒号 / Expect colon
-            if (match(TokenKind::Colon)) {
-                // 解析约束类型 / Parse constraint types (T: A & B)
-                do {
-                    TypeReprPtr constraint = parseType();
-                    if (constraint) {
-                        wc.constraints.push_back(std::move(constraint));
-                    }
-                } while (match(TokenKind::Amp));
-            }
-            if (!wc.typeName.empty()) {
-                decl->whereConstraints.push_back(std::move(wc));
-            }
-        } while (match(TokenKind::Comma));
-    }
-
-    // Parameter list
-    if (expect(TokenKind::LParen)) {
-        decl->params = parseParamList();
-        expect(TokenKind::RParen);
-    }
-
-    // async/throws
-    while (true) {
-        if (match(TokenKind::KwAsync)) { decl->isAsync = true; continue; }
-        if (match(TokenKind::KwThrows)) { decl->isThrows = true; continue; }
-        break;
-    }
-
-    // Return type
-    if (match(TokenKind::Arrow)) {
-        decl->returnType = parseType();
-    }
-
-    // Body (optional for protocol requirements)
-    if (check(TokenKind::LBrace)) {
-        decl->body = parseBlock();
-    }
-
-    return decl;
-}
-
-// ─── Type declarations ────────────────────────────────────────────────────
-
-DeclPtr Parser::parseStructDecl() {
-    expect(TokenKind::KwStruct);
-    auto decl = makeNode<StructDecl>();
-
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected struct name");
-    }
-
-    if (check(TokenKind::Less)) {
-        decl->genericParams = parseGenericParams();
-    }
-
-    // Conformances: struct Foo: Protocol1, Protocol2
-    if (match(TokenKind::Colon)) {
-        do {
-            decl->conformsTo.push_back(parseType());
-        } while (match(TokenKind::Comma));
-    }
-
-    // Body
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            parseDeclarationInto(decl->members);
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseClassDecl() {
-    expect(TokenKind::KwClass);
-    auto decl = makeNode<ClassDecl>();
-
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected class name");
-    }
-
-    if (check(TokenKind::Less)) {
-        decl->genericParams = parseGenericParams();
-    }
-
-    // Superclass and/or protocol conformances
-    if (match(TokenKind::Colon)) {
-        // First type is the superclass (classes have single inheritance)
-        auto firstType = parseType();
-        decl->superclass = std::move(firstType);
-        // Additional conformances
-        while (match(TokenKind::Comma)) {
-            decl->conformsTo.push_back(parseType());
-        }
-    }
-
-    // Body
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            parseDeclarationInto(decl->members);
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseEnumDecl() {
-    expect(TokenKind::KwEnum);
-    auto decl = makeNode<EnumDecl>();
-
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected enum name");
-    }
-
-    if (check(TokenKind::Less)) {
-        decl->genericParams = parseGenericParams();
-    }
-
-    // Raw value type: enum Foo: Int
-    if (match(TokenKind::Colon)) {
-        decl->rawValueType = parseType();
-    }
-
-    // Body
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            if (match(TokenKind::KwCase)) {
-                auto enumCase = makeNode<EnumCaseDecl>();
-                if (check(TokenKind::Identifier)) {
-                    enumCase->name = std::string(advance().stringValue);
-                } else {
-                    error("expected case name");
-                }
-
-                // Associated values: case foo(Int, String)
-                if (check(TokenKind::LParen)) {
-                    advance(); // (
-                    do {
-                        EnumCaseDecl::AssociatedValue av;
-                        if (check(TokenKind::Identifier)) {
-                            // Check if next is ':' (labeled) or type (unlabeled)
-                            auto& next = peekAt(1);
-                            if (next.is(TokenKind::Colon)) {
-                                av.label = std::string(advance().stringValue);
-                                advance(); // :
-                            }
-                        }
-                        av.type = parseType();
-                        enumCase->associatedValues.push_back(std::move(av));
-                    } while (match(TokenKind::Comma));
-                    expect(TokenKind::RParen);
-                }
-
-                // Raw value: case foo = 42
-                if (match(TokenKind::Assign)) {
-                    enumCase->rawValue = parseExpression();
-                }
-
-                decl->cases.push_back(std::move(enumCase));
-            } else {
-                parseDeclarationInto(decl->members);
-            }
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseProtocolDecl() {
-    expect(TokenKind::KwProtocol);
-    auto decl = makeNode<ProtocolDecl>();
-
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected protocol name");
-    }
-
-    // Inheritance: protocol Foo: Bar, Baz
-    if (match(TokenKind::Colon)) {
-        do {
-            decl->conformsTo.push_back(parseType());
-        } while (match(TokenKind::Comma));
-    }
-
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            parseDeclarationInto(decl->members);
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseActorDecl() {
-    expect(TokenKind::KwActor);
-    auto decl = makeNode<ActorDecl>();
-
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected actor name");
-    }
-
-    if (check(TokenKind::Less)) {
-        decl->genericParams = parseGenericParams();
-    }
-
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            parseDeclarationInto(decl->members);
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseExtensionDecl() {
-    expect(TokenKind::KwExtension);
-    auto decl = makeNode<ExtensionDecl>();
-
-    decl->extendedType = parseType();
-
-    if (match(TokenKind::Colon)) {
-        do {
-            decl->conformsTo.push_back(parseType());
-        } while (match(TokenKind::Comma));
-    }
-
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            parseDeclarationInto(decl->members);
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseTypealiasDecl() {
-    expect(TokenKind::KwTypealias);
-    auto decl = makeNode<TypealiasDecl>();
-
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected typealias name");
-    }
-
-    if (check(TokenKind::Less)) {
-        decl->genericParams = parseGenericParams();
-    }
-
-    expect(TokenKind::Assign);
-    decl->underlyingType = parseType();
-
-    return decl;
-}
-
-DeclPtr Parser::parseAssociatedTypeDecl() {
-    expect(TokenKind::KwAssociatedtype);
-    auto decl = makeNode<AssociatedTypeDecl>();
-
-    // 关联类型名称 / Associated type name
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected associated type name");
-    }
-
-    // 可选的约束 / Optional constraint
-    if (match(TokenKind::Colon)) {
-        decl->constraint = parseType();
-    }
-
-    // 可选的默认类型 / Optional default type
-    if (match(TokenKind::Assign)) {
-        decl->defaultType = parseType();
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseInitDecl() {
-    expect(TokenKind::KwInit);
-    auto decl = makeNode<InitDecl>();
-
-    if (expect(TokenKind::LParen)) {
-        decl->params = parseParamList();
-        expect(TokenKind::RParen);
-    }
-
-    if (check(TokenKind::LBrace)) {
-        decl->body = parseBlock();
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseDeinitDecl() {
-    expect(TokenKind::KwDeinit);
-    auto decl = makeNode<DeinitDecl>();
-
-    if (check(TokenKind::LBrace)) {
-        decl->body = parseBlock();
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseSubscriptDecl() {
-    expect(TokenKind::KwSubscript);
-    auto decl = makeNode<SubscriptDecl>();
-
-    if (expect(TokenKind::LParen)) {
-        decl->params = parseParamList();
-        expect(TokenKind::RParen);
-    }
-
-    if (match(TokenKind::Arrow)) {
-        decl->returnType = parseType();
-    }
-
-    // Body: get/set or single expression
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            if (match(TokenKind::KwGet)) {
-                decl->getterBody = parseBlock();
-            } else if (match(TokenKind::KwSet)) {
-                decl->setterBody = parseBlock();
-            } else {
-                error("expected 'get' or 'set' in subscript");
-                advance();
-            }
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-// ─── Control flow declarations ────────────────────────────────────────────
-
-DeclPtr Parser::parseIfDecl() {
-    expect(TokenKind::KwIf);
-    auto decl = makeNode<IfDecl>();
-    decl->condition = parseExpression();
-    decl->thenBody = parseBlock();
-
-    if (match(TokenKind::KwElse)) {
-        if (check(TokenKind::KwIf)) {
-            // else if — store as nested IfDecl
-            decl->elseIfDecl = parseIfDecl();
-        } else {
-            decl->elseBody = parseBlock();
-        }
-    }
-    return decl;
-}
-
-DeclPtr Parser::parseGuardDecl() {
-    expect(TokenKind::KwGuard);
-    auto decl = makeNode<GuardDecl>();
-    decl->condition = parseExpression();
-    expect(TokenKind::KwElse);
-    decl->elseBody = parseBlock();
-    return decl;
-}
-
-DeclPtr Parser::parseSwitchDecl() {
-    expect(TokenKind::KwSwitch);
-    auto decl = makeNode<SwitchDecl>();
-    decl->subject = parseExpression();
-
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            SwitchCase sc;
-
-            if (match(TokenKind::KwCase)) {
-                // Parse case labels
-                do {
-                    SwitchCase::Label label;
-                    // Handle enum case pattern: .caseName
-                    if (check(TokenKind::Dot) && peekAt(1).is(TokenKind::Identifier)) {
-                        advance(); // .
-                        auto pat = makeNode<EnumCasePattern>();
-                        pat->caseName = std::string(advance().stringValue);
-                        label.pattern = std::move(pat);
-                    } else {
-                        // Try to parse as expression
-                        label.expression = parseExpression();
-                    }
-                    sc.labels.push_back(std::move(label));
-                } while (match(TokenKind::Comma));
-            } else if (match(TokenKind::KwDefault)) {
-                SwitchCase::Label label;
-                label.isDefault = true;
-                sc.labels.push_back(std::move(label));
-            } else {
-                error("expected 'case' or 'default' in switch");
-                advance();
-                continue;
-            }
-
-            expect(TokenKind::Colon);
-
-            // Parse case body (until next case/default/})
-            while (!check(TokenKind::KwCase) && !check(TokenKind::KwDefault) &&
-                   !check(TokenKind::RBrace) && !isAtEnd()) {
-                auto stmt = parseStatement();
-                if (stmt) sc.body.push_back(std::move(stmt));
-            }
-
-            // Check for fallthrough
-            if (!sc.body.empty()) {
-                auto& lastStmt = sc.body.back();
-                if (lastStmt && lastStmt->stmtKind == StmtKind::Fallthrough) {
-                    sc.isFallthrough = true;
-                }
-            }
-
-            decl->cases.push_back(std::move(sc));
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseForInDecl() {
-    expect(TokenKind::KwFor);
-    auto decl = makeNode<ForInDecl>();
-    decl->pattern = parsePattern();
-    expect(TokenKind::KwIn);
-    decl->sequence = parseExpression();
-
-    // Optional where clause
-    if (match(TokenKind::KwWhere)) {
-        decl->whereClause = parseExpression();
-    }
-
-    decl->body = parseBlock();
-    return decl;
-}
-
-DeclPtr Parser::parseWhileDecl() {
-    expect(TokenKind::KwWhile);
-    auto decl = makeNode<WhileDecl>();
-
-    // Handle 'while let pattern = expr' (optional binding)
-    if (check(TokenKind::KwLet) || check(TokenKind::KwVar)) {
-        // 解析 while let 绑定：while let name = expr
-        // Parse while-let binding: while let name = expr
-        advance(); // consume let/var
-        if (check(TokenKind::Identifier)) advance(); // consume pattern name
-        if (match(TokenKind::Assign)) {
-            decl->condition = parseExpression();
-        }
-    } else {
-        decl->condition = parseExpression();
-    }
-
-    decl->body = parseBlock();
-    return decl;
-}
-
-DeclPtr Parser::parseRepeatWhileDecl() {
-    expect(TokenKind::KwRepeat);
-    auto decl = makeNode<RepeatWhileDecl>();
-    decl->body = parseBlock();
-    expect(TokenKind::KwWhile);
-    decl->condition = parseExpression();
-    return decl;
-}
-
-DeclPtr Parser::parseDoCatchDecl() {
-    expect(TokenKind::KwDo);
-    auto decl = makeNode<DoCatchDecl>();
-    decl->doBody = parseBlock();
-
-    while (match(TokenKind::KwCatch)) {
-        DoCatchDecl::CatchClause cc;
-        // Optional catch pattern: catch { ... }, catch let error { ... },
-        // catch let error as FileError { ... }, catch is FileError { ... }
-        if (!check(TokenKind::LBrace)) {
-            cc.pattern = parsePattern();
-            // Handle 'pattern as Type' in catch
-            if (match(TokenKind::KwAs)) {
-                auto asPat = makeNode<AsTypePattern>();
-                asPat->subPattern = std::move(cc.pattern);
-                asPat->type = parseType();
-                cc.pattern = std::move(asPat);
-            }
-            if (match(TokenKind::KwWhere)) {
-                cc.whereClause = parseExpression();
-            }
-        }
-        cc.body = parseBlock();
-        decl->catches.push_back(std::move(cc));
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseSelectDecl() {
-    expect(TokenKind::KwSelect);
-    auto decl = makeNode<SelectDecl>();
-
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            SelectCase sc;
-
-            if (match(TokenKind::KwDefault)) {
-                // Standalone default: (without case prefix)
-                sc.kind = SelectCase::Kind::Default;
-                expect(TokenKind::Colon);
-            } else if (match(TokenKind::KwCase)) {
-                if (match(TokenKind::KwDefault)) {
-                    sc.kind = SelectCase::Kind::Default;
-                    expect(TokenKind::Colon);
-                } else {
-                    // Check if this is send or receive
-                    // send: case value <- channel
-                    // receive: case let x <- channel (or case x <- channel)
-                    sc.recvPattern = parsePattern();
-                    if (expect(TokenKind::LeftArrow)) {
-                        sc.channel = parseExpression();
-                    }
-                    expect(TokenKind::Colon);
-
-                    // Determine send vs receive by pattern type
-                    if (sc.recvPattern && sc.recvPattern->patternKind == PatternKind::Identifier) {
-                        auto* ip = static_cast<IdentifierPattern*>(sc.recvPattern.get());
-                        if (ip->name.empty()) {
-                            sc.kind = SelectCase::Kind::Send;
-                        } else {
-                            sc.kind = SelectCase::Kind::Receive;
-                        }
-                    } else {
-                        sc.kind = SelectCase::Kind::Receive;
-                    }
-                }
-            } else {
-                error("expected 'case' or 'default' in select");
-                advance();
-                continue;
-            }
-
-            // Parse case body
-            while (!check(TokenKind::KwCase) && !check(TokenKind::RBrace) && !isAtEnd()) {
-                auto stmt = parseStatement();
-                if (stmt) sc.body.push_back(std::move(stmt));
-            }
-
-            decl->cases.push_back(std::move(sc));
-        }
-        expect(TokenKind::RBrace);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseUnsafeDecl() {
-    expect(TokenKind::KwUnsafe);
-    auto decl = makeNode<UnsafeDecl>();
-    decl->body = parseBlock();
-    return decl;
-}
-
-DeclPtr Parser::parseAsmDecl() {
-    expect(TokenKind::KwAsm);
-    auto decl = makeNode<AsmDecl>();
-
-    // asm("assembly template" : outputs : inputs : clobbers)
-    if (expect(TokenKind::LParen)) {
-        // 解析汇编模板字符串
-        if (check(TokenKind::StringLiteral)) {
-            decl->assembly = std::string(advance().stringValue);
-        } else {
-            error("expected string literal in asm");
-        }
-
-        // 可选的约束部分 : outputs : inputs : clobbers
-        while (match(TokenKind::Colon)) {
-            // 跳过约束字符串
-            if (check(TokenKind::StringLiteral)) {
-                decl->constraints += std::string(advance().stringValue);
-            }
-        }
-
-        expect(TokenKind::RParen);
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseMacroDecl(MacroKind kind) {
-    auto decl = makeNode<MacroDecl>();
-    decl->macroKind = kind;
-
-    // 期望 func 关键字 / Expect func keyword
-    if (!check(TokenKind::KwFunc)) {
-        error("expected 'func' after @macro");
-        return decl;
-    }
-    advance(); // skip 'func'
-
-    // 解析宏名称 / Parse macro name
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected macro name");
-    }
-
-    // 解析参数 / Parse parameters
-    if (expect(TokenKind::LParen)) {
-        decl->params = parseParamList();
-        expect(TokenKind::RParen);
-    }
-
-    // 解析宏体 / Parse macro body
-    if (check(TokenKind::LBrace)) {
-        decl->body = parseBlock();
-    }
-
-    return decl;
-}
-
-DeclPtr Parser::parseExternDecl() {
-    expect(TokenKind::KwExtern);
-
-    // 解析调用约定 / Parse calling convention
-    std::string callingConv = "C"; // 默认 C 调用约定
-    if (check(TokenKind::StringLiteral)) {
-        callingConv = std::string(advance().stringValue);
-    }
-
-    // extern "C" { func ...; func ...; } - extern 块
-    if (check(TokenKind::LBrace)) {
-        auto block = makeNode<ExternBlockDecl>();
-        block->callingConvention = callingConv;
-        advance(); // skip '{'
-
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            if (check(TokenKind::KwFunc)) {
-                advance(); // skip 'func'
-                auto funcDecl = parseExternFuncDecl(callingConv);
-                if (funcDecl) {
-                    block->declarations.push_back(std::move(funcDecl));
-                }
-            }
-            match(TokenKind::Semicolon);
-        }
-        expect(TokenKind::RBrace);
-        return block;
-    }
-
-    // extern "C" func printf(...) -> i32 - 单个 extern 函数
-    if (check(TokenKind::KwFunc)) {
-        advance(); // skip 'func'
-        return parseExternFuncDecl(callingConv);
-    }
-
-    error("expected 'func' or '{' after extern");
-    return makeNode<FunctionDecl>();
-}
-
-FunctionParam Parser::parseExternParam() {
-    FunctionParam param;
-
-    // 参数名 / Parameter name
-    if (check(TokenKind::Identifier)) {
-        param.internalName = std::string(advance().stringValue);
-    } else if (check(TokenKind::KwInOut)) {
-        advance(); // skip 'inout'
-        param.isInOut = true;
-        if (check(TokenKind::Identifier)) {
-            param.internalName = std::string(advance().stringValue);
-        }
-    }
-
-    // 类型注解 / Type annotation
-    if (match(TokenKind::Colon)) {
-        param.type = parseType();
-    }
-
-    // 可变参数 / Variadic
-    if (match(TokenKind::Ellipsis)) {
-        param.isVariadic = true;
-    }
-
-    return param;
-}
-
-DeclPtr Parser::parseExternFuncDecl(const std::string& callingConv) {
-    auto decl = makeNode<FunctionDecl>();
-
-    // 函数名 / Function name
-    if (check(TokenKind::Identifier)) {
-        decl->name = std::string(advance().stringValue);
-    } else {
-        error("expected function name");
-        return decl;
-    }
-
-    // 参数列表 / Parameter list
-    if (expect(TokenKind::LParen)) {
-        while (!check(TokenKind::RParen) && !isAtEnd()) {
-            // 检查可变参数 ... / Check variadic ...
-            if (check(TokenKind::Ellipsis)) {
-                decl->isVariadic = true;
-                advance();
-                break;
-            }
-
-            auto param = parseExternParam();
-            decl->params.push_back(std::move(param));
-
-            if (!match(TokenKind::Comma)) break;
-        }
-        expect(TokenKind::RParen);
-    }
-
-    // 返回类型 / Return type
-    if (match(TokenKind::Arrow)) {
-        decl->returnType = parseType();
-    }
-
-    // 标记为 extern / Mark as extern
-    decl->isExtern = true;
-    decl->callingConvention = callingConv;
-    decl->externSymbolName = decl->name; // 默认符号名等于函数名
-
-    // 添加 @_cdecl 属性 / Add @_cdecl attribute
-    Attribute attr;
-    attr.name = "_cdecl";
-    decl->attributes.push_back(attr);
-
-    return decl;
-}
-
-// ─── Statements ───────────────────────────────────────────────────────────
-
-StmtPtr Parser::parseStatement() {
-    // 分号禁止检查 / Semicolon prohibition check
-    if (check(TokenKind::Semicolon)) {
-        error("semicolons are prohibited as statement terminators in SukiCode");
-        advance(); // skip the semicolon
-    }
-
-    switch (peek().kind) {
-        case TokenKind::KwReturn:   return parseReturnStmt();
-        case TokenKind::KwBreak:    return parseBreakStmt();
-        case TokenKind::KwContinue: return parseContinueStmt();
-        case TokenKind::KwFallthrough: return parseFallthroughStmt();
-        case TokenKind::KwDefer:    return parseDeferStmt();
-        case TokenKind::KwThrow:    return parseThrowStmt();
-        case TokenKind::KwLet:
-        case TokenKind::KwVar: {
-            auto varDecl = parseVariableDecl();
-            if (varDecl) {
-                auto stmt = makeNode<VariableDeclStmt>();
-                stmt->varDecl = std::move(varDecl);
-                return stmt;
-            }
-            return nullptr;
-        }
-        // Control flow declarations used as statements
-        case TokenKind::KwIf:
-        case TokenKind::KwGuard:
-        case TokenKind::KwSwitch:
-        case TokenKind::KwFor:
-        case TokenKind::KwWhile:
-        case TokenKind::KwRepeat:
-        case TokenKind::KwDo:
-        case TokenKind::KwSelect:
-        case TokenKind::KwUnsafe:
-        case TokenKind::KwAsm: {
-            auto decl = parseDeclaration();
-            if (decl) {
-                auto stmt = makeNode<DeclStmt>();
-                stmt->decl = std::move(decl);
-                return stmt;
-            }
-            return nullptr;
-        }
-        default: {
-            // Try expression statement
-            ExprPtr expr = parseExpression();
-            if (expr) {
-                auto stmt = makeNode<ExpressionStmt>();
-                stmt->expression = std::move(expr);
-                return stmt;
-            }
-            error("expected statement");
+    if (checkPunct(PunctuatorID::LParen)) {
+        if (looksLikeArrowClosure()) return parseClosure(true);
+        advance();
+        if (checkPunct(PunctuatorID::RParen)) {
             advance();
-            return nullptr;
+            auto p = std::make_unique<ParenExpr>(); // empty tuple / unit
+            return p;
         }
-    }
-}
-
-StmtPtr Parser::parseReturnStmt() {
-    expect(TokenKind::KwReturn);
-    auto stmt = makeNode<ReturnStmt>();
-    // Return value is optional (return vs return expr)
-    if (!check(TokenKind::RBrace) && !isAtEnd() &&
-        !peek().isOneOf({TokenKind::KwCase, TokenKind::KwDefault, TokenKind::KwElse})) {
-        stmt->value = parseExpression();
-    }
-    return stmt;
-}
-
-StmtPtr Parser::parseBreakStmt() {
-    expect(TokenKind::KwBreak);
-    return makeNode<BreakStmt>();
-}
-
-StmtPtr Parser::parseContinueStmt() {
-    expect(TokenKind::KwContinue);
-    return makeNode<ContinueStmt>();
-}
-
-StmtPtr Parser::parseFallthroughStmt() {
-    expect(TokenKind::KwFallthrough);
-    return makeNode<FallthroughStmt>();
-}
-
-StmtPtr Parser::parseDeferStmt() {
-    expect(TokenKind::KwDefer);
-    auto stmt = makeNode<DeferStmt>();
-    stmt->body = parseBlock();
-    return stmt;
-}
-
-StmtPtr Parser::parseThrowStmt() {
-    expect(TokenKind::KwThrow);
-    auto stmt = makeNode<ThrowStmt>();
-    stmt->value = parseExpression();
-    return stmt;
-}
-
-std::vector<StmtPtr> Parser::parseBlock() {
-    std::vector<StmtPtr> stmts;
-    if (expect(TokenKind::LBrace)) {
-        while (!check(TokenKind::RBrace) && !isAtEnd()) {
-            auto stmt = parseStatement();
-            if (stmt) stmts.push_back(std::move(stmt));
-        }
-        expect(TokenKind::RBrace);
-    }
-    return stmts;
-}
-
-// ─── Expression parsing (precedence climbing) ─────────────────────────────
-
-ExprPtr Parser::parseExpression() {
-    return parseAssignmentExpr();
-}
-
-ExprPtr Parser::parseAssignmentExpr() {
-    ExprPtr left = parseRangeExpr();
-
-    // Assignment operators
-    if (peek().isAssignmentOperator()) {
-        auto expr = makeNode<AssignmentExpr>();
-        expr->op = advance().kind;
-        expr->target = std::move(left);
-        expr->value = parseAssignmentExpr();
-        return expr;
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseTernaryExpr() {
-    ExprPtr cond = parseLogicalOrExpr();
-
-    // No ternary operator in SukiCode (use if expressions instead)
-    return cond;
-}
-
-ExprPtr Parser::parseLogicalOrExpr() {
-    ExprPtr left = parseLogicalAndExpr();
-
-    while (match(TokenKind::PipePipe) || match(TokenKind::KwOr)) {
-        TokenKind op = tokens_[pos_ - 1].kind;
-        ExprPtr right = parseLogicalAndExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseLogicalAndExpr() {
-    ExprPtr left = parseBitwiseOrExpr();
-
-    while (match(TokenKind::AmpAmp) || match(TokenKind::KwAnd)) {
-        TokenKind op = tokens_[pos_ - 1].kind;
-        ExprPtr right = parseBitwiseOrExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseBitwiseOrExpr() {
-    ExprPtr left = parseBitwiseXorExpr();
-
-    while (match(TokenKind::Pipe)) {
-        ExprPtr right = parseBitwiseXorExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = TokenKind::Pipe;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseBitwiseXorExpr() {
-    ExprPtr left = parseBitwiseAndExpr();
-
-    while (match(TokenKind::Caret)) {
-        ExprPtr right = parseBitwiseAndExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = TokenKind::Caret;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseBitwiseAndExpr() {
-    ExprPtr left = parseComparisonExpr();
-
-    while (match(TokenKind::Amp)) {
-        ExprPtr right = parseComparisonExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = TokenKind::Amp;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseComparisonExpr() {
-    ExprPtr left = parseShiftExpr();
-
-    while (true) {
-        TokenKind op;
-        if (match(TokenKind::Equal))         op = TokenKind::Equal;
-        else if (match(TokenKind::NotEqual)) op = TokenKind::NotEqual;
-        else if (match(TokenKind::Less))     op = TokenKind::Less;
-        else if (match(TokenKind::Greater))  op = TokenKind::Greater;
-        else if (match(TokenKind::LessEqual))    op = TokenKind::LessEqual;
-        else if (match(TokenKind::GreaterEqual)) op = TokenKind::GreaterEqual;
-        else break;
-
-        ExprPtr right = parseShiftExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseRangeExpr() {
-    ExprPtr left = parseLogicalOrExpr();
-
-    // Range operators: ..< (half-open), ... (closed)
-    // Lower precedence than logical or, higher than assignment
-    while (true) {
-        TokenKind op;
-        if (match(TokenKind::Range))     op = TokenKind::Range;     // ..<
-        else if (match(TokenKind::Ellipsis)) op = TokenKind::Ellipsis; // ...
-        else break;
-
-        ExprPtr right = parseLogicalOrExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseShiftExpr() {
-    ExprPtr left = parseAdditionExpr();
-
-    while (true) {
-        TokenKind op;
-        if (match(TokenKind::LShift))      op = TokenKind::LShift;
-        else if (match(TokenKind::RShift)) op = TokenKind::RShift;
-        else break;
-
-        ExprPtr right = parseAdditionExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseAdditionExpr() {
-    ExprPtr left = parseMultiplicationExpr();
-
-    while (true) {
-        TokenKind op;
-        if (match(TokenKind::Plus))       op = TokenKind::Plus;
-        else if (match(TokenKind::Minus)) op = TokenKind::Minus;
-        else break;
-
-        ExprPtr right = parseMultiplicationExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parseMultiplicationExpr() {
-    ExprPtr left = parsePrefixExpr();
-
-    while (true) {
-        TokenKind op;
-        if (match(TokenKind::Star))        op = TokenKind::Star;
-        else if (match(TokenKind::Slash))  op = TokenKind::Slash;
-        else if (match(TokenKind::Percent)) op = TokenKind::Percent;
-        else break;
-
-        ExprPtr right = parsePrefixExpr();
-        auto expr = makeNode<BinaryExpr>();
-        expr->op = op;
-        expr->left = std::move(left);
-        expr->right = std::move(right);
-        left = std::move(expr);
-    }
-
-    return left;
-}
-
-ExprPtr Parser::parsePrefixExpr() {
-    // Prefix operators: -, !, ~, try, await, move, unsafe
-    if (match(TokenKind::Minus)) {
-        auto expr = makeNode<UnaryExpr>();
-        expr->op = TokenKind::Minus;
-        expr->isPrefix = true;
-        expr->operand = parsePrefixExpr();
-        return expr;
-    }
-    if (match(TokenKind::Bang)) {
-        auto expr = makeNode<UnaryExpr>();
-        expr->op = TokenKind::Bang;
-        expr->isPrefix = true;
-        expr->operand = parsePrefixExpr();
-        return expr;
-    }
-    if (match(TokenKind::Tilde)) {
-        auto expr = makeNode<UnaryExpr>();
-        expr->op = TokenKind::Tilde;
-        expr->isPrefix = true;
-        expr->operand = parsePrefixExpr();
-        return expr;
-    }
-    if (match(TokenKind::KwTry)) {
-        auto expr = makeNode<TryExpr>();
-        if (match(TokenKind::Bang)) expr->isForce = true;
-        else if (match(TokenKind::Question)) expr->isOptional = true;
-        expr->subExpr = parsePrefixExpr();
-        return expr;
-    }
-    if (match(TokenKind::KwAwait)) {
-        auto expr = makeNode<AwaitExpr>();
-        expr->subExpr = parsePrefixExpr();
-        return expr;
-    }
-    if (match(TokenKind::KwMove)) {
-        auto expr = makeNode<MoveExpr>();
-        expr->subExpr = parsePrefixExpr();
-        return expr;
-    }
-    if (match(TokenKind::Amp)) {
-        auto expr = makeNode<InOutExpr>();
-        expr->subExpr = parsePrefixExpr();
-        return expr;
-    }
-
-    return parsePostfixExpr();
-}
-
-ExprPtr Parser::parsePostfixExpr() {
-    ExprPtr expr = parsePrimaryExpr();
-    if (!expr) return nullptr;
-
-    while (true) {
-        // Generic type arguments: Identifier<Type>(args)
-        if (check(TokenKind::Less) && expr->exprKind == ExprKind::Identifier) {
-            // Lookahead: check if < is followed by a type pattern
-            size_t save = pos_;
-            pos_++; // skip <
-            bool isGeneric = false;
-            if (pos_ < tokens_.size() && tokens_[pos_].is(TokenKind::Identifier)) {
-                // Check for Type> or Type, pattern
-                while (pos_ < tokens_.size() && !tokens_[pos_].is(TokenKind::Greater) &&
-                       !tokens_[pos_].is(TokenKind::Eof)) {
-                    pos_++;
-                }
-                if (pos_ < tokens_.size() && tokens_[pos_].is(TokenKind::Greater)) {
-                    pos_++; // skip >
-                    // Check if followed by (
-                    if (pos_ < tokens_.size() && tokens_[pos_].is(TokenKind::LParen)) {
-                        isGeneric = true;
-                    }
-                }
+        // tuple or parenthesized expr
+        NodePtr first = parseExpr();
+        if (matchPunct(PunctuatorID::Comma)) {
+            auto tup = std::make_unique<TupleExpr>();
+            tup->elements.push_back(std::move(first));
+            while (!checkPunct(PunctuatorID::RParen) && !atEnd()) {
+                tup->elements.push_back(parseExpr());
+                if (!matchPunct(PunctuatorID::Comma)) break;
             }
-            pos_ = save; // restore
-
-            if (isGeneric) {
-                // Parse generic type arguments
-                advance(); // <
-                std::vector<TypeReprPtr> genericArgs;
-                do {
-                    genericArgs.push_back(parseType());
-                } while (match(TokenKind::Comma));
-                expect(TokenKind::Greater);
-
-                // Create a generic call expression
-                // For now, just skip the generic args and parse the call
-                if (check(TokenKind::LParen)) {
-                    expr = parseCallExpr(std::move(expr));
-                }
-            }
+            expectPunct(PunctuatorID::RParen, "expected ')'");
+            return tup;
         }
-        if (check(TokenKind::LParen)) {
-            expr = parseCallExpr(std::move(expr));
-            // Trailing closure: call() { params in body }
-            if (check(TokenKind::LBrace)) {
-                auto closure = makeNode<ClosureExpr>();
-                advance(); // {
-                // Parse optional parameters before 'in'
-                if (!check(TokenKind::KwIn) && !check(TokenKind::RBrace)) {
-                    // Could be params: { x in ... } or { (a, b) in ... }
-                    if (check(TokenKind::Identifier)) {
-                        // Simple param: { x in ... }
-                        ClosureExpr::Param param;
-                        param.name = std::string(advance().stringValue);
-                        closure->params.push_back(std::move(param));
-                        // Check for more params
-                        while (match(TokenKind::Comma) && check(TokenKind::Identifier)) {
-                            ClosureExpr::Param p;
-                            p.name = std::string(advance().stringValue);
-                            closure->params.push_back(std::move(p));
-                        }
-                    }
-                }
-                match(TokenKind::KwIn); // consume 'in' if present
-                // Parse body
-                while (!check(TokenKind::RBrace) && !isAtEnd()) {
-                    auto stmt = parseStatement();
-                    if (stmt) closure->body.push_back(std::move(stmt));
-                }
-                match(TokenKind::RBrace); // }
-                // Add as last argument
-                if (expr->exprKind == ExprKind::Call) {
-                    auto& call = static_cast<CallExpr&>(*expr);
-                    CallExpr::Arg arg;
-                    arg.value = std::move(closure);
-                    call.args.push_back(std::move(arg));
-                }
-            }
-        } else if (check(TokenKind::Dot) || check(TokenKind::Question)) {
-            bool isOptional = match(TokenKind::Question);
-            if (match(TokenKind::Dot)) {
-                // Member name can be an identifier or a keyword (init, deinit, self, etc.)
-                if (check(TokenKind::Identifier) || peek().isKeyword()) {
-                    auto member = makeNode<MemberAccessExpr>();
-                    member->base = std::move(expr);
-                    member->member = std::string(advance().stringValue);
-                    member->isOptionalChain = isOptional;
-                    expr = std::move(member);
-                } else {
-                    error("expected member name after '.'");
-                    break;
-                }
-            } else if (isOptional) {
-                // ?. optional chain
-                auto chain = makeNode<OptionalChainExpr>();
-                chain->subExpr = std::move(expr);
-                expr = std::move(chain);
-            } else {
-                break;
-            }
-        } else if (check(TokenKind::LBracket)) {
-            expr = parseSubscriptExpr(std::move(expr));
-        } else if (match(TokenKind::Bang)) {
-            auto unwrap = makeNode<ForceUnwrapExpr>();
-            unwrap->subExpr = std::move(expr);
-            expr = std::move(unwrap);
-        } else if (match(TokenKind::QuestionQuestion)) {
-            // Null coalescing: expr ?? default
-            ExprPtr rhs = parsePrefixExpr();
-            auto binary = makeNode<BinaryExpr>();
-            binary->op = TokenKind::QuestionQuestion;
-            binary->left = std::move(expr);
-            binary->right = std::move(rhs);
-            expr = std::move(binary);
-        } else if (match(TokenKind::KwIs)) {
-            // Type check: expr is Type
-            auto check = makeNode<TypeCheckExpr>();
-            check->subExpr = std::move(expr);
-            check->checkType = parseType();
-            expr = std::move(check);
-        } else if (check(TokenKind::KwAs)) {
-            // Type cast: expr as Type, expr as? Type, expr as! Type
-            advance(); // consume 'as'
-            auto cast = makeNode<TypeCastExpr>();
-            cast->subExpr = std::move(expr);
-            if (match(TokenKind::Question)) {
-                cast->castKind = CastKind::Conditional;
-            } else if (match(TokenKind::Bang)) {
-                cast->castKind = CastKind::Force;
-            } else {
-                cast->castKind = CastKind::Coerce;
-            }
-            cast->targetType = parseType();
-            expr = std::move(cast);
-        } else {
-            break;
-        }
+        expectPunct(PunctuatorID::RParen, "expected ')'");
+        auto p = std::make_unique<ParenExpr>();
+        p->expr = std::move(first);
+        return p;
     }
-
-    return expr;
+    if (checkPunct(PunctuatorID::LBracket)) {
+        return parseCollectionLiteral();
+    }
+    if (checkPunct(PunctuatorID::LBrace)) {
+        // `{` starts a closure, but `{ 1, 2 }` is a set literal. A brace whose
+        // next token is a value (or `}`) therefore opens a collection; anything
+        // else — a parameter list, a statement — is a closure.
+        // `{ x in ... }` / `{ x, y in ... }` is a closure with a bare parameter
+        // list, never a set literal. The `in` may follow several names, so the
+        // whole run is scanned.
+        if (closureParamsAhead())
+            return parseClosure(/*arrowSyntax=*/false);
+        const Token& nxt = peek(1);
+        bool setLiteral = nxt.kind == TokenKind::TK_IntLiteral ||
+                          nxt.kind == TokenKind::TK_FloatLiteral ||
+                          nxt.kind == TokenKind::TK_StringLiteral ||
+                          nxt.kind == TokenKind::TK_StringFragment ||
+                          nxt.kind == TokenKind::TK_CharLiteral ||
+                          nxt.kind == TokenKind::TK_Identifier ||
+                          (nxt.kind == TokenKind::TK_Punctuator &&
+                           (nxt.punct == PunctuatorID::Minus ||
+                            nxt.punct == PunctuatorID::LBracket));
+        if (setLiteral) return parseSetLiteral();
+        return parseClosure(/*arrowSyntax=*/false);
+    }
+    errorAt(cur(), "unexpected token in expression");
+    advance();
+    return nullptr;
 }
 
-ExprPtr Parser::parsePrimaryExpr() {
-    switch (peek().kind) {
-        // Literals
-        case TokenKind::IntegerLiteral: {
-            auto expr = makeNode<IntegerLiteralExpr>();
-            expr->value = advance().literal.intValue;
-            return expr;
-        }
-        case TokenKind::FloatLiteral: {
-            auto expr = makeNode<FloatLiteralExpr>();
-            expr->value = advance().literal.floatValue;
-            return expr;
-        }
-        case TokenKind::StringLiteral: {
-            std::string strValue = std::string(advance().stringValue);
-            // 检查是否包含字符串插值 \(expr)
-            size_t interpPos = strValue.find("\\(");
-            if (interpPos == std::string::npos) {
-                // 普通字符串
-                auto expr = makeNode<StringLiteralExpr>();
-                expr->value = strValue;
-                return expr;
-            }
-            // 字符串插值：拆分为片段
-            auto interpExpr = makeNode<InterpolatedStringExpr>();
-            size_t pos = 0;
-            while (pos < strValue.size()) {
-                size_t found = strValue.find("\\(", pos);
-                if (found == std::string::npos) {
-                    // 剩余部分是字面文本
-                    InterpolatedStringExpr::Segment seg;
-                    seg.literalText = strValue.substr(pos);
-                    interpExpr->segments.push_back(std::move(seg));
-                    break;
-                }
-                // \( 之前的字面文本
-                if (found > pos) {
-                    InterpolatedStringExpr::Segment seg;
-                    seg.literalText = strValue.substr(pos, found - pos);
-                    interpExpr->segments.push_back(std::move(seg));
-                }
-                // 解析 \(expr) 中的表达式
-                // 查找匹配的 )
-                size_t exprStart = found + 2;
-                int depth = 1;
-                size_t exprEnd = exprStart;
-                while (exprEnd < strValue.size() && depth > 0) {
-                    if (strValue[exprEnd] == '(') depth++;
-                    else if (strValue[exprEnd] == ')') depth--;
-                    if (depth > 0) exprEnd++;
-                }
-                std::string exprStr = strValue.substr(exprStart, exprEnd - exprStart);
-                // 创建临时词法分析器解析表达式
-                DiagnosticEngine tempDiag;
-                Lexer tempLexer(exprStr, "interpolation", tempDiag);
-                auto tempTokens = tempLexer.lexAll();
-                Parser tempParser(std::move(tempTokens), exprStr, "interpolation", tempDiag);
-                auto parsedExpr = tempParser.parseExpression();
-                InterpolatedStringExpr::Segment seg;
-                seg.expression = std::move(parsedExpr);
-                interpExpr->segments.push_back(std::move(seg));
-                pos = exprEnd + 1;
-            }
-            return interpExpr;
-        }
-        case TokenKind::CharLiteral: {
-            auto expr = makeNode<CharLiteralExpr>();
-            expr->value = advance().literal.charValue;
-            return expr;
-        }
-        case TokenKind::True: {
-            advance();
-            auto expr = makeNode<BoolLiteralExpr>();
-            expr->value = true;
-            return expr;
-        }
-        case TokenKind::False: {
-            advance();
-            auto expr = makeNode<BoolLiteralExpr>();
-            expr->value = false;
-            return expr;
-        }
-        case TokenKind::Nil: {
-            advance();
-            return makeNode<NilLiteralExpr>();
-        }
-
-        // Identifier
-        case TokenKind::Identifier: {
-            auto expr = makeNode<IdentifierExpr>();
-            expr->name = std::string(advance().stringValue);
-            return expr;
-        }
-
-        // self / super / Self
-        case TokenKind::KwSelf: {
-            advance();
-            return makeNode<SelfRefExpr>();
-        }
-        case TokenKind::KwSuper: {
-            advance();
-            return makeNode<SuperRefExpr>();
-        }
-        case TokenKind::KwSelfType: {
-            auto expr = makeNode<IdentifierExpr>();
-            expr->name = "Self";
-            advance();
-            return expr;
-        }
-
-        // Parenthesized expression, tuple, or arrow closure
-        case TokenKind::LParen: {
-            // Lookahead: check if this is an arrow closure (...)=> expr
-            // Only detect by checking for '=>' AFTER the closing ')'
-            bool isArrowClosure = false;
-            {
-                size_t save = pos_;
-                advance(); // (
-                // Skip to matching ')'
-                int depth = 1;
-                while (pos_ < tokens_.size() && depth > 0) {
-                    if (tokens_[pos_].is(TokenKind::LParen)) depth++;
-                    else if (tokens_[pos_].is(TokenKind::RParen)) depth--;
-                    if (depth > 0) pos_++;
-                }
-                // pos_ is now at the matching ')'
-                // Check if next token after ')' is '=>'
-                if (pos_ + 1 < tokens_.size() && tokens_[pos_ + 1].is(TokenKind::FatArrow)) {
-                    isArrowClosure = true;
-                }
-                pos_ = save; // restore
-            }
-
-            if (isArrowClosure) {
-                // Parse as arrow closure: (params) => expr
-                advance(); // (
-                auto closure = makeNode<ClosureExpr>();
-                closure->isArrow = true;
-                if (!check(TokenKind::RParen)) {
-                    do {
-                        ClosureExpr::Param param;
-                        if (check(TokenKind::Identifier)) {
-                            param.name = std::string(advance().stringValue);
-                        }
-                        if (match(TokenKind::Colon)) {
-                            param.type = parseType();
-                        }
-                        closure->params.push_back(std::move(param));
-                    } while (match(TokenKind::Comma));
-                }
-                expect(TokenKind::RParen);
-                expect(TokenKind::FatArrow);
-                // Parse body expression
-                auto bodyExpr = parseExpression();
-                if (bodyExpr) {
-                    auto retStmt = makeNode<ReturnStmt>();
-                    retStmt->value = std::move(bodyExpr);
-                    closure->body.push_back(std::move(retStmt));
-                }
-                return closure;
-            }
-
-            advance(); // (
-            if (check(TokenKind::RParen)) {
-                advance(); // empty tuple ()
-                auto expr = makeNode<TupleExpr>();
-                return expr;
-            }
-            ExprPtr inner = parseExpression();
-            if (match(TokenKind::Comma)) {
-                // Tuple
-                auto tuple = makeNode<TupleExpr>();
-                TupleExpr::Element first;
-                first.value = std::move(inner);
-                tuple->elements.push_back(std::move(first));
-                do {
-                    TupleExpr::Element elem;
-                    elem.value = parseExpression();
-                    tuple->elements.push_back(std::move(elem));
-                } while (match(TokenKind::Comma));
-                expect(TokenKind::RParen);
-                return tuple;
-            }
-            expect(TokenKind::RParen);
-            return inner;
-        }
-
-        // Array literal [1, 2, 3] or Dictionary literal ["key": "value"]
-        case TokenKind::LBracket: {
-            advance(); // [
-            if (check(TokenKind::RBracket)) {
-                advance(); // empty []
-                return makeNode<ArrayLiteralExpr>();
-            }
-            // Parse first expression
-            ExprPtr first = parseExpression();
-            // Check if it's a dictionary: [key: value, ...]
-            if (match(TokenKind::Colon)) {
-                auto dict = makeNode<DictLiteralExpr>();
-                DictLiteralExpr::Entry entry;
-                entry.key = std::move(first);
-                entry.value = parseExpression();
-                dict->entries.push_back(std::move(entry));
-                while (match(TokenKind::Comma)) {
-                    DictLiteralExpr::Entry e;
-                    e.key = parseExpression();
-                    expect(TokenKind::Colon);
-                    e.value = parseExpression();
-                    dict->entries.push_back(std::move(e));
-                }
-                expect(TokenKind::RBracket);
-                return dict;
-            }
-            // Array literal
-            auto arr = makeNode<ArrayLiteralExpr>();
-            arr->elements.push_back(std::move(first));
-            while (match(TokenKind::Comma)) {
-                arr->elements.push_back(parseExpression());
-            }
-            expect(TokenKind::RBracket);
-            return arr;
-        }
-
-        // Closure: { params -> return in body } or () => expr
-        // Closure or set literal: {1, 2, 3} vs { body }
-        case TokenKind::LBrace: {
-            // Heuristic: if { is followed by a literal, it's a set literal
-            // Use tokens_ array directly for lookahead to avoid issues
-            bool isSetLiteral = false;
-            if (pos_ + 1 < tokens_.size()) {
-                TokenKind nextKind = tokens_[pos_ + 1].kind;
-                isSetLiteral = (nextKind == TokenKind::IntegerLiteral ||
-                               nextKind == TokenKind::FloatLiteral ||
-                               nextKind == TokenKind::StringLiteral ||
-                               nextKind == TokenKind::CharLiteral ||
-                               nextKind == TokenKind::True ||
-                               nextKind == TokenKind::False ||
-                               nextKind == TokenKind::Nil);
-            }
-            if (isSetLiteral) {
-                // Parse as set literal: {1, 2, 3}
-                advance(); // {
-                auto setLit = makeNode<SetLiteralExpr>();
-                while (!check(TokenKind::RBrace) && !isAtEnd()) {
-                    ExprPtr elem = parseExpression();
-                    if (elem) {
-                        setLit->elements.push_back(std::move(elem));
-                    } else {
+// True when the tokens after the current `{` are a closure parameter list —
+// one or more names, optionally typed, then `in`. A set literal has no `in`, so
+// this is what tells `{ x in ... }` apart from `{ x }`.
+bool Parser::closureParamsAhead() {
+    size_t off = 1;
+    // An empty or immediately-closed brace is a literal, not a parameter list.
+    if (peek(off).kind == TokenKind::TK_Punctuator &&
+        peek(off).punct == PunctuatorID::RBrace)
+        return false;
+    bool sawName = false;
+    while (off < 64) {
+        const Token& t = peek(off);
+        if (t.kind == TokenKind::TK_Identifier ||
+            t.kind == TokenKind::TK_Keyword) {
+            sawName = true;
+            ++off;
+            // `name: Type` is a typed parameter; skip the type up to the comma
+            // or the `in` that ends the list.
+            if (peek(off).kind == TokenKind::TK_Punctuator &&
+                peek(off).punct == PunctuatorID::Colon) {
+                ++off;
+                while (off < 64) {
+                    const Token& ty = peek(off);
+                    if (ty.kind == TokenKind::TK_Punctuator &&
+                        (ty.punct == PunctuatorID::Comma ||
+                         ty.punct == PunctuatorID::RBrace))
                         break;
-                    }
-                    if (!check(TokenKind::Comma)) break;
-                    advance(); // ,
-                }
-                if (check(TokenKind::RBrace)) advance(); // }
-                return setLit;
-            }
-
-            auto closure = makeNode<ClosureExpr>();
-            advance(); // {
-
-            // Capture list: [weak self, unowned delegate]
-            if (check(TokenKind::LBracket)) {
-                advance(); // [
-                do {
-                    if (check(TokenKind::Identifier)) {
-                        std::string capture = std::string(advance().stringValue);
-                        if (capture == "weak" || capture == "unowned") {
-                            if (check(TokenKind::Identifier)) {
-                                capture += " " + std::string(advance().stringValue);
-                            }
-                        }
-                        closure->captureList.push_back(capture);
-                    }
-                } while (match(TokenKind::Comma));
-                expect(TokenKind::RBracket);
-            }
-
-            // Parameters: (a, b) or a, b in
-            if (check(TokenKind::LParen)) {
-                advance(); // (
-                do {
-                    ClosureExpr::Param param;
-                    if (check(TokenKind::Identifier)) {
-                        param.name = std::string(advance().stringValue);
-                    }
-                    if (match(TokenKind::Colon)) {
-                        param.type = parseType();
-                    }
-                    closure->params.push_back(std::move(param));
-                } while (match(TokenKind::Comma));
-                expect(TokenKind::RParen);
-            }
-
-            // Return type
-            if (match(TokenKind::Arrow)) {
-                closure->returnType = parseType();
-            }
-
-            // 'in' keyword separates params from body
-            match(TokenKind::KwIn);
-
-            // Body
-            while (!check(TokenKind::RBrace) && !isAtEnd()) {
-                auto stmt = parseStatement();
-                if (stmt) closure->body.push_back(std::move(stmt));
-            }
-            expect(TokenKind::RBrace);
-            return closure;
-        }
-
-        // if expression
-        case TokenKind::KwIf: {
-            advance(); // if
-            auto expr = makeNode<IfExpr>();
-            expr->condition = parseExpression();
-            // if x > 0 { expr } else { expr }
-            if (expect(TokenKind::LBrace)) {
-                expr->thenExpr = parseExpression();
-                expect(TokenKind::RBrace);
-            }
-            if (match(TokenKind::KwElse)) {
-                if (expect(TokenKind::LBrace)) {
-                    expr->elseExpr = parseExpression();
-                    expect(TokenKind::RBrace);
+                    ++off;
                 }
             }
-            return expr;
+            if (peek(off).kind == TokenKind::TK_Keyword &&
+                peek(off).keyword == KeywordID::In)
+                return sawName;
+            if (peek(off).kind == TokenKind::TK_Punctuator &&
+                peek(off).punct == PunctuatorID::Comma) { ++off; continue; }
+            return false;
         }
+        return false;
+    }
+    return false;
+}
 
-        // Type cast: expr as Type, expr as? Type, expr as! Type
-        case TokenKind::KwAs: {
-            // This shouldn't happen in prefix position; handled in postfix
-            break;
-        }
-
-        // Selector: #selector(method) or Macro: #macroName(args)
-        case TokenKind::Hash: {
-            advance(); // #
-            if (check(TokenKind::Identifier)) {
-                auto& name = advance().stringValue;
-                if (name == "selector") {
-                    if (expect(TokenKind::LParen)) {
-                        auto sel = makeNode<SelectorExpr>();
-                        sel->method = parseExpression();
-                        expect(TokenKind::RParen);
-                        return sel;
-                    }
-                } else if (name == "unique") {
-                    // #unique("base") 生成全局唯一标识符
-                    // Generate globally unique identifier
-                    if (expect(TokenKind::LParen)) {
-                        std::string base;
-                        if (check(TokenKind::StringLiteral)) {
-                            base = std::string(advance().stringValue);
-                        }
-                        expect(TokenKind::RParen);
-                        // 返回一个字符串字面量，包含唯一标识符
-                        auto result = makeNode<StringLiteralExpr>();
-                        result->value = base + "$" + std::to_string(uniqueIdCounter_++);
-                        return result;
-                    }
-                } else {
-                    // 宏展开表达式 / Macro expansion expression
-                    auto macro = makeNode<MacroExpansionExpr>();
-                    macro->macroName = std::string(name);
-                    if (check(TokenKind::LParen)) {
-                        advance(); // (
-                        while (!check(TokenKind::RParen) && !isAtEnd()) {
-                            auto arg = parseExpression();
-                            if (arg) macro->args.push_back(std::move(arg));
-                            if (!match(TokenKind::Comma)) break;
-                        }
-                        expect(TokenKind::RParen);
-                    }
-                    return macro;
-                }
-            }
-            error("expected '#selector(...)', '#unique(...)', or '#macroName(...)'");
-            return nullptr;
-        }
-
+// True when the token after the current one can begin an expression. Used to
+// tell a trailing `?` (Optional promotion) from `? :` (conditional) and `?.`
+// (chaining), both of which are followed by something expression-like.
+bool Parser::nextStartsExpression() {
+    const Token& t = peek(1);
+    switch (t.kind) {
+        case TokenKind::TK_IntLiteral:
+        case TokenKind::TK_FloatLiteral:
+        case TokenKind::TK_StringLiteral:
+        case TokenKind::TK_StringFragment:
+        case TokenKind::TK_CharLiteral:
+        case TokenKind::TK_Identifier:
+        case TokenKind::TK_Keyword:
+            return true;
+        case TokenKind::TK_Punctuator:
+            // `.` continues a member access and `-` a negation; both continue
+            // the expression rather than starting a new one after `?`.
+            return t.punct == PunctuatorID::Dot ||
+                   t.punct == PunctuatorID::Minus ||
+                   t.punct == PunctuatorID::Bang;
         default:
-            break;
+            return false;
     }
-
-    return nullptr;
 }
 
-// ─── Call / Member / Subscript ────────────────────────────────────────────
-
-ExprPtr Parser::parseCallExpr(ExprPtr callee) {
-    expect(TokenKind::LParen);
-    auto expr = makeNode<CallExpr>();
-    expr->callee = std::move(callee);
-
-    if (!check(TokenKind::RParen)) {
-        do {
-            CallExpr::Arg arg;
-            // Check for labeled argument: label: expr
-            if (check(TokenKind::Identifier) && peekAt(1).is(TokenKind::Colon)) {
-                arg.label = std::string(advance().stringValue);
-                advance(); // :
-            }
-            arg.value = parseExpression();
-            expr->args.push_back(std::move(arg));
-        } while (match(TokenKind::Comma));
-    }
-
-    expect(TokenKind::RParen);
-    return expr;
-}
-
-ExprPtr Parser::parseMemberAccessExpr(ExprPtr base) {
-    auto expr = makeNode<MemberAccessExpr>();
-    expr->base = std::move(base);
-    if (check(TokenKind::Identifier)) {
-        expr->member = std::string(advance().stringValue);
-    } else if (check(TokenKind::IntegerLiteral)) {
-        // 元组访问: tuple.0, tuple.1, etc.
-        expr->member = std::to_string(advance().literal.intValue);
-    } else {
-        error("expected member name");
-    }
-    return expr;
-}
-
-ExprPtr Parser::parseSubscriptExpr(ExprPtr base) {
-    expect(TokenKind::LBracket);
-    auto expr = makeNode<SubscriptExpr>();
-    expr->base = std::move(base);
-
-    do {
-        expr->indices.push_back(parseExpression());
-    } while (match(TokenKind::Comma));
-
-    expect(TokenKind::RBracket);
-    return expr;
-}
-
-// ─── Type parsing ─────────────────────────────────────────────────────────
-
-TypeReprPtr Parser::parseType() {
-    // Check for function type first: (A, B) -> C
-    if (check(TokenKind::LParen)) {
-        auto& next = peekAt(1);
-        if (next.is(TokenKind::RParen) || next.is(TokenKind::Identifier) ||
-            next.is(TokenKind::KwSelfType)) {
-            // Could be function type or tuple type — try function type
-            // if we see -> after the closing paren
-            size_t savePos = pos_;
-            // Quick lookahead for ->
-            int depth = 1;
-            size_t i = pos_ + 1;
-            while (i < tokens_.size() && depth > 0) {
-                if (tokens_[i].is(TokenKind::LParen)) depth++;
-                else if (tokens_[i].is(TokenKind::RParen)) depth--;
-                i++;
-            }
-            if (i < tokens_.size() && tokens_[i].is(TokenKind::Arrow)) {
-                return parseFunctionType();
-            }
-            pos_ = savePos; // restore
-        }
-    }
-
-    return parseSimpleType();
-}
-
-TypeReprPtr Parser::parseSimpleType() {
-    // 'some' opaque type
-    if (match(TokenKind::KwSome)) {
-        auto type = makeNode<OpaqueTypeRepr>();
-        type->constraint = parseSimpleType();
-        return type;
-    }
-
-    // 'any' existential type
-    if (match(TokenKind::KwAny)) {
-        auto type = makeNode<ExistentialTypeRepr>();
-        type->constraint = parseSimpleType();
-        return type;
-    }
-
-    // Self type
-    if (match(TokenKind::KwSelfType)) {
-        return makeNode<SelfTypeRepr>();
-    }
-
-    // Named type: Identifier, Identifier<T, U>
-    if (check(TokenKind::Identifier)) {
-        auto namedType = makeNode<NamedTypeRepr>();
-        namedType->name = std::string(advance().stringValue);
-
-        // Module prefix: Module.Type
-        while (match(TokenKind::Dot)) {
-            if (check(TokenKind::Identifier)) {
-                namedType->name += ".";
-                namedType->name += advance().stringValue;
-            }
-        }
-
-        // Generic arguments
-        if (match(TokenKind::Less)) {
-            do {
-                namedType->genericArgs.push_back(parseType());
-            } while (match(TokenKind::Comma));
-            expect(TokenKind::Greater);
-        }
-
-        TypeReprPtr type = std::move(namedType);
-
-        // Postfix: [] for Array, [:] for Dict, ? for Optional
-        while (true) {
-            if (check(TokenKind::LBracket)) {
-                advance(); // [
-                if (match(TokenKind::Colon)) {
-                    // Dictionary: [Key: Value]
-                    expect(TokenKind::RBracket);
-                    auto dictType = makeNode<DictTypeRepr>();
-                    dictType->keyType = std::move(type);
-                    dictType->valueType = parseType();
-                    type = std::move(dictType);
-                } else if (match(TokenKind::RBracket)) {
-                    // Array: [Element]
-                    auto arrType = makeNode<ArrayTypeRepr>();
-                    arrType->elementType = std::move(type);
-                    type = std::move(arrType);
-                } else {
-                    // Shouldn't happen in type context
-                    break;
-                }
-            } else if (match(TokenKind::Question)) {
-                auto optType = makeNode<OptionalTypeRepr>();
-                optType->base = std::move(type);
-                type = std::move(optType);
-            } else {
-                break;
-            }
-        }
-
-        return type;
-    }
-
-    // Array type: [T]
-    if (check(TokenKind::LBracket)) {
-        advance(); // [
-        auto elemType = parseType();
-        if (match(TokenKind::Colon)) {
-            auto valType = parseType();
-            expect(TokenKind::RBracket);
-            auto dictType = makeNode<DictTypeRepr>();
-            dictType->keyType = std::move(elemType);
-            dictType->valueType = std::move(valType);
-            return dictType;
-        }
-        expect(TokenKind::RBracket);
-        auto arrType = makeNode<ArrayTypeRepr>();
-        arrType->elementType = std::move(elemType);
-        return arrType;
-    }
-
-    error("expected type");
-    return nullptr;
-}
-
-TypeReprPtr Parser::parseFunctionType() {
-    auto type = makeNode<FunctionTypeRepr>();
-
-    expect(TokenKind::LParen);
-    if (!check(TokenKind::RParen)) {
-        do {
-            FunctionTypeRepr::Param param;
-            param.type = parseType();
-            type->params.push_back(std::move(param));
-        } while (match(TokenKind::Comma));
-    }
-    expect(TokenKind::RParen);
-
-    // async/throws
-    while (true) {
-        if (match(TokenKind::KwAsync)) { type->isAsync = true; continue; }
-        if (match(TokenKind::KwThrows)) { type->isThrows = true; continue; }
-        break;
-    }
-
-    expect(TokenKind::Arrow);
-    type->returnType = parseType();
-
-    return type;
-}
-
-// ─── Pattern parsing ──────────────────────────────────────────────────────
-
-PatternPtr Parser::parsePattern() {
-    // Wildcard
-    if (match(TokenKind::Underscore)) {
-        return makeNode<WildcardPattern>();
-    }
-
-    // let/var binding
-    bool isLet = true;
-    if (match(TokenKind::KwLet)) isLet = true;
-    else if (match(TokenKind::KwVar)) isLet = false;
-
-    // Identifier pattern
-    if (check(TokenKind::Identifier)) {
-        auto pat = makeNode<IdentifierPattern>();
-        pat->name = std::string(advance().stringValue);
-        pat->isLet = isLet;
-        return pat;
-    }
-
-    // Enum case pattern: .caseName
-    if (check(TokenKind::Dot) && peekAt(1).is(TokenKind::Identifier)) {
-        advance(); // .
-        auto pat = makeNode<EnumCasePattern>();
-        pat->caseName = std::string(advance().stringValue);
-
-        // Associated values: .case(let x, let y)
-        if (check(TokenKind::LParen)) {
-            advance();
-            do {
-                pat->associatedPatterns.push_back(parsePattern());
-            } while (match(TokenKind::Comma));
-            expect(TokenKind::RParen);
-        }
-        return pat;
-    }
-
-    // Tuple pattern: (a, b, c)
-    if (check(TokenKind::LParen)) {
+// `{1, 2, 3}` — a set literal. The opening brace is consumed by the caller.
+NodePtr Parser::parseSetLiteral() {
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    auto set = std::make_unique<SetLitExpr>();
+    if (checkPunct(PunctuatorID::RBrace)) {
         advance();
-        auto pat = makeNode<TuplePattern>();
-        if (!check(TokenKind::RParen)) {
-            do {
-                pat->elements.push_back(parsePattern());
-            } while (match(TokenKind::Comma));
-        }
-        expect(TokenKind::RParen);
-        return pat;
+        return set;   // the empty set
     }
-
-    // is Type pattern
-    if (match(TokenKind::KwIs)) {
-        auto pat = makeNode<IsTypePattern>();
-        pat->type = parseType();
-        return pat;
+    while (!atEnd()) {
+        NodePtr e = parseExpr();
+        if (!e) break;
+        set->elements.push_back(std::move(e));
+        if (!matchPunct(PunctuatorID::Comma)) break;
+        if (checkPunct(PunctuatorID::RBrace)) break;
     }
-
-    // Fallback: try expression pattern (常量模式匹配)
-    auto expr = parseExpression();
-    if (expr) {
-        // 创建表达式模式 / Create expression pattern
-        auto pat = makeNode<ExpressionPattern>();
-        pat->expression = std::move(expr);
-        return pat;
-    }
-
-    error("expected pattern");
-    return makeNode<WildcardPattern>();
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return set;
 }
 
-// ─── Function parameters ──────────────────────────────────────────────────
+NodePtr Parser::parseCollectionLiteral() {
+    expectPunct(PunctuatorID::LBracket, "expected '['");
+    if (matchPunct(PunctuatorID::RBracket)) {
+        auto a = std::make_unique<ArrayLitExpr>();
+        return a; // empty array
+    }
+    // Empty dictionary literal `[:]`. This must be recognised before parsing
+    // a first element, otherwise the leading colon is reported as a stray
+    // token.
+    if (checkPunct(PunctuatorID::Colon)) {
+        advance(); // :
+        expectPunct(PunctuatorID::RBracket, "expected ']'");
+        return std::make_unique<DictLitExpr>();
+    }
+    NodePtr first = parseExpr();
+    if (matchPunct(PunctuatorID::Colon)) {
+        // dictionary
+        auto d = std::make_unique<DictLitExpr>();
+        NodePtr firstVal = parseExpr();
+        d->keys.push_back(std::move(first));
+        d->values.push_back(std::move(firstVal));
+        while (matchPunct(PunctuatorID::Comma)) {
+            if (checkPunct(PunctuatorID::RBracket)) break;
+            NodePtr k = parseExpr();
+            expectPunct(PunctuatorID::Colon, "expected ':' in dictionary");
+            NodePtr v = parseExpr();
+            d->keys.push_back(std::move(k));
+            d->values.push_back(std::move(v));
+        }
+        expectPunct(PunctuatorID::RBracket, "expected ']'");
+        return d;
+    }
+    auto a = std::make_unique<ArrayLitExpr>();
+    a->elements.push_back(std::move(first));
+    while (matchPunct(PunctuatorID::Comma)) {
+        if (checkPunct(PunctuatorID::RBracket)) break;
+        a->elements.push_back(parseExpr());
+    }
+    expectPunct(PunctuatorID::RBracket, "expected ']'");
+    return a;
+}
 
-FunctionParam Parser::parseFunctionParam() {
-    FunctionParam param;
-
-    // External label (optional): externalName internalName: Type
-    if (check(TokenKind::Identifier)) {
-        // First identifier is the external label
-        param.externalLabel = std::string(advance().stringValue);
-
-        // Second identifier (if present) is the internal name
-        if (check(TokenKind::Identifier)) {
-            param.internalName = std::string(advance().stringValue);
+NodePtr Parser::parseClosure(bool arrowSyntax) {
+    auto c = std::make_unique<ClosureExpr>();
+    c->isArrowSyntax = arrowSyntax;
+    if (arrowSyntax) {
+        // (params) => expr   OR   params => expr
+        if (matchPunct(PunctuatorID::LParen)) {
+            if (!checkPunct(PunctuatorID::RParen)) {
+                while (!atEnd()) {
+                    Param p;
+                    if (check(TokenKind::TK_Identifier)) { p.externalName = cur().text; p.internalName = cur().text; advance(); }
+                    if (matchPunct(PunctuatorID::Colon)) p.type = parseType();
+                    c->params.push_back(std::move(p));
+                    if (!matchPunct(PunctuatorID::Comma)) break;
+                }
+            }
+            expectPunct(PunctuatorID::RParen, "expected ')'");
+        } else if (check(TokenKind::TK_Identifier)) {
+            Param p; p.externalName = cur().text; p.internalName = cur().text; advance();
+            if (matchPunct(PunctuatorID::Colon)) p.type = parseType();
+            c->params.push_back(std::move(p));
+        }
+        expectPunct(PunctuatorID::FatArrow, "expected '=>'");
+        c->body.push_back([&]() -> NodePtr {
+            auto r = std::make_unique<ReturnStmt>();
+            r->value = parseExpr();
+            return r;
+        }());
+        return c;
+    }
+    // block closure: { (params) -> Ret in ... }
+    expectPunct(PunctuatorID::LBrace, "expected '{'");
+    // optional parameter clause before `in`
+    if (checkPunct(PunctuatorID::LParen)) {
+        advance();
+        while (!checkPunct(PunctuatorID::RParen) && !atEnd()) {
+            Param p;
+            if (check(TokenKind::TK_Identifier)) { p.externalName = cur().text; p.internalName = cur().text; advance(); }
+            if (matchPunct(PunctuatorID::Colon)) p.type = parseType();
+            c->params.push_back(std::move(p));
+            if (!matchPunct(PunctuatorID::Comma)) break;
+        }
+        expectPunct(PunctuatorID::RParen, "expected ')'");
+    } else if (check(TokenKind::TK_Identifier) &&
+               peek(1).kind == TokenKind::TK_Punctuator && peek(1).punct == PunctuatorID::Colon) {
+        Param p;
+        p.externalName = cur().text; p.internalName = cur().text; advance();
+        advance(); // consume ':'
+        p.type = parseType();
+        c->params.push_back(std::move(p));
+    } else {
+        // `{ x, y in ... }` — bare identifier parameter list terminated by `in`
+        size_t save = pos_;
+        std::vector<std::string> names;
+        bool ok = true;
+        while (true) {
+            if (!check(TokenKind::TK_Identifier)) { ok = false; break; }
+            names.push_back(cur().text);
+            advance();
+            if (checkKw(KeywordID::In)) break;
+            if (matchPunct(PunctuatorID::Comma)) continue;
+            ok = false; break;
+        }
+        if (ok && checkKw(KeywordID::In)) {
+            for (auto& n : names) {
+                Param p; p.externalName = n; p.internalName = n;
+                c->params.push_back(std::move(p));
+            }
         } else {
-            // No internal name — external label IS the internal name
-            // Unless external label is "_" (unlabeled)
-            if (param.externalLabel == "_") {
-                param.internalName = "_";
+            pos_ = save; // not a parameter list; rewind
+        }
+    }
+    if (matchPunct(PunctuatorID::Arrow)) c->returnType = parseType();
+    if (matchKw(KeywordID::In)) {
+        while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+            NodePtr s = parseStatement();
+            if (s) c->body.push_back(std::move(s));
+            else synchronize();
+        }
+    } else {
+        // no `in`: the whole body is statements; but we already may have parsed a param
+        // treat until '}'
+        while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+            NodePtr s = parseStatement();
+            if (s) c->body.push_back(std::move(s));
+            else synchronize();
+        }
+    }
+    expectPunct(PunctuatorID::RBrace, "expected '}'");
+    return c;
+}
+
+// ─── types ─────────────────────────────────────────────────────────────────────
+NodePtr Parser::parseType() {
+    NodePtr base;
+    if (checkKw(KeywordID::Inout)) {
+        advance();
+        auto it = std::make_unique<InoutType>();
+        it->pointee = parseType();
+        base = std::move(it);
+        return parseTypePostfix(std::move(base));
+    }
+    if (checkPunct(PunctuatorID::LBracket)) {
+        advance();
+        if (checkPunct(PunctuatorID::RBracket)) {
+            advance();
+            auto a = std::make_unique<ArrayType>();
+            a->element = std::make_unique<PlaceholderType>();
+            base = std::move(a);
+        } else {
+            NodePtr first = parseType();
+            if (matchPunct(PunctuatorID::Colon)) {
+                NodePtr val = parseType();
+                auto d = std::make_unique<DictType>();
+                d->key = std::move(first); d->value = std::move(val);
+                expectPunct(PunctuatorID::RBracket, "expected ']'");
+                base = std::move(d);
             } else {
-                param.internalName = param.externalLabel;
+                auto a = std::make_unique<ArrayType>();
+                a->element = std::move(first);
+                expectPunct(PunctuatorID::RBracket, "expected ']'");
+                base = std::move(a);
             }
         }
-    } else if (match(TokenKind::Underscore)) {
-        // Unlabeled parameter: _ name: Type
-        param.externalLabel = "_";
-        if (check(TokenKind::Identifier)) {
-            param.internalName = std::string(advance().stringValue);
+        return parseTypePostfix(std::move(base));
+    }
+    if (check(TokenKind::TK_Identifier)) {
+        auto n = std::make_unique<NamedType>();
+        n->name = cur().text; advance();
+        if (checkPunct(PunctuatorID::Less)) {
+            advance();
+            while (!checkPunct(PunctuatorID::Greater) && !atEnd()) {
+                n->genericArgs.push_back(parseType());
+                if (!matchPunct(PunctuatorID::Comma)) break;
+            }
+            expectPunct(PunctuatorID::Greater, "expected '>'");
         }
-    }
-
-    expect(TokenKind::Colon);
-
-    // inout modifier
-    if (match(TokenKind::KwInOut)) {
-        param.isInOut = true;
-    }
-
-    param.type = parseType();
-
-    // Default value
-    if (match(TokenKind::Assign)) {
-        param.defaultValue = parseExpression();
-    }
-
-    // Variadic
-    if (match(TokenKind::Ellipsis)) {
-        param.isVariadic = true;
-    }
-
-    return param;
-}
-
-std::vector<FunctionParam> Parser::parseParamList() {
-    std::vector<FunctionParam> params;
-    if (!check(TokenKind::RParen)) {
-        do {
-            params.push_back(parseFunctionParam());
-        } while (match(TokenKind::Comma));
-    }
-    return params;
-}
-
-// ─── Generic parameters ───────────────────────────────────────────────────
-
-std::vector<GenericParam> Parser::parseGenericParams() {
-    std::vector<GenericParam> params;
-    expect(TokenKind::Less);
-    do {
-        if (check(TokenKind::Identifier)) {
-            GenericParam param;
-            param.name = std::string(advance().stringValue);
-
-            // 泛型约束: T: Protocol, T: A & B
-            if (match(TokenKind::Colon)) {
-                // 解析约束类型 / Parse constraint types
-                do {
-                    TypeReprPtr constraint = parseType();
-                    if (constraint) {
-                        param.constraints.push_back(std::move(constraint));
-                    }
-                } while (match(TokenKind::Amp)); // A & B 用 & 分隔
-            }
-
-            // 默认值: T = Int
-            if (match(TokenKind::Assign)) {
-                param.defaultValue = parseType();
-            }
-
-            params.push_back(std::move(param));
+        base = std::move(n);
+    } else if (checkPunct(PunctuatorID::LParen)) {
+        // tuple type or function type
+        advance();
+        if (checkPunct(PunctuatorID::RParen)) {
+            advance();
+            // unit type () -> treat as empty tuple
+            auto t = std::make_unique<TupleType>();
+            base = std::move(t);
         } else {
-            error("expected generic parameter name");
+            NodePtr first = parseType();
+            if (matchPunct(PunctuatorID::Arrow)) {
+                // function type () -> R
+                auto ft = std::make_unique<FuncType>();
+                ft->params.push_back(std::move(first));
+                ft->ret = parseType();
+                base = std::move(ft);
+            } else if (matchPunct(PunctuatorID::Comma)) {
+                auto t = std::make_unique<TupleType>();
+                t->elements.push_back(std::move(first));
+                while (!checkPunct(PunctuatorID::RParen) && !atEnd()) {
+                    t->elements.push_back(parseType());
+                    if (!matchPunct(PunctuatorID::Comma)) break;
+                }
+                expectPunct(PunctuatorID::RParen, "expected ')'");
+                base = std::move(t);
+            } else {
+                expectPunct(PunctuatorID::RParen, "expected ')'");
+                auto t = std::make_unique<TupleType>();
+                t->elements.push_back(std::move(first));
+                base = std::move(t);
+            }
         }
-    } while (match(TokenKind::Comma));
-    expect(TokenKind::Greater);
-    return params;
+        return parseTypePostfix(std::move(base));
+    } else if (checkPunct(PunctuatorID::Bang)) {
+        advance();
+        base = std::make_unique<NeverType>();
+        return parseTypePostfix(std::move(base));
+    } else if (check(TokenKind::TK_Identifier) && cur().text == "_") {
+        advance();
+        base = std::make_unique<PlaceholderType>();
+        return parseTypePostfix(std::move(base));
+    } else {
+        errorAt(cur(), "expected type");
+        base = std::make_unique<NamedType>();
+        static_cast<NamedType*>(base.get())->name = "<<error>>";
+    }
+    return parseTypePostfix(std::move(base));
 }
 
-// ─── Access control ───────────────────────────────────────────────────────
-
-AccessLevel Parser::parseAccessLevel() {
-    if (match(TokenKind::KwPublic)) return AccessLevel::Public;
-    if (match(TokenKind::KwInternal)) return AccessLevel::Internal;
-    if (match(TokenKind::KwFileprivate)) return AccessLevel::FilePrivate;
-    if (match(TokenKind::KwPrivate)) return AccessLevel::Private;
-    if (match(TokenKind::KwOpen)) return AccessLevel::Open;
-    return AccessLevel::Internal;
+NodePtr Parser::parseTypePostfix(NodePtr base) {
+    while (true) {
+        if (checkPunct(PunctuatorID::Question)) {
+            advance();
+            auto o = std::make_unique<OptionalType>();
+            o->wrapped = std::move(base);
+            base = std::move(o);
+        } else if (matchKw(KeywordID::Some)) {
+            // opaque type `some Protocol`
+            auto o = std::make_unique<OptionalType>(); // reuse; sema distinguishes
+            o->wrapped = std::move(base);
+            base = std::move(o);
+        } else if (checkPunct(PunctuatorID::LBracket)) {
+            advance();
+            if (checkPunct(PunctuatorID::RBracket)) {
+                advance();
+                auto a = std::make_unique<ArrayType>();
+                a->element = std::move(base);
+                base = std::move(a);
+            } else {
+                NodePtr key = parseType();
+                if (matchPunct(PunctuatorID::Colon)) {
+                    NodePtr val = parseType();
+                    auto d = std::make_unique<DictType>();
+                    d->key = std::move(key); d->value = std::move(val);
+                    // wrap: base[key:value]? SukiCode uses base as element; here we treat [K:V]
+                    base = std::move(d);
+                } else {
+                    auto a = std::make_unique<ArrayType>();
+                    a->element = std::move(key);
+                    base = std::move(a);
+                }
+                expectPunct(PunctuatorID::RBracket, "expected ']'");
+            }
+        } else if (checkPunct(PunctuatorID::Arrow)) {
+            advance();
+            auto ft = std::make_unique<FuncType>();
+            // base could be a single param type or tuple
+            ft->params.push_back(std::move(base));
+            ft->ret = parseType();
+            base = std::move(ft);
+        } else if (checkPunct(PunctuatorID::Amp)) {
+            advance();
+            auto r = std::make_unique<RefType>();
+            r->refKind = "shared";
+            r->pointee = parseType();
+            base = std::move(r);
+        } else if (checkPunct(PunctuatorID::At)) {
+            advance();
+            std::string kind;
+            if (check(TokenKind::TK_Identifier)) { kind = cur().text; advance(); }
+            auto r = std::make_unique<RefType>();
+            r->refKind = kind.empty() ? "shared" : kind;
+            r->pointee = parseType();
+            base = std::move(r);
+        } else if (checkPunct(PunctuatorID::Dot)) {
+            advance();
+            if (check(TokenKind::TK_Identifier) && cur().text == "Type") {
+                advance();
+                auto m = std::make_unique<MetatypeType>();
+                m->base = std::move(base); m->isMeta = true;
+                base = std::move(m);
+            } else if (matchKw(KeywordID::Protocol)) {
+                auto m = std::make_unique<MetatypeType>();
+                m->base = std::move(base); m->isMeta = false;
+                base = std::move(m);
+            } else { errorAt(cur(), "expected 'Type' or 'Protocol'"); break; }
+        } else {
+            break;
+        }
+    }
+    return base;
 }
 
 } // namespace suki
