@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // ─── printing ─────────────────────────────────────────────────────────────
 void print(const char* s) {
@@ -635,4 +636,27 @@ void suki_atomic_store_i64(int64_t* p, int64_t v) {
 
 int64_t suki_atomic_add_i64(int64_t* p, int64_t delta) {
     return p ? __atomic_fetch_add(p, delta, __ATOMIC_ACQ_REL) + delta : 0;
+}
+
+// ─── async / concurrency support ────────────────────────────────────────────────
+void suki_sleep(int64_t ms) {
+    if (ms <= 0) return;
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000);
+    req.tv_nsec = (long)((ms % 1000) * 1000000L);
+    nanosleep(&req, NULL);
+}
+
+// A CAS loop on the first word of an `Int` makes a usable spin lock for the
+// concurrency stress scenarios the language binding exercises.
+void suki_spin_lock(int64_t* lock) {
+    int64_t expected = 0;
+    while (!__atomic_compare_exchange_n(lock, &expected, 1, 1,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        expected = 0;
+    }
+}
+
+void suki_spin_unlock(int64_t* lock) {
+    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
 }

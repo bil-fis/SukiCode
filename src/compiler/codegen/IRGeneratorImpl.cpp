@@ -1255,6 +1255,11 @@ private:
         if (base && base->kind == NodeKind::IdentExpr) {
             auto it = locals_.find(static_cast<IdentExpr*>(base)->name);
             if (it != locals_.end()) return it->second;
+            // Module-level variables also have their address taken here, so an
+            // `&counter` reference resolves to the global slot (detached_async.suki
+            // passes the global to `atomicAdd`/`mutexLock`).
+            auto git = globalsMap_.find(static_cast<IdentExpr*>(base)->name);
+            if (git != globalsMap_.end()) return git->second;
         }
         llvm::Value* v = genExpr(base);
         if (!v || !v->getType()->isAggregateType()) return nullptr;
@@ -1699,9 +1704,22 @@ private:
                 }
                 llvm::Value* v = genExpr(u->operand.get());
                 if (!v) return nullptr;
-                // `try` / `await` are prefix keywords carrying a flag, not
-                // operators; both pass the operand value through unchanged.
-                if (u->isTry || u->isAwait) return v;
+                // `try` passes the operand value through unchanged. `await` expects a
+                // Future handle (i8*) already produced by the async call and unboxes
+                // the boxed result of the awaited type.
+                if (u->isTry) return v;
+                if (u->isAwait) {
+                    if (!v) return nullptr;
+                    const Type* rt = u->semaType;
+                    if (!rt || rt->kind == TypeKind::Void || rt->kind == TypeKind::Unknown)
+                        return llvm::Constant::getNullValue(
+                            llvm::Type::getInt32Ty(*ctx_));
+                    llvm::Type* rty = layout_->lower(rt);
+                    if (!rty) return nullptr;
+                    llvm::Value* p = b_->CreateBitCast(v,
+                        llvm::PointerType::getUnqual(rty));
+                    return b_->CreateLoad(rty, p);
+                }
                 switch (u->op) {
                     case PunctuatorID::Minus:
                         return v->getType()->isFloatingPointTy() ? b_->CreateFNeg(v)
@@ -3426,6 +3444,109 @@ private:
         return b_->CreateCall(fty, fp, callArgs);
     }
 
+    // ─── async / Future lowering (synchronous model) ────────────────────────────
+    // An async call runs immediately and its result is heap-boxed; the returned
+    // pointer is the Future handle. `await` later unboxes it. This yields correct
+    // single-threaded semantics for the language binding's async tests; real
+    // scheduling is a separate concern layered on top of this handle.
+
+    // Synchronous runtime builtins with fixed C prototypes, intercepted by name so
+    // the exact signature (pointer first argument, etc.) is emitted.
+    llvm::Value* genSyncBuiltin(const std::string& name, CallExpr* e) {
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::Type* i64p = llvm::PointerType::getUnqual(i64);
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+        std::string cname;
+        std::vector<llvm::Type*> ptys;
+        llvm::Type* rty = voidTy;
+        if (name == "atomicAdd")         { cname = "suki_atomic_add_i64"; ptys = {i64p, i64}; rty = i64; }
+        else if (name == "mutexLock")    { cname = "suki_spin_lock";      ptys = {i64p};      rty = voidTy; }
+        else if (name == "mutexUnlock")  { cname = "suki_spin_unlock";    ptys = {i64p};      rty = voidTy; }
+        else return nullptr;
+        llvm::Function* fn = declareExternalSig(cname, ptys, rty);
+        std::vector<llvm::Value*> args;
+        for (auto& a : e->arguments) {
+            llvm::Value* v = genExpr(a.get());
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        for (size_t i = 0; i < args.size() && i < ptys.size(); ++i)
+            args[i] = coerce(args[i], ptys[i]);
+        return b_->CreateCall(fn, args);
+    }
+
+    // Emit `<sym>_spawn` for an async function: run the synchronous body, box the
+    // result, return the Future handle (i8*). A foreign async builtin (e.g. sleep)
+    // calls its C implementation directly instead of a SukiCode body.
+    void genAsyncSpawn(FunctionDecl* fn, const std::string& sym) {
+        std::string spawnSym = sym + "_spawn";
+        if (fns_.count(spawnSym)) return;
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        std::vector<llvm::Type*> ptys;
+        for (auto& p : fn->params)
+            ptys.push_back(p.semaType ? layout_->lower(p.semaType)
+                                      : llvm::Type::getInt64Ty(*ctx_));
+        llvm::FunctionType* ft = llvm::FunctionType::get(i8p, ptys, false);
+        llvm::Function* spawnFn = llvm::Function::Create(
+            ft, llvm::GlobalValue::ExternalLinkage, spawnSym, module_.get());
+        llvm::BasicBlock* bb = llvm::BasicBlock::Create(*ctx_, "entry", spawnFn);
+        b_->SetInsertPoint(bb);
+        std::vector<llvm::Value*> args;
+        for (unsigned i = 0; i < spawnFn->arg_size(); ++i)
+            args.push_back(spawnFn->getArg(i));
+        llvm::Function* bodyFn = fns_[fn->name];
+        if (!bodyFn) bodyFn = declareAs(fn, fn->name);
+        const Type* rt = fn->returnType ? fn->returnType->semaType : nullptr;
+        bool isVoid = !rt || rt->kind == TypeKind::Void || rt->kind == TypeKind::Unknown;
+        llvm::Value* result = isVoid ? nullptr : b_->CreateCall(bodyFn, args);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        int64_t sz = isVoid ? 1 : (int64_t)sizeOf(layout_->lower(rt));
+        llvm::Value* box = b_->CreateCall(
+            declareExternalSig("suki_alloc", {i64}, i8p),
+            { llvm::ConstantInt::get(i64, sz) });
+        if (!isVoid) {
+            llvm::Type* rty = layout_->lower(rt);
+            llvm::Value* rp = b_->CreateAlloca(rty);
+            b_->CreateStore(result, rp);
+            llvm::Value* src = b_->CreateBitCast(rp, i8p);
+            llvm::Function* memcpyF = llvm::Intrinsic::getDeclaration(
+                module_.get(), llvm::Intrinsic::memcpy, { i8p, i8p, i64 });
+            b_->CreateCall(memcpyF, { box, src,
+                llvm::ConstantInt::get(i64, sz), llvm::ConstantInt::getFalse(*ctx_) });
+        }
+        b_->CreateRet(box);
+        fns_[spawnSym] = spawnFn;
+    }
+
+    // Always-provided spawn for the `sleep` async builtin (calls suki_sleep).
+    void genSleepSpawn() {
+        if (fns_.count("sleep_spawn")) return;
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::FunctionType* ft = llvm::FunctionType::get(i8p, {i64}, false);
+        llvm::Function* f = llvm::Function::Create(
+            ft, llvm::GlobalValue::ExternalLinkage, "sleep_spawn", module_.get());
+        llvm::BasicBlock* bb = llvm::BasicBlock::Create(*ctx_, "entry", f);
+        b_->SetInsertPoint(bb);
+        llvm::Function* sleepFn = declareExternalSig(
+            "suki_sleep", {i64}, llvm::Type::getVoidTy(*ctx_));
+        b_->CreateCall(sleepFn, { f->getArg(0) });
+        llvm::Value* box = b_->CreateCall(
+            declareExternalSig("suki_alloc", {i64}, i8p),
+            { llvm::ConstantInt::get(i64, 1) });
+        b_->CreateRet(box);
+        fns_["sleep_spawn"] = f;
+    }
+
+    void ensureAsyncSpawns(const NodeList& decls) {
+        genSleepSpawn();
+        for (auto& d : decls) {
+            if (!d || d->kind != NodeKind::FunctionDecl) continue;
+            auto* fn = static_cast<FunctionDecl*>(d.get());
+            if (fn->isAsync) genAsyncSpawn(fn, fn->name);
+        }
+    }
+
     llvm::Value* genCall(CallExpr* e) {
         if (!e->callee) return nullptr;
         // A local (or member) holding a closure is called indirectly rather
@@ -3551,8 +3672,32 @@ private:
             }
             return nullptr;
         }
+        // A constructor for a generic type (`Box<Int>(value:)`) names the type in a
+        // NamedType node rather than an identifier. Resolve it to the monomorphised
+        // instance so the initialiser builds that instance's concrete layout.
+        if (e->callee && (e->callee->kind == NodeKind::NamedType ||
+                          e->callee->kind == NodeKind::GenericExpr)) {
+            const Type* ct = e->callee->semaType;
+            std::string cname;
+            if (ct && ct->kind == TypeKind::Named && ct->record)
+                cname = ct->record->name;
+            else if (e->callee->kind == NodeKind::NamedType)
+                cname = static_cast<NamedType*>(e->callee.get())->name;
+            if (!cname.empty()) {
+                auto gsit = structTypes_.find(cname);
+                if (gsit != structTypes_.end()) return genStructInit(gsit->second, e);
+                auto gcit = classTypes_.find(cname);
+                if (gcit != classTypes_.end()) return genClassInit(gcit->second, e);
+            }
+            return nullptr;
+        }
         if (e->callee->kind != NodeKind::IdentExpr) return nullptr;
         const std::string& n = static_cast<IdentExpr*>(e->callee.get())->name;
+        // Synchronous runtime builtins with fixed C prototypes (atomicAdd / mutex*)
+        // — intercepted by name so the exact signature is emitted rather than the
+        // default variadic foreign declaration.
+        if (n == "atomicAdd" || n == "mutexLock" || n == "mutexUnlock")
+            return genSyncBuiltin(n, e);
         // A call naming a struct type is a constructor invocation.
         auto sit = structTypes_.find(n);
         if (sit != structTypes_.end()) return genStructInit(sit->second, e);
@@ -3569,10 +3714,12 @@ private:
         std::vector<llvm::Value*> args;
         std::vector<bool> isNilArg;
         std::vector<std::string> argTypeNames;
+        bool calleeIsAsync = false;
         auto fdit = fnDecls_.find(n);
         if (fdit != fnDecls_.end()) {
             // 默认参数 / 变长参数展开（规范 3.1）。
             FunctionDecl* fdecl = fdit->second;
+            calleeIsAsync = fdecl->isAsync;
             std::vector<bool> provided(fdecl->params.size(), false);
             for (size_t i = 0; i < e->arguments.size(); ++i) {
                 const std::string& lab = (i < e->argumentLabels.size())
@@ -3664,6 +3811,19 @@ private:
                                 fnThrows_.count(*fit) ? fnThrows_[*fit] : false,
                                 isNilArg);
             }
+        }
+        // An async call returns a Future handle (i8*), not the value directly. Route
+        // it through the generated `<n>_spawn` (or `sleep_spawn`) wrapper that runs
+        // the body and boxes the result; `await` unboxes it.
+        if (calleeIsAsync || n == "sleep") {
+            std::string spawnSym = (n == "sleep") ? "sleep_spawn" : (n + "_spawn");
+            auto sit = fns_.find(spawnSym);
+            if (sit == fns_.end() || !sit->second) return nullptr;
+            std::vector<llvm::Value*> callArgs;
+            for (size_t i = 0; i < args.size() && i < sit->second->arg_size(); ++i)
+                callArgs.push_back(coerce(args[i],
+                    sit->second->getFunctionType()->getParamType(i)));
+            return b_->CreateCall(sit->second, callArgs);
         }
         auto it = fns_.find(n);
         llvm::Function* callee = (it != fns_.end()) ? it->second : declareExternal(n);
@@ -3807,6 +3967,33 @@ public:
             }
         }
 
+        // Generic type instantiations (规范 5.2): each `Box<Int>` is a distinct
+        // record with concrete members. Register it under its mangled key so
+        // constructor calls and method dispatch resolve per instance, and emit its
+        // methods with that instance's parameters bound — the shared method AST is
+        // re-annotated for each instance, exactly as generic functions are.
+        if (sema_) {
+            for (const auto& gi : sema_->genericTypeInstances()) {
+                const Type* instTy = gi.instanceType;
+                if (!instTy || !instTy->record) continue;
+                if (gi.isClass) classTypes_[gi.key] = instTy;
+                else structTypes_[gi.key] = instTy;
+                layout_->lower(instTy);
+                sema_->bindTypeParams(gi.params, gi.args);
+                for (const auto& mem : instTy->record->members) {
+                    if (!mem.isFunction || !mem.decl ||
+                        mem.decl->kind != NodeKind::FunctionDecl) continue;
+                    auto* mf = static_cast<FunctionDecl*>(mem.decl);
+                    sema_->resolveFunctionSignature(mf);
+                    const std::string mkey = gi.key + "." + mf->name;
+                    declareMethod(mkey, mf, instTy);
+                    auto mit = methodFns_.find(mkey);
+                    if (mit != methodFns_.end()) genMethodBody(mf, instTy, mit->second);
+                }
+                sema_->unbindTypeParams();
+            }
+        }
+
         // Module-level variables become globals so every function can reach
         // them; a nested declaration would be invisible across functions.
         for (auto& d : decls) {
@@ -3865,6 +4052,11 @@ public:
         // 自定义下标的 getter/setter 必须在生成普通函数体之前声明，否则
         // 函数体内对 `obj[idx]` 的调用在查表时还找不到对应方法（规范 3.1）。
         genSubscriptBodies(decls);
+        // Async spawns must exist *before* bodies are generated: a body (e.g.
+        // @main) that awaits an async call resolves `<fn>_spawn` at that moment, and
+        // a missing entry silently emits no call at all, leaving the Future slot
+        // uninitialised.
+        ensureAsyncSpawns(decls);
         for (auto& pb : pendingBodies_) {
             // 外部函数（foreign）只声明符号、不发射函数体，否则会与
             // runtime.c 里的真实定义产生 multiple definition 冲突。
@@ -3991,6 +4183,11 @@ public:
     // parameter: a `mutating` method receives it as a pointer (so writes hit the
     // caller's copy in place, preserving value semantics), otherwise by value.
     void declareMethod(const std::string& key, FunctionDecl* fn, const Type* ownerTy) {
+        // A generic type's methods are emitted once per monomorphised instance
+        // (`Box<Int>.get`), never for the uninstantiated generic: its members still
+        // mention the type parameter, so its signature cannot be lowered.
+        if (ownerTy && ownerTy->record && !ownerTy->record->genericParams.empty())
+            return;
         if (methodFns_.count(key)) return;
         llvm::Type* selfTy = layout_->lower(ownerTy);
         llvm::Type* selfParam = fn->isMutating

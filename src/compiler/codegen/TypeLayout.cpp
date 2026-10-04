@@ -198,6 +198,9 @@ llvm::Type* TypeLayout::lower(const Type* t) {
                                                   llvm::Type::getInt1Ty(C) });
             return llvm::PointerType::getUnqual(lower(t->element));
         }
+        case TypeKind::Future:
+            // A Future<R> handle is an opaque pointer to the boxed result.
+            return i8Ptr();
     }
     return i8Ptr();
 }

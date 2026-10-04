@@ -273,8 +273,40 @@ public:
     void bindInstance(size_t index, FunctionDecl* fn);
     void unbindInstance();
 
+    // ─── Generic *type* instantiation (规范 5.2) ────────────────────────────
+    // `Box<Int>` receives its own TypeRecord with the type parameters substituted,
+    // so its fields and methods lower against concrete types rather than the
+    // opaque ones a single shared record would imply.
+    struct GenericTypeInstance {
+        std::string typeName;               // "Box"
+        std::string key;                    // "Box<Int>"
+        std::vector<std::string> typeArgs;  // printed type arguments
+        std::vector<std::string> params;    // generic parameter names, e.g. "T"
+        std::vector<const Type*> args;      // concrete argument types
+        const Type* instanceType = nullptr; // Named type over the monomorphised record
+        bool isClass = false;
+    };
+    const std::vector<GenericTypeInstance>& genericTypeInstances() const {
+        return genericTypeInstances_;
+    }
+    // Bind / unbind one instantiation's parameters around code generation, so
+    // member signatures and bodies are annotated for that instance.
+    void bindTypeParams(const std::vector<std::string>& params,
+                        const std::vector<const Type*>& args);
+    void unbindTypeParams();
+    // Re-resolve a function's parameter and return types under the current
+    // bindings and re-check its body, so lowering sees this instance's types.
+    void resolveFunctionSignature(FunctionDecl* fn);
+
 private:
     std::vector<GenericInstance> genericInstances_;
+    std::vector<GenericTypeInstance> genericTypeInstances_;
+    // Owning storage for monomorphised records; Named types reference these, and
+    // they must outlive the compilation session.
+    std::vector<std::unique_ptr<TypeRecord>> monoRecords_;
+    const Type* monomorphiseGenericType(const TypeRecord* rec,
+                                        const std::string& name,
+                                        const std::vector<const Type*>& args);
 
     // Record `funcName<typeArgs...>` once; duplicates are dropped so the set of
     // monomorphised functions stays minimal.

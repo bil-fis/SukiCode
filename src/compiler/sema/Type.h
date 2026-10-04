@@ -41,6 +41,7 @@ enum class TypeKind {
     Function,     // (A, B) -> R
     Closure,      // closure literal type (params, ret, captures)
     Ref,          // &T (shared), inout T, weak/unowned/owned wrappers
+    Future,       // Future<R> — handle returned by an `async` call, awaited later
     Metatype,     // T.Type / T.Protocol
 };
 
@@ -112,6 +113,10 @@ public:
                         std::vector<std::string> captures = {});
     const Type* ref(RefKind k, const Type* pointee);
     const Type* metatype(const Type* base, bool isProtocol);
+    // Future<R>: the handle an `async` call returns and `await` consumes. `element`
+    // is the eventual result type R; the handle itself lowers to an `i8*` pointer
+    // to a runtime SukiFuture.
+    const Type* future(const Type* result);
     const Type* named(const TypeRecord* rec, std::string name,
                       std::vector<const Type*> genericArgs = {});
 

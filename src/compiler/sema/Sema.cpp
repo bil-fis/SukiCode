@@ -109,6 +109,105 @@ void Sema::unbindInstance() {
     bindingStack_.pop_back();
 }
 
+void Sema::bindTypeParams(const std::vector<std::string>& params,
+                          const std::vector<const Type*>& args) {
+    bindingStack_.push_back(genericBindings_);
+    for (size_t i = 0; i < params.size() && i < args.size(); ++i)
+        genericBindings_[params[i]] = args[i];
+}
+
+void Sema::unbindTypeParams() {
+    if (bindingStack_.empty()) return;
+    genericBindings_ = bindingStack_.back();
+    bindingStack_.pop_back();
+}
+
+// Re-resolve a function's signature under the current bindings and re-check its
+// body. Members of a generic type share one AST across instantiations, so their
+// annotated types must be refreshed immediately before each instance is lowered.
+void Sema::resolveFunctionSignature(FunctionDecl* fn) {
+    if (!fn) return;
+    for (Param& prm : fn->params)
+        prm.semaType = prm.type ? resolveTypeRepr(prm.type.get(), nullptr)
+                                : prm.semaType;
+    if (fn->returnType) {
+        const Type* rt = resolveTypeRepr(fn->returnType.get(), nullptr);
+        if (rt) fn->returnType->semaType = rt;
+    }
+    checkFunctionBody(fn, nullptr);
+}
+
+// Build (or reuse) the monomorphised record for `Box<Int>`: a copy of the generic
+// record whose every member type is re-resolved with the type parameters bound to
+// the concrete arguments, so fields store real values and methods return them.
+const Type* Sema::monomorphiseGenericType(const TypeRecord* rec,
+                                          const std::string& name,
+                                          const std::vector<const Type*>& args) {
+    std::string key = name + "<";
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) key += ",";
+        key += typeToString(args[i]);
+    }
+    key += ">";
+    for (const auto& gi : genericTypeInstances_)
+        if (gi.key == key) return gi.instanceType;
+
+    // Bind the parameters for the duration of the re-resolution below.
+    bindingStack_.push_back(genericBindings_);
+    for (size_t i = 0; i < args.size() && i < rec->genericParams.size(); ++i)
+        genericBindings_[rec->genericParams[i]] = args[i];
+
+    // Built field by field rather than copied: GenericConstraint owns a NodePtr
+    // and is therefore not copyable.
+    auto* inst = new TypeRecord();
+    inst->name = key;
+    inst->kind = rec->kind;
+    inst->decl = rec->decl;
+    inst->superclass = rec->superclass;
+    inst->protocols = rec->protocols;
+    inst->isCEnum = rec->isCEnum;
+    // The instance is concrete: it has no parameters or constraints left to bind.
+    for (const auto& m : rec->members) {
+        TypeRecord::Member nm = m;
+        nm.owner = inst;
+        if (m.isFunction && m.decl && m.decl->kind == NodeKind::FunctionDecl) {
+            auto* fd = static_cast<FunctionDecl*>(m.decl);
+            std::vector<const Type*> pts;
+            for (auto& p : fd->params)
+                pts.push_back(p.type ? resolveTypeRepr(p.type.get(), nullptr)
+                                     : (p.semaType ? p.semaType : types_.unknownType()));
+            const Type* rt = fd->returnType
+                ? resolveTypeRepr(fd->returnType.get(), nullptr)
+                : types_.voidType();
+            nm.type = types_.function(std::move(pts), rt);
+        } else if (m.decl && m.decl->kind == NodeKind::VarDecl) {
+            auto* vd = static_cast<VarDecl*>(m.decl);
+            if (vd->type) {
+                const Type* vt = resolveTypeRepr(vd->type.get(), nullptr);
+                if (vt) nm.type = vt;
+            }
+        }
+        inst->members.push_back(nm);
+    }
+    genericBindings_ = bindingStack_.back();
+    bindingStack_.pop_back();
+
+    const Type* instTy = types_.named(inst, key, args);
+    monoRecords_.emplace_back(inst);
+
+    GenericTypeInstance gi;
+    gi.typeName = name;
+    gi.key = key;
+    gi.instanceType = instTy;
+    gi.params = rec->genericParams;
+    gi.args = args;
+    gi.isClass = (rec->kind == TypeDeclKind::Class ||
+                  rec->kind == TypeDeclKind::Actor);
+    for (const Type* a : args) gi.typeArgs.push_back(typeToString(a));
+    genericTypeInstances_.push_back(gi);
+    return instTy;
+}
+
 // The type a generic argument should be inferred as. A parameter written `[T]`
 // or `Dictionary<K,V>` is matched by its element(s), not by the container, which
 // is what the instantiation has to be named after.
@@ -588,6 +687,51 @@ void Sema::registerBuiltins() {
     addFn("print", { types_.anyType() }, types_.voidType());
     addFn("println", { types_.anyType() }, types_.voidType());
     addFn("panic", { types_.stringType() }, types_.voidType());
+
+    // Foreign builtins backed by the C runtime (src/runtime/runtime.c). These are
+    // real function declarations so the code generator knows their flags (async /
+    // foreign / cdecl symbol) and the checker can type incoming arguments.
+    auto intMutRef = types_.ref(RefKind::Mut, types_.intType());
+    auto addBuiltinFn = [&](const char* name, std::vector<const Type*> params,
+                           const Type* ret, bool async = false,
+                           const std::string& cname = "") {
+        auto* fn = new FunctionDecl();
+        fn->name = name;
+        fn->isAsync = async;
+        fn->isForeign = true;
+        fn->cdeclName = cname;
+        for (size_t i = 0; i < params.size(); ++i) {
+            // Param holds a unique_ptr (default value), so it is not copyable;
+            // build it in place rather than push_back a temporary.
+            fn->params.emplace_back();
+            Param& p = fn->params.back();
+            p.internalName = "a" + std::to_string(i);
+            p.semaType = params[i];
+        }
+        if (ret) {
+            // The return type is a type-representation node carrying the resolved
+            // type; code generation reads `returnType->semaType`.
+            auto* tr = new NamedType();
+            tr->name = typeToString(ret);
+            tr->semaType = ret;
+            fn->returnType.reset(tr);
+        }
+        Symbol s;
+        s.kind = Symbol::Kind::Function;
+        s.function = fn;
+        s.type = types_.function(params, ret);
+        globals_.declare(name, s);
+    };
+    // Synchronous runtime primitives used by the concurrency stress test.
+    addBuiltinFn("atomicAdd",  { intMutRef, types_.intType() }, types_.intType(),
+                 false, "suki_atomic_add_i64");
+    addBuiltinFn("mutexLock",   { intMutRef }, types_.voidType(),
+                 false, "suki_spin_lock");
+    addBuiltinFn("mutexUnlock", { intMutRef }, types_.voidType(),
+                 false, "suki_spin_unlock");
+    // `await sleep(ms)` suspends; sleep is an async foreign builtin.
+    addBuiltinFn("sleep", { types_.intType() }, types_.voidType(),
+                 true, "suki_sleep");
 }
 
 void Sema::collectTypeDecl(Node* decl) {
@@ -1042,6 +1186,15 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
                     std::unordered_map<std::string, const Type*> binds;
                     for (size_t i = 0; i < args.size(); ++i) binds[rec->genericParams[i]] = args[i];
                     checkGenericConstraints(rec->genericConstraints, binds, repr);
+                }
+                // 泛型类型实例化（规范 5.2）：`Box<Int>` 各自单态化出独立记录，
+                // 字段与方法按具体类型解析，而非共用未解析的 `T`。
+                if (!rec->genericParams.empty() &&
+                    args.size() == rec->genericParams.size()) {
+                    bool concrete = true;
+                    for (const Type* a : args)
+                        if (!a || a->kind == TypeKind::Unknown) { concrete = false; break; }
+                    if (concrete) return monomorphiseGenericType(rec, name, args);
                 }
                 return types_.named(rec, name, std::move(args));
             }
@@ -2282,7 +2435,19 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             // becomes `nil` instead of propagating.
             if (u->isOptionalTry && t && t->kind != TypeKind::Unknown)
                 return types_.optional(t);
-            // `try` and `await` reuse markers; they pass the operand type through.
+            // `try` passes the operand type through unchanged.
+            if (u->isTry) return t ? t : types_.unknownType();
+            // `await` is only valid on an async call (whose type is Future<R>) or a
+            // stored Future handle — never on an ordinary, non-async value.
+            if (u->isAwait) {
+                if (t && t->kind == TypeKind::Future)
+                    return (t->element && t->element->kind != TypeKind::Unknown)
+                               ? t->element : types_.voidType();
+                hadError_ = true;
+                diags_.reportError("'await' 只能用于 async 调用或已暂存的 Future 句柄"
+                                   "（此处类型：" + typeToString(t) + "）", rangeOf(e));
+                return types_.unknownType();
+            }
             return t ? t : types_.unknownType();
         }
         case NodeKind::MoveExpr: {
@@ -2467,7 +2632,23 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         case NodeKind::GenericExpr: {
             auto* g = static_cast<GenericExpr*>(e);
-            for (auto& a : g->args) resolveTypeRepr(a.get(), context);
+            std::vector<const Type*> args;
+            for (auto& a : g->args) args.push_back(resolveTypeRepr(a.get(), context));
+            // A generic *type* applied to arguments in expression position — a
+            // constructor call such as `Box<Int>(value:)` — resolves to that
+            // monomorphised instance, so the value built has concrete fields.
+            if (g->base && g->base->kind == NodeKind::IdentExpr) {
+                const std::string& bname =
+                    static_cast<IdentExpr*>(g->base.get())->name;
+                const TypeRecord* rec = findType(bname);
+                if (rec && !rec->genericParams.empty() &&
+                    args.size() == rec->genericParams.size()) {
+                    bool concrete = true;
+                    for (const Type* a : args)
+                        if (!a || a->kind == TypeKind::Unknown) { concrete = false; break; }
+                    if (concrete) return monomorphiseGenericType(rec, bname, args);
+                }
+            }
             return checkExpr(g->base.get(), context);
         }
         case NodeKind::AssignmentExpr: {
@@ -2495,6 +2676,35 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         case NodeKind::CallExpr: {
             auto* c = static_cast<CallExpr*>(e);
+            // A generic type's constructor (`Box<Int>(value:)`) names the type in a
+            // GenericExpr; it yields an instance of the monomorphised type rather
+            // than a function's result, so the binding and later member access see
+            // the concrete fields.
+            if (c->callee && c->callee->kind == NodeKind::GenericExpr) {
+                auto* g = static_cast<GenericExpr*>(c->callee.get());
+                if (g->base && g->base->kind == NodeKind::IdentExpr) {
+                    const std::string& n =
+                        static_cast<IdentExpr*>(g->base.get())->name;
+                    const TypeRecord* rec = findType(n);
+                    if (rec && !rec->genericParams.empty() &&
+                        g->args.size() == rec->genericParams.size()) {
+                        std::vector<const Type*> args;
+                        for (auto& a : g->args)
+                            args.push_back(resolveTypeRepr(a.get(), context));
+                        bool concrete = true;
+                        for (const Type* a : args)
+                            if (!a || a->kind == TypeKind::Unknown) { concrete = false; break; }
+                        if (concrete) {
+                            for (auto& a : c->arguments) checkExpr(a.get(), context);
+                            const Type* instTy = monomorphiseGenericType(rec, n, args);
+                            // Annotate the callee so code generation can resolve the
+                            // instance by name and emit its initialiser.
+                            if (c->callee) c->callee->semaType = instTy;
+                            return instTy;
+                        }
+                    }
+                }
+            }
             // A call whose callee names a type is a constructor invocation
             // (`Point(x: 1)`, `MemoryPool<Int>(capacity: 8)`); it yields an
             // instance of that type rather than a function's result.
@@ -2658,6 +2868,11 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                     const Type* at2 = checkExpr(c->arguments[i].get(), context);
                     if (paramType) requireAssignable(paramType, at2, c->arguments[i].get(), "argument");
                 }
+                // An `async` call yields a Future of its result type; `await` later
+                // unwraps that handle back to the value.
+                if (fdecl && fdecl->isAsync)
+                    return types_.future(callee->ret ? callee->ret
+                                                     : types_.voidType());
                 return callee->ret ? callee->ret : types_.unknownType();
             }
             if (callee && callee->kind == TypeKind::Optional && callee->element &&

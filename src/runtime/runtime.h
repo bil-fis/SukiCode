@@ -140,6 +140,18 @@ int64_t suki_atomic_load_i64(const int64_t* p);
 void    suki_atomic_store_i64(int64_t* p, int64_t v);
 int64_t suki_atomic_add_i64(int64_t* p, int64_t delta);
 
+// ─── async / concurrency support ───────────────────────────────────────────
+// `await` on an `async` call produces a Future handle: the callee's value is
+// heap-boxed (suki_alloc) and the pointer is the handle. `suki_sleep` gives the
+// real-time suspension that makes `await sleep(ms)` observable, while the spin
+// locks let a plain `Int` act as a mutex for the concurrency stress test.
+void suki_sleep(int64_t ms);
+
+// Spin locks operating directly on an `Int` (int64), so a plain `Int` can act as
+// a mutex — matching how the language binding threads the `mu` variable.
+void suki_spin_lock(int64_t* lock);
+void suki_spin_unlock(int64_t* lock);
+
 #ifdef __cplusplus
 }
 #endif

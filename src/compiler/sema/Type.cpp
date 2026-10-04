@@ -100,6 +100,9 @@ const Type* TypeContext::metatype(const Type* base, bool isProtocol) {
     Type m; m.kind = TypeKind::Metatype; m.element = base; m.refKind =
         isProtocol ? RefKind::Unowned : RefKind::Shared; return intern(m);
 }
+const Type* TypeContext::future(const Type* result) {
+    Type f; f.kind = TypeKind::Future; f.element = result; return intern(f);
+}
 const Type* TypeContext::named(const TypeRecord* rec, std::string name,
                                std::vector<const Type*> genericArgs) {
     Type n; n.kind = TypeKind::Named; n.record = rec; n.name = std::move(name);
@@ -120,6 +123,8 @@ bool isIdentical(const Type* a, const Type* b) {
             return isIdentical(a->element, b->element);
         case TypeKind::Ref: case TypeKind::Metatype:
             return a->refKind == b->refKind && isIdentical(a->element, b->element);
+        case TypeKind::Future:
+            return isIdentical(a->element, b->element);
         case TypeKind::Dict:
             return isIdentical(a->key, b->key) && isIdentical(a->value, b->value);
         case TypeKind::Tuple: case TypeKind::Function: case TypeKind::Closure:
@@ -145,7 +150,7 @@ bool isValueType(const Type* t) {
             // A Named type is a value type unless its record says otherwise
             // (class/actor). Without a record (forward-declared) assume value.
             return true;
-        case TypeKind::Function: case TypeKind::Metatype:
+        case TypeKind::Function: case TypeKind::Metatype: case TypeKind::Future:
             return false;
         default:
             return true;
@@ -269,6 +274,8 @@ std::string typeToString(const Type* t) {
         case TypeKind::Metatype:
             return typeToString(t->element) +
                    (t->refKind == RefKind::Unowned ? ".Protocol" : ".Type");
+        case TypeKind::Future:
+            return "Future<" + (t->element ? typeToString(t->element) : "?") + ">";
     }
     return "<type>";
 }
