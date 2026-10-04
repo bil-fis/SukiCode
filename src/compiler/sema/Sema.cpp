@@ -400,6 +400,27 @@ void Sema::checkConformances() {
                                        rangeOf(rec->decl));
                 }
             }
+            // 关联类型绑定（规范 2.2）：带 associatedtype 的协议，遵循类型须为
+            // 每个关联类型提供绑定（类型内 typealias）。泛型类型留待类型推断，
+            // 此处仅对具体（非泛型）类型强制显式绑定。
+            if (!proto->associatedTypes.empty() && rec->genericParams.empty()) {
+                for (const auto& at : proto->associatedTypes) {
+                    bool bound = false;
+                    for (const TypeRecord* r = rec; r && !bound; r = r->superclass) {
+                        for (auto& mm : r->members) {
+                            if (mm.decl && mm.decl->kind == NodeKind::TypealiasDecl &&
+                                mm.name == at) { bound = true; break; }
+                        }
+                    }
+                    if (!bound) {
+                        hadError_ = true;
+                        diags_.reportError("type '" + rec->name +
+                            "' does not conform to protocol '" + proto->name +
+                            "': missing associated type binding for '" + at + "'",
+                            rangeOf(rec->decl));
+                    }
+                }
+            }
         }
     }
 }
@@ -646,6 +667,19 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
         TypeRecord::Member mem;
         mem.name = "deinit"; mem.isFunction = true; mem.decl = m;
         mem.type = types_.function({}, types_.voidType());
+        rec.members.push_back(std::move(mem));
+    } else if (m->kind == NodeKind::TypealiasDecl) {
+        // 类型内 typealias（规范 2.2）：作为成员登记，使其可在关联类型绑定
+        // 检查与成员查找中被发现。
+        auto* ta = static_cast<TypealiasDecl*>(m);
+        TypeRecord::Member mem;
+        mem.name = ta->name;
+        mem.isFunction = false;
+        mem.decl = ta;
+        mem.type = ta->underlying ? resolveTypeRepr(ta->underlying.get(), &rec)
+                                   : types_.unknownType();
+        mem.access = accessLevelFromModifiers(nodeModifiers(m));
+        mem.owner = &rec;
         rec.members.push_back(std::move(mem));
     } else if (m->kind == NodeKind::EnumCaseDecl) {
         auto* ec = static_cast<EnumCaseDecl*>(m);
