@@ -210,6 +210,7 @@ NodeList Parser::parseModule() {
 NodePtr Parser::parseDecl() {
     std::vector<std::string> attrs;
     pendingCdeclName_.clear();
+    pendingCEnum_ = false;
     while (checkPunct(PunctuatorID::At)) {
         advance();
         if (check(TokenKind::TK_Identifier)) {
@@ -224,6 +225,18 @@ NodePtr Parser::parseDecl() {
                 if (checkPunct(PunctuatorID::RParen)) advance();
                 continue;
             }
+        } else if (checkKw(KeywordID::Enum)) {
+            // @enum(C)：标记 C 兼容整数枚举（规范 1.5）。`enum` 是关键字，
+            // 故在标识符分支之外单独捕获。
+            advance();
+            pendingCEnum_ = true;
+            if (checkPunct(PunctuatorID::LParen)) {
+                int depth = 0;
+                do { if (checkPunct(PunctuatorID::LParen)) ++depth;
+                     else if (checkPunct(PunctuatorID::RParen)) --depth;
+                     advance(); } while (!atEnd() && depth > 0);
+            }
+            continue;
         }
         if (checkPunct(PunctuatorID::LParen)) {
             // @attr(...) — skip contents
@@ -479,6 +492,8 @@ NodePtr Parser::parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers)
     if (matchPunct(PunctuatorID::Colon)) td->inherited = parseInheritedTypes();
     if (matchKw(KeywordID::Where)) parseWhereConstraints();
     td->genericConstraints = std::move(pendingGenericConstraints_);
+    td->isCEnum = pendingCEnum_;
+    pendingCEnum_ = false;
     expectPunct(PunctuatorID::LBrace, "expected '{'");
     while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
         // member declarations
@@ -564,6 +579,11 @@ NodePtr Parser::parseEnumCase() {
             }
         }
         expectPunct(PunctuatorID::RParen, "expected ')'");
+    }
+    // @enum(C) 显式原始值：`case a = 5`（规范 1.5）。
+    if (matchPunct(PunctuatorID::Equal) && check(TokenKind::TK_IntLiteral)) {
+        c->rawValue = std::strtoll(cur().numberText.c_str(), nullptr, 10);
+        advance();
     }
     return c;
 }

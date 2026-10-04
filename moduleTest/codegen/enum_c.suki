@@ -1,0 +1,17 @@
+@enum(C) enum Color : Int {
+    case red
+    case green = 5
+    case blue
+}
+enum Direction {
+    case north
+    case south
+    case east
+}
+func main() -> Int {
+    if Int(Color.green) != 5 { return 1 }
+    if Int(Color.red) != 0 { return 2 }
+    if Int(Color.blue) != 6 { return 3 }
+    if Int(Direction.south) != 1 { return 4 }
+    return 0
+}

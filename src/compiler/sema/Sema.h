@@ -38,6 +38,7 @@ struct TypeRecord {
     std::vector<GenericConstraint> genericConstraints; // 泛型约束（规范 2.1）
     const TypeRecord* superclass = nullptr;      // class single inheritance
     std::vector<const TypeRecord*> protocols;    // declared conformances
+    bool isCEnum = false;                        // @enum(C)：C 兼容整数枚举（规范 1.5）
     // Members are keyed by name; a property and a method may share a name only
     // via distinct overloads, which we keep in one list and match by arity.
     struct Member {
@@ -57,6 +58,7 @@ struct TypeRecord {
     struct EnumCaseInfo {
         std::string name;
         std::vector<const Type*> associated;
+        int64_t rawValue = -1;           // @enum(C) 显式/顺序原始值（规范 1.5）
     };
     std::vector<EnumCaseInfo> cases;
     // Protocol requirements (name + isFunction); satisfied by members.

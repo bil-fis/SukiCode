@@ -111,6 +111,7 @@ struct TypeDecl : Node {
     NodeList members;
     NodePtr whereClause;                    // optional `where` clause (Expr)
     std::vector<GenericConstraint> genericConstraints; // 泛型约束（规范 2.1）
+    bool isCEnum = false;               // @enum(C)：C 兼容整数枚举（规范 1.5）
     // 宿主类型名（类型嵌套，规范 4.6）。`Outer.Inner` 的成员查找靠它把
     // 子类型登记到外层类型上；顶层类型为空。
     std::string enclosingType;
@@ -207,6 +208,7 @@ struct EnumCaseDecl : Node {
     std::string name;
     std::vector<NodePtr> associatedTypes; // TypeRepr list (if any)
     bool hasAssociated = false;
+    long long rawValue = -1;             // 显式原始值（@enum(C)，规范 1.5）；-1 表示自动顺序赋值
 };
 
 // `get { }`, `set(v) { }`, `willSet { }`, `didSet { }`

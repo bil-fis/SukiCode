@@ -851,7 +851,9 @@ private:
             rec = m->base->semaType->record;
         if (!rec || rec->kind != TypeDeclKind::Enum) return -1;
         for (size_t i = 0; i < rec->cases.size(); ++i)
-            if (rec->cases[i].name == m->member) return static_cast<int64_t>(i);
+            if (rec->cases[i].name == m->member)
+                return rec->cases[i].rawValue < 0 ? static_cast<int64_t>(i)
+                                                  : rec->cases[i].rawValue;
         return -1;
     }
 
@@ -883,7 +885,9 @@ private:
         if (!rec || rec->kind != TypeDeclKind::Enum) return nullptr;
         for (size_t i = 0; i < rec->cases.size(); ++i) {
             if (rec->cases[i].name != m->member) continue;
-            if (tagOut) *tagOut = static_cast<int64_t>(i);
+            if (tagOut)
+                *tagOut = rec->cases[i].rawValue < 0 ? static_cast<int64_t>(i)
+                                                     : rec->cases[i].rawValue;
             return rec;
         }
         return nullptr;

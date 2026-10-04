@@ -138,6 +138,8 @@ private:
     std::vector<GenericConstraint> pendingGenericConstraints_;
     // @_cdecl("name") 捕获的外部符号名暂存区（规范 6.3）。
     std::string pendingCdeclName_;
+    // @enum(C) 捕获的 C 兼容枚举标记暂存区（规范 1.5）。
+    bool pendingCEnum_ = false;
 };
 
 } // namespace suki

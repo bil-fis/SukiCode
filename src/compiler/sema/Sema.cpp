@@ -262,6 +262,18 @@ void Sema::analyze(const NodeList& decls) {
         if (rec->decl) collectMembers(*rec, static_cast<TypeDecl*>(rec->decl));
     }
 
+    // 枚举原始值（@enum(C)，规范 1.5）：未显式赋值的 case 取上一个值 +1，
+    // 从 0 起始顺序编号。
+    for (auto& kv : typeIndex_) {
+        TypeRecord* rec = kv.second;
+        if (rec->kind != TypeDeclKind::Enum) continue;
+        int64_t next = 0;
+        for (auto& c : rec->cases) {
+            if (c.rawValue < 0) c.rawValue = next;
+            next = c.rawValue + 1;
+        }
+    }
+
     // Pass 3.5: fold extension members (and the conformances they declare)
     // into the extended type, then inherit protocol default implementations.
     // After this the member list of every type is flat, so code generation
@@ -589,6 +601,7 @@ void Sema::collectTypeDecl(Node* decl) {
     }
     rec->genericParams = td->genericParams;
     rec->genericConstraints = std::move(td->genericConstraints);
+    rec->isCEnum = td->isCEnum;          // @enum(C)（规范 1.5）
 
     TypeRecord* raw = rec.get();
     typeIndex_[td->name] = raw;
@@ -729,6 +742,7 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
         auto* ec = static_cast<EnumCaseDecl*>(m);
         TypeRecord::EnumCaseInfo ci;
         ci.name = ec->name;
+        ci.rawValue = ec->rawValue;   // @enum(C) 显式原始值（规范 1.5）
         for (auto& at : ec->associatedTypes) {
             ci.associated.push_back(resolveTypeRepr(at.get(), &rec));
         }
