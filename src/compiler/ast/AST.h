@@ -159,6 +159,7 @@ struct FunctionDecl : Node {
     NodePtr returnType;      // TypeRepr or null
     NodeList body;           // statements; empty if external (`foreign`)
     bool isForeign = false;
+    std::string cdeclName;                         // @_cdecl("name")：外部符号名（P6.3）
     // True for a `func` in a protocol whose body supplies the default
     // implementation (规范 4.5). Such a member is lowered into every conforming
     // type but must not be type-checked again there.

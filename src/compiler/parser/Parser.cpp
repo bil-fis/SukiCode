@@ -209,10 +209,22 @@ NodeList Parser::parseModule() {
 // ─── declarations ──────────────────────────────────────────────────────────────
 NodePtr Parser::parseDecl() {
     std::vector<std::string> attrs;
+    pendingCdeclName_.clear();
     while (checkPunct(PunctuatorID::At)) {
         advance();
-        if (check(TokenKind::TK_Identifier)) attrs.push_back(cur().text);
-        advance();
+        if (check(TokenKind::TK_Identifier)) {
+            std::string an = cur().text;
+            attrs.push_back(an);
+            advance();
+            // @_cdecl("name")：捕获外部符号名（规范 6.3），不走通用 (...) 跳过。
+            if (an == "_cdecl" && checkPunct(PunctuatorID::LParen)) {
+                advance();
+                if (check(TokenKind::TK_StringLiteral)) { pendingCdeclName_ = cur().text; advance(); }
+                else if (check(TokenKind::TK_Identifier)) { pendingCdeclName_ = cur().text; advance(); }
+                if (checkPunct(PunctuatorID::RParen)) advance();
+                continue;
+            }
+        }
         if (checkPunct(PunctuatorID::LParen)) {
             // @attr(...) — skip contents
             int depth = 0;
@@ -308,6 +320,7 @@ NodePtr Parser::parseFunctionDecl(std::vector<std::string> modifiers) {
     // 泛型 `where` 子句（规范 2.1）：`func f<T>(x: T) where T: Equatable`。
     if (matchKw(KeywordID::Where)) parseWhereConstraints();
     fn->genericConstraints = std::move(pendingGenericConstraints_);
+    fn->cdeclName = std::move(pendingCdeclName_);
     if (std::find(modifiers.begin(), modifiers.end(), "async") != modifiers.end()) fn->isAsync = true;
     if (std::find(modifiers.begin(), modifiers.end(), "mutating") != modifiers.end()) fn->isMutating = true;
     if (std::find(modifiers.begin(), modifiers.end(), "foreign") != modifiers.end() ||

@@ -136,6 +136,8 @@ private:
     // 泛型约束累积区：parseGenericParamNames / parseWhereConstraints 解析到的
     // 约束暂存于此，调用方随后取走填入 decl->genericConstraints（规范 2.1）。
     std::vector<GenericConstraint> pendingGenericConstraints_;
+    // @_cdecl("name") 捕获的外部符号名暂存区（规范 6.3）。
+    std::string pendingCdeclName_;
 };
 
 } // namespace suki

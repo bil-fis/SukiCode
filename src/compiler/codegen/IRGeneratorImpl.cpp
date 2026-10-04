@@ -137,6 +137,9 @@ private:
         llvm::Function* f = llvm::Function::Create(
             llvm::FunctionType::get(ret, params, false),
             llvm::GlobalValue::ExternalLinkage, symName, module_.get());
+        // @_cdecl("name")：foreign 函数使用指定的 C 符号名（规范 6.3）。
+        // map 键仍为 fn->name，调用解析不受影响。
+        if (fn->isForeign && !fn->cdeclName.empty()) f->setName(fn->cdeclName);
         fns_[symName] = f;
         fnDecls_[fn->name] = fn;
         pendingBodies_.emplace_back(fn, symName);
