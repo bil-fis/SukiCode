@@ -1,0 +1,10 @@
+class Node {
+    var value: Int = 0
+    unowned var next: Node? = nil
+}
+func main() -> Int {
+    let n = Node()
+    n.next = n          // unowned 不持有引用，打破循环引用
+    n.value = 7
+    return 0
+}

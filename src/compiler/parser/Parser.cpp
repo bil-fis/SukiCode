@@ -286,6 +286,11 @@ std::vector<std::string> Parser::parseModifiers() {
         for (KeywordID k : modKw) {
             if (checkKw(k)) { mods.push_back(keywordToString(k)); advance(); again = true; break; }
         }
+        // `unowned` 是上下文标识符（常见局部变量名），仅当位于修饰符位置时
+        // 作为修饰符收集（规范 4.3）。
+        if (check(TokenKind::TK_Identifier) && cur().text == "unowned") {
+            mods.push_back("unowned"); advance(); again = true;
+        }
     }
     return mods;
 }
