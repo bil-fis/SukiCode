@@ -1,6 +1,7 @@
 #include "compiler/parser/Parser.h"
 
 #include <algorithm>
+#include <cerrno>
 
 namespace suki {
 
@@ -168,6 +169,7 @@ void Parser::synchronize() {
 // ─── module ───────────────────────────────────────────────────────────────────
 NodeList Parser::parseModule() {
     NodeList decls;
+    try {
     // optional module declaration
     if (checkKw(KeywordID::Module)) {
         auto m = std::make_unique<ModuleDecl>();
@@ -216,6 +218,9 @@ NodeList Parser::parseModule() {
         if (d) decls.push_back(std::move(d));
         else synchronize();
     }
+    } catch (ParseTooDeep&) {
+        diags_.reportError("输入嵌套层级过深，已中止解析（可能存在恶意构造的深层嵌套代码）");
+    }
     return decls;
 }
 
@@ -243,6 +248,7 @@ NodePtr Parser::parseMacroDecl() {
 }
 
 NodePtr Parser::parseDecl() {
+    RecGuard _rg(this);
     std::vector<std::string> attrs;
     pendingCdeclName_.clear();
     pendingCEnum_ = false;
@@ -634,7 +640,15 @@ NodePtr Parser::parseEnumCase() {
     }
     // @enum(C) 显式原始值：`case a = 5`（规范 1.5）。
     if (matchPunct(PunctuatorID::Equal) && check(TokenKind::TK_IntLiteral)) {
-        c->rawValue = std::strtoll(cur().numberText.c_str(), nullptr, 10);
+        errno = 0;
+        char* endp = nullptr;
+        long long rv = std::strtoll(cur().numberText.c_str(), &endp, 10);
+        if (errno == ERANGE || endp == cur().numberText.c_str()) {
+            errorAt(cur(), "枚举原始值超出 Int 取值范围");
+            c->rawValue = 0;
+        } else {
+            c->rawValue = rv;
+        }
         advance();
     }
     return c;
@@ -818,6 +832,7 @@ NodeList Parser::parseInheritedTypes() {
 
 // ─── statements ───────────────────────────────────────────────────────────────
 NodePtr Parser::parseStatement() {
+    RecGuard _rg(this);
     if (checkKw(KeywordID::Return)) return parseReturnStmt();
     if (checkKw(KeywordID::If)) return parseIfStmt();
     if (checkKw(KeywordID::Guard)) return parseGuardStmt();
@@ -883,6 +898,7 @@ NodePtr Parser::parseReturnStmt() {
 }
 
 NodePtr Parser::parseIfStmt() {
+    RecGuard _rg(this);
     auto ifs = std::make_unique<IfStmt>();
     advance(); // if
     // optional condition in parens
@@ -1163,9 +1179,15 @@ NodePtr Parser::parseDoStmt() {
 }
 
 // ─── expressions ───────────────────────────────────────────────────────────────
-NodePtr Parser::parseExpression() { return parseExpr(); }
+NodePtr Parser::parseExpression() {
+    try { return parseExpr(); }
+    catch (ParseTooDeep&) {
+        errorAt(cur(), "输入嵌套层级过深，已中止解析");
+        return nullptr;
+    }
+}
 
-NodePtr Parser::parseExpr() { return parseAssignment(); }
+NodePtr Parser::parseExpr() { RecGuard _rg(this); return parseAssignment(); }
 
 NodePtr Parser::parseExprNoTrailingClosure() {
     ++suppressTrailingClosure_;
@@ -1431,6 +1453,7 @@ NodePtr Parser::parseMultiplicative() {
 }
 
 NodePtr Parser::parseUnary() {
+    RecGuard _rg(this);
     if (checkPunct(PunctuatorID::Minus) || checkPunct(PunctuatorID::Plus) ||
         checkPunct(PunctuatorID::Bang) || checkPunct(PunctuatorID::Tilde) ||
         checkPunct(PunctuatorID::Amp)) {
@@ -1644,6 +1667,7 @@ bool Parser::looksLikeArrowClosure() {
 }
 
 NodePtr Parser::parsePrimary() {
+    RecGuard _rg(this);
     Token t = cur();
     // 宏引用（规范 5.6）：`#name` 由 Hash 标点后跟标识符组成，用于宏调用点
     //（`#stringify(x)`）以及宏体内的原语（`#makeExpr` / #makeDecl / #unique）。
@@ -1980,6 +2004,7 @@ NodePtr Parser::parseCollectionLiteral() {
 }
 
 NodePtr Parser::parseClosure(bool arrowSyntax) {
+    RecGuard _rg(this);
     auto c = std::make_unique<ClosureExpr>();
     c->isArrowSyntax = arrowSyntax;
     if (arrowSyntax) {
@@ -2100,6 +2125,7 @@ NodePtr Parser::parseClosure(bool arrowSyntax) {
 
 // ─── types ─────────────────────────────────────────────────────────────────────
 NodePtr Parser::parseType() {
+    RecGuard _rg(this);
     NodePtr base;
     if (checkKw(KeywordID::Some)) {
         // 不透明返回类型 `some P`（规范 5.5）：前缀修饰符，复用 OptionalType 标记

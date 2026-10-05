@@ -129,6 +129,18 @@ private:
     std::vector<Token> tokens_;
     size_t pos_ = 0;
     DiagnosticEngine& diags_;
+    // 解析递归深度守卫：深度嵌套输入（如 ((((...)))) 或 if/else-if 长链）会让
+    // 递归下降解析无限递归直至栈溢出（拒绝服务）。超过 kMaxParseDepth 时抛出
+    // ParseTooDeep，由 parseModule / parseExpression 捕获并报告单条诊断，而非崩溃。
+    // RecGuard 以 RAII 方式在每次递归入口递增、返回时递减，确保正常深嵌套不会误触。
+    int parseDepth_ = 0;
+    struct ParseTooDeep {};
+    enum { kMaxParseDepth = 1024 };
+    struct RecGuard {
+        Parser* p;
+        RecGuard(Parser* p) : p(p) { if (++p->parseDepth_ > kMaxParseDepth) throw ParseTooDeep{}; }
+        ~RecGuard() { --p->parseDepth_; }
+    };
     // >0 while parsing a control-flow condition/subject, where `{` denotes a
     // block rather than a trailing closure argument.
     int suppressTrailingClosure_ = 0;
