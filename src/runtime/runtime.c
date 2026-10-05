@@ -7,12 +7,25 @@
 // ARC reference counting (suki_arc_retain/release) uses acquire/release
 // memory ordering; only debug counters use relaxed ordering.
 
+// On POSIX, expose `nanosleep` (needs _POSIX_C_SOURCE >= 199309L) *before*
+// any system header is pulled in (including transitively via runtime.h),
+// otherwise its declaration stays hidden and we get an implicit-declaration
+// warning (C11 UB). Feature-test macros are only consulted at the first
+// system-header inclusion, so this MUST precede every #include.
+#if !defined(_WIN32)
+  #define _POSIX_C_SOURCE 199309L
+#endif
+
 #include "runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
+#if !defined(_WIN32)
+  #include <unistd.h>   // nanosleep (POSIX)
+#endif
 
 // ─── platform threading backend ────────────────────────────────────────────────
 // Windows: Win32 threads, critical sections, condition variables.
@@ -28,6 +41,31 @@
 #else
   #include <pthread.h>
 #endif
+
+// ─── integer-overflow-safe size arithmetic ───────────────────────────────
+// Allocation sizes are products of caller-supplied counts and element sizes.
+// A naive `a * b` can wrap, yielding a small size_t that leads to a heap
+// buffer overflow. These helpers detect overflow and abort instead of
+// passing a wrong size to malloc.
+static int suki_size_mul(int64_t a, int64_t b, size_t* out) {
+    if (a < 0 || b < 0) return 1;          // negative counts are never valid
+    uint64_t ua = (uint64_t)a, ub = (uint64_t)b;
+    if (ua != 0 && ub > UINT64_MAX / ua) return 1;
+    uint64_t prod = ua * ub;
+    if (prod > (uint64_t)SIZE_MAX) return 1;
+    *out = (size_t)prod;
+    return 0;
+}
+
+// Round up to the next power of two (used for the dictionary capacity so the
+// probe mask `cap - 1` is always a full bitmask). Returns 0 on overflow.
+static int64_t suki_round_pow2(int64_t v) {
+    if (v <= 1) return 1;
+    if (v > ((int64_t)1 << 62)) return 0;  // would overflow int64
+    int64_t p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
 
 // ─── printing ─────────────────────────────────────────────────────────────
 void print(const char* s) {
@@ -91,9 +129,14 @@ uint64_t suki_arc_release(void* obj) {
     // acquire on the decrement: synchronizes with the retain that produced it.
     uint64_t remaining = __atomic_sub_fetch(counter, 1, __ATOMIC_ACQ_REL);
     if (remaining == 0) {
-        // Last strong reference: run `deinit` before releasing the storage. The
-        // slot is null for classes that declare none; a subclass that does not
-        // declare its own simply inherits the pointer the constructor stored.
+        // Last strong reference: clear every registered weak slot pointing at
+        // this object *before* running `deinit` and freeing, so that any
+        // outstanding `weak` reference observes nil instead of a dangling
+        // pointer (spec §6.1: weak references auto-nil on deallocation).
+        suki_weak_clear_all(obj);
+        // Run `deinit` before releasing the storage. The slot is null for
+        // classes that declare none; a subclass that does not declare its own
+        // simply inherits the pointer the constructor stored.
         SukiDeinit dtor =
             (SukiDeinit)*(void**)((char*)obj + SUKI_OBJECT_DEINIT_OFFSET);
         if (dtor) dtor(obj);
@@ -125,10 +168,13 @@ int64_t suki_str_length(SukiString s) { return s.length; }
 const char* suki_str_data(SukiString s) { return s.data ? s.data : ""; }
 
 SukiString suki_str_concat(SukiString a, SukiString b) {
+    if (a.length < 0) a.length = 0;
+    if (b.length < 0) b.length = 0;
+    if (a.length > INT64_MAX - b.length) panic("string concatenation overflow");
     int64_t n = a.length + b.length;
     char* buf = (char*)suki_alloc((size_t)n + 1);
-    if (a.length) memcpy(buf, a.data, (size_t)a.length);
-    if (b.length) memcpy(buf + a.length, b.data, (size_t)b.length);
+    if (a.data && a.length) memcpy(buf, a.data, (size_t)a.length);
+    if (b.data && b.length) memcpy(buf + a.length, b.data, (size_t)b.length);
     buf[n] = '\0';
     SukiString r = { buf, n };
     return r;
@@ -157,17 +203,22 @@ static int32_t suki_utf8_seq_len(const unsigned char* p) {
 int32_t suki_str_has_prefix(SukiString s, SukiString prefix) {
     if (prefix.length > s.length) return 0;
     if (prefix.length == 0) return 1;
-    return memcmp(s.data, prefix.data, (size_t)prefix.length) == 0;
+    const char* sd = s.data ? s.data : "";
+    const char* pd = prefix.data ? prefix.data : "";
+    return memcmp(sd, pd, (size_t)prefix.length) == 0;
 }
 
 int32_t suki_str_has_suffix(SukiString s, SukiString suffix) {
     if (suffix.length > s.length) return 0;
     if (suffix.length == 0) return 1;
-    return memcmp(s.data + (s.length - suffix.length), suffix.data,
+    const char* sd = s.data ? s.data : "";
+    const char* pxd = suffix.data ? suffix.data : "";
+    return memcmp(sd + (s.length - suffix.length), pxd,
                   (size_t)suffix.length) == 0;
 }
 
 int32_t suki_str_utf8_count(SukiString s) {    int32_t n = 0;
+    if (!s.data) return 0;
     for (int64_t i = 0; i < s.length; ) {
         int32_t w = suki_utf8_seq_len((const unsigned char*)s.data + i);
         i += w;
@@ -179,11 +230,16 @@ int32_t suki_str_utf8_count(SukiString s) {    int32_t n = 0;
 // Returns the Unicode scalar at `index` (character, not byte), or -1 when the
 // index is out of range. This is the backing for SukiCode's String view.
 int32_t suki_str_utf8_get(SukiString s, int32_t index) {
+    if (!s.data) return -1;
     int64_t i = 0;
     int32_t n = 0;
     while (i < s.length) {
         const unsigned char* p = (const unsigned char*)s.data + i;
         int32_t w = suki_utf8_seq_len(p);
+        // A truncated lead byte claims more bytes than remain before the end
+        // of the string; reading them would go past the buffer. Treat a
+        // truncated sequence at the requested index as "out of range".
+        if ((int64_t)w > s.length - i) return -1;
         if (n == index) {
             switch (w) {
                 case 1: return p[0];
@@ -213,6 +269,7 @@ int64_t suki_str_to_int(SukiString s) {
     char buf[64];
     int64_t n = s.length < 63 ? s.length : 63;
     if (n < 0) n = 0;
+    if (!s.data) n = 0;
     memcpy(buf, s.data, (size_t)n);
     buf[n] = '\0';
     return (int64_t)strtoll(buf, NULL, 10);
@@ -222,6 +279,7 @@ double suki_str_to_double(SukiString s) {
     char buf[64];
     int64_t n = s.length < 63 ? s.length : 63;
     if (n < 0) n = 0;
+    if (!s.data) n = 0;
     memcpy(buf, s.data, (size_t)n);
     buf[n] = '\0';
     return strtod(buf, NULL);
@@ -297,8 +355,11 @@ void suki_array_new(int64_t elem_size, int64_t capacity, SukiArray* out) {
     if (!out) return;
     if (elem_size <= 0) elem_size = 1;
     if (capacity < 0) capacity = 0;
-    int64_t bytes = capacity * elem_size;
-    char* block = (char*)suki_alloc((size_t)(sizeof(int64_t) + (bytes ? bytes : 1)));
+    size_t bytes;
+    if (suki_size_mul(capacity, elem_size, &bytes)) panic("array size overflow");
+    size_t total = bytes + sizeof(int64_t);
+    if (total < bytes) panic("array size overflow");
+    char* block = (char*)suki_alloc(total ? total : 1);
     *(int64_t*)block = elem_size;
     out->data = block + sizeof(int64_t);
     out->length = 0;
@@ -320,8 +381,10 @@ void suki_array_push(SukiArray* ap, int64_t elem_size, const void* value) {
         // Grow geometrically; the length is carried in the first slot of the
         // block header so a by-value SukiArray still sees the update.
         int64_t newCap = a.capacity ? a.capacity * 2 : 4;
-        char* newBlock = (char*)suki_alloc((size_t)(sizeof(int64_t) +
-                                                   newCap * elem_size));
+        if (newCap <= a.capacity) panic("array capacity overflow");
+        size_t body;
+        if (suki_size_mul(newCap, elem_size, &body)) panic("array resize overflow");
+        char* newBlock = (char*)suki_alloc(sizeof(int64_t) + (body ? body : 1));
         *(int64_t*)newBlock = elem_size;
         if (a.length)
             memcpy(newBlock + sizeof(int64_t), a.data, (size_t)(a.length * elem_size));
@@ -416,12 +479,22 @@ void suki_dict_new(int64_t key_size, int64_t val_size, int64_t capacity,
     if (key_size <= 0) key_size = 1;
     if (val_size < 0) val_size = 0;
     if (capacity < SUKI_DICT_MIN_CAP) capacity = SUKI_DICT_MIN_CAP;
+    capacity = suki_round_pow2(capacity);
+    if (capacity == 0) panic("dictionary capacity overflow");
+    // `slot` is fixed per table; `capacity` is now a power of two so the probe
+    // mask `cap - 1` stays correct. Guard both multiplications against overflow.
     int64_t slot = key_size + 1 + val_size;
-    int64_t total = SUKI_DICT_HDR + capacity * slot;
-    char* block = (char*)suki_alloc((size_t)total);
+    if (slot <= 0) panic("invalid dictionary key/value size");
+    size_t tableBytes;
+    if (suki_size_mul(capacity, slot, &tableBytes)) panic("dictionary size overflow");
+    size_t total = (size_t)SUKI_DICT_HDR + tableBytes;
+    if (total < tableBytes) panic("dictionary size overflow");
+    char* block = (char*)suki_alloc(total);
     *(int64_t*)block = key_size;
     *(int64_t*)(block + 8) = val_size;
-    memset(block + SUKI_DICT_HDR, SUKI_DICT_EMPTY, (size_t)(capacity * slot));
+    // Use the already-overflow-checked byte count, not a fresh `capacity*slot`
+    // (which is int64 and can wrap even when the size_t product is valid).
+    memset(block + SUKI_DICT_HDR, SUKI_DICT_EMPTY, tableBytes);
     out->data = block;
     out->count = 0;
     out->capacity = capacity;
@@ -458,8 +531,10 @@ static void suki_dict_grow(SukiDict* d) {
     int64_t oldCap = d->capacity;
     if (!old.base) return;
     // Copy slot payloads aside before releasing the old block.
+    int64_t newCap = oldCap * 2;
+    if (newCap <= oldCap) panic("dictionary capacity overflow");
     SukiDict fresh;
-    suki_dict_new(old.key_size, old.val_size, oldCap * 2, &fresh);
+    suki_dict_new(old.key_size, old.val_size, newCap, &fresh);
     SukiDictView nv = suki_dict_view(&fresh);
     for (int64_t i = 0; i < oldCap; ++i) {
         unsigned char* s = suki_dict_slot(&old, i);
@@ -494,7 +569,14 @@ void suki_dict_set(SukiDict* d, int64_t key_size, int64_t val_size,
     if ((d->count + 1) * 10 >= d->capacity * 7) suki_dict_grow(d);
     SukiDictView v = suki_dict_view(d);
     unsigned char* s = suki_dict_probe(&v, d->capacity, key, 1);
-    if (!s) return;
+    if (!s) {
+        // Table was somehow full (e.g. exact-size capacity with no headroom):
+        // grow once and retry rather than silently dropping the insertion.
+        suki_dict_grow(d);
+        v = suki_dict_view(d);
+        s = suki_dict_probe(&v, d->capacity, key, 1);
+        if (!s) return;
+    }
     int wasFull = (s[v.key_size] == SUKI_DICT_FULL);
     if (!wasFull) d->count += 1;
     memcpy(s, key, (size_t)v.key_size);
@@ -873,7 +955,9 @@ SukiChannel* suki_channel_create(int64_t capacity, int64_t elemSize) {
     c->count = 0;
     c->head = 0;
     c->closed = 0;
-    c->buf = (unsigned char*)suki_alloc((size_t)(capacity * elemSize));
+    size_t bufBytes;
+    if (suki_size_mul(capacity, elemSize, &bufBytes)) panic("channel size overflow");
+    c->buf = (unsigned char*)suki_alloc(bufBytes ? bufBytes : 1);
     suki_bmtx_init(&c->mtx);
     suki_cvar_init(&c->notFull);
     suki_cvar_init(&c->notEmpty);
@@ -1046,7 +1130,11 @@ void suki_taskgroup_add(SukiTaskGroup* g, SukiFuture* f) {
     suki_bmtx_lock(&g->mtx);
     if (g->count == g->capacity) {
         int64_t nc = g->capacity * 2;
-        SukiFuture** nf = (SukiFuture**)suki_alloc(sizeof(SukiFuture*) * (size_t)nc);
+        if (nc <= g->capacity) panic("task group capacity overflow");
+        size_t nfBytes;
+        if (suki_size_mul((int64_t)sizeof(SukiFuture*), nc, &nfBytes))
+            panic("task group size overflow");
+        SukiFuture** nf = (SukiFuture**)suki_alloc(nfBytes);
         for (int64_t i = 0; i < g->count; ++i) nf[i] = g->futures[i];
         suki_free(g->futures);
         g->futures = nf;
