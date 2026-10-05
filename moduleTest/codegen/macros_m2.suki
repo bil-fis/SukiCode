@@ -1,0 +1,55 @@
+// M2 宏系统回归：@freestanding(declaration) / @attached(member) / #unique / \(self)
+// M2 macro regression: freestanding(declaration) / attached(member) / #unique / \(self)
+
+@freestanding(declaration)
+macro definePoint() -> Void {
+    return #makeDecl("struct GenPoint { var x, y: Int }")
+}
+
+@attached(member)
+macro AddIdentifiable() -> Void {
+    return #makeDecl("var id: Int = 0\nfunc uid() -> Int { return id }")
+}
+
+@attached(member)
+macro AddTypeName() -> Void {
+    return #makeDecl("func typeName() -> String { return \"\(self)\" }")
+}
+
+@freestanding(declaration)
+macro makeCounter() -> Void {
+    return #makeDecl("var \(#unique): Int = 7")
+}
+
+// 顶层声明宏：生成 GenPoint 结构体
+#definePoint()
+
+@AddIdentifiable
+struct User {
+    var name: String
+}
+
+@AddTypeName
+struct Widget {
+}
+
+#makeCounter()
+
+@main
+func main() -> Int {
+    // freestanding(declaration) 产物
+    let p = GenPoint(x: 3, y: 4)
+    if (p.x + p.y != 7) { return 1 }
+
+    // @attached(member) 注入成员
+    let u = User(name: "a")
+    if (u.uid() != 0) { return 2 }
+    if (u.id != 0) { return 3 }
+
+    // \(self) 引用被注解类型名
+    let w = Widget()
+    if (w.typeName() != "Widget") { return 4 }
+
+    // #unique 生成了唯一名字的全局变量（此处仅验证可编译运行）
+    return 0
+}

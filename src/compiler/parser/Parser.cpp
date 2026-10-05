@@ -199,6 +199,19 @@ NodeList Parser::parseModule() {
             else synchronize();
             continue;
         }
+        // 顶层宏展开（声明位 / 表达式位）：`#name(...)` 作为表达式语句承载，
+        // 交由 Sema 的宏展开 pass 处理（规范 5.6）。
+        if (check(TokenKind::TK_Punctuator) && cur().punct == PunctuatorID::Hash &&
+            peek(1).kind == TokenKind::TK_Identifier &&
+            peek(2).kind == TokenKind::TK_Punctuator && peek(2).punct == PunctuatorID::LParen) {
+            NodePtr e = parseExpression();
+            if (e) {
+                auto es = std::make_unique<ExprStmt>();
+                es->expr = std::move(e);
+                decls.push_back(std::move(es));
+            } else synchronize();
+            continue;
+        }
         NodePtr d = parseDecl();
         if (d) decls.push_back(std::move(d));
         else synchronize();
@@ -207,10 +220,34 @@ NodeList Parser::parseModule() {
 }
 
 // ─── declarations ──────────────────────────────────────────────────────────────
+NodePtr Parser::parseMacroDecl() {
+    auto md = std::make_unique<MacroDecl>();
+    advance(); // 'macro'
+    // 可选泛型参数 <T>：M1 不用于展开，仅消费以免解析失败。
+    if (checkPunct(PunctuatorID::Less)) {
+        parseGenericParamNames();
+        pendingGenericConstraints_.clear();
+    }
+    if (check(TokenKind::TK_Identifier)) { md->name = cur().text; advance(); }
+    if (checkPunct(PunctuatorID::LParen))
+        md->params = parseParameterList();
+    if (matchPunct(PunctuatorID::Arrow))
+        md->returnType = parseType();
+    md->role = pendingMacroRole_;
+    md->kind = pendingMacroKind_;
+    pendingMacroRole_.clear();
+    pendingMacroKind_.clear();
+    if (checkPunct(PunctuatorID::LBrace))
+        md->body = parseBlockStatements();
+    return md;
+}
+
 NodePtr Parser::parseDecl() {
     std::vector<std::string> attrs;
     pendingCdeclName_.clear();
     pendingCEnum_ = false;
+    pendingMacroRole_.clear();
+    pendingMacroKind_.clear();
     while (checkPunct(PunctuatorID::At)) {
         advance();
         if (check(TokenKind::TK_Identifier)) {
@@ -223,6 +260,17 @@ NodePtr Parser::parseDecl() {
                 if (check(TokenKind::TK_StringLiteral)) { pendingCdeclName_ = cur().text; advance(); }
                 else if (check(TokenKind::TK_Identifier)) { pendingCdeclName_ = cur().text; advance(); }
                 if (checkPunct(PunctuatorID::RParen)) advance();
+                continue;
+            }
+            // @freestanding(expression|declaration) / @attached(member|accessor|peer)：
+            // 捕获角色与种类，留待 parseMacroDecl 应用（规范 5.6）。
+            if (an == "freestanding" || an == "attached") {
+                pendingMacroRole_ = an;
+                if (checkPunct(PunctuatorID::LParen)) {
+                    advance();
+                    if (check(TokenKind::TK_Identifier)) { pendingMacroKind_ = cur().text; advance(); }
+                    if (checkPunct(PunctuatorID::RParen)) advance();
+                }
                 continue;
             }
         } else if (checkKw(KeywordID::Enum)) {
@@ -277,6 +325,7 @@ NodePtr Parser::parseDecl() {
         bool isLet = checkKw(KeywordID::Let);
         return attach(parseVarDecl(isLet, modifiers, /*member=*/false));
     }
+    if (checkKw(KeywordID::Macro)) return attach(parseMacroDecl());
 
     errorAt(cur(), "unexpected token at top level");
     advance();
@@ -1596,6 +1645,18 @@ bool Parser::looksLikeArrowClosure() {
 
 NodePtr Parser::parsePrimary() {
     Token t = cur();
+    // 宏引用（规范 5.6）：`#name` 由 Hash 标点后跟标识符组成，用于宏调用点
+    //（`#stringify(x)`）以及宏体内的原语（`#makeExpr` / #makeDecl / #unique）。
+    // 解析为一个名为 "#name" 的 IdentExpr，交由 Sema 的展开 pass 处理。
+    if (t.kind == TokenKind::TK_Punctuator && t.punct == PunctuatorID::Hash &&
+        peek(1).kind == TokenKind::TK_Identifier) {
+        advance();                 // '#'
+        Token idt = cur(); advance(); // name
+        auto id = std::make_unique<IdentExpr>();
+        id->name = "#" + idt.text;
+        id->range = SourceRange{idt.loc, idt.loc};
+        return id;
+    }
     // 内联汇编（规范 8.2）：上下文关键字 `asm`，仅在后跟 `(` 时按汇编表达式解析。
     if (t.kind == TokenKind::TK_Identifier && t.text == "asm" &&
         peek(1).kind == TokenKind::TK_Punctuator && peek(1).punct == PunctuatorID::LParen)

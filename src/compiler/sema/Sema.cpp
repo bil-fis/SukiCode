@@ -4,6 +4,9 @@
 #include <functional>
 #include <map>
 
+#include "compiler/lexer/Lexer.h"
+#include "compiler/parser/Parser.h"
+
 namespace suki {
 
 static SourceRange rangeOf(Node* n) { return n ? n->range : SourceRange{}; }
@@ -319,20 +322,26 @@ const Type* Sema::checkAsChar(Node* e, const TypeRecord* context) {
     return t;
 }
 
-void Sema::analyze(const NodeList& decls) {
+void Sema::analyze(NodeList& decls) {
     hadError_ = false;
+    // 宏展开（规范 5.6）：在类型解析与符号收集之前就地展开 freestanding 宏。
+    expandMacros(decls);
     globals_.pushScope();
     locals_.pushScope();
     registerBuiltins();
 
     // Pass 1: create type records for every named type declaration.
-    for (auto& d : decls) {
+    // Declarations belonging to the imported stdlib prelude (index < stdlibDeclCount_)
+    // are trusted and may reference unsafe types (e.g. UnsafeMutablePointer).
+    for (size_t i = 0; i < decls.size(); ++i) {
+        auto& d = decls[i];
         if (!d) continue;
+        unsafeContext_ = (i < stdlibDeclCount_);
         switch (d->kind) {
             case NodeKind::StructDecl: case NodeKind::EnumDecl:
             case NodeKind::ClassDecl: case NodeKind::ActorDecl:
             case NodeKind::ProtocolDecl:
-                collectTypeDecl(d.get());
+                collectTypeDecl(d.get(), i < stdlibDeclCount_);
                 break;
             case NodeKind::TypealiasDecl:
                 collectTypeAlias(static_cast<TypealiasDecl*>(d.get()));
@@ -389,8 +398,11 @@ void Sema::analyze(const NodeList& decls) {
     checkInitRules();
 
     // Pass 4: collect global functions and variables.
-    for (auto& d : decls) {
+    // (stdlib decls may declare functions/initialisers returning unsafe types.)
+    for (size_t i = 0; i < decls.size(); ++i) {
+        auto& d = decls[i];
         if (!d) continue;
+        unsafeContext_ = (i < stdlibDeclCount_);
         if (d->kind == NodeKind::FunctionDecl) {
             collectFunction(static_cast<FunctionDecl*>(d.get()), nullptr);
         } else if (d->kind == NodeKind::VarDecl) {
@@ -402,9 +414,12 @@ void Sema::analyze(const NodeList& decls) {
     // 不透明返回类型（规范 5.5）推断必须在函数体检查之前完成，以便前向引用的
     // 调用点也能解析到底层具体类型。
     inferOpaqueReturnTypes(decls);
+    unsafeContext_ = false;
     for (auto& kv : typeIndex_) {
         TypeRecord* rec = kv.second;
         if (!rec->decl) continue;
+        // 标准库类型的方法体可引用 unsafe 类型（如 UnsafeMutablePointer）。
+        unsafeContext_ = rec->isStdlib;
         auto* td = static_cast<TypeDecl*>(rec->decl);
         for (auto& m : td->members) {
             if (m && m->kind == NodeKind::FunctionDecl) {
@@ -465,7 +480,9 @@ void Sema::analyze(const NodeList& decls) {
             }
         }
     }
-    for (auto& d : decls) {
+    for (size_t i = 0; i < decls.size(); ++i) {
+        auto& d = decls[i];
+        unsafeContext_ = (i < stdlibDeclCount_);
         if (d && d->kind == NodeKind::FunctionDecl) {
             checkFunctionBody(static_cast<FunctionDecl*>(d.get()), nullptr);
         } else if (d && d->kind == NodeKind::VarDecl) {
@@ -478,7 +495,14 @@ void Sema::analyze(const NodeList& decls) {
     // the call sites have revealed which type arguments are used, check each
     // distinct instantiation again with those parameters bound, which annotates
     // the body with real types for lowering.
-    if (!genericInstances_.empty()) monomorphise(decls);
+    if (!genericInstances_.empty()) {
+        // 单态化重新检查泛型函数体（含标准库泛型类型的方法）；放宽 unsafe 约束，
+        // 因这些实例化多来自受信任的标准库。
+        bool savedUnsafe = unsafeContext_;
+        unsafeContext_ = true;
+        monomorphise(decls);
+        unsafeContext_ = savedUnsafe;
+    }
 
     locals_.popScope();
     globals_.popScope();
@@ -860,7 +884,9 @@ void Sema::registerBuiltins() {
         addHandleStruct("Task", ms);
     }
 
-    // TaskGroup — `addTask { ... }` spawns a child, `waitForAll` joins them.
+    // TaskGroup<T> — `addTask { ... }` spawns a child producing a T, and
+    // `waitForAll` joins them. `T` lets `for await` collect the children's
+    // results; a group used without type arguments behaves as before.
     {
         std::vector<TypeRecord::Member> ms;
         {
@@ -871,12 +897,13 @@ void Sema::registerBuiltins() {
             p.externalName = "_";
             p.internalName = "body";
             auto* ft = new FuncType();
-            ft->ret.reset(voidRepr());
+            auto* tRepr = new NamedType(); tRepr->name = "T";
+            ft->ret.reset(tRepr);
             p.type.reset(ft);
             fd->returnType.reset(voidRepr());
             TypeRecord::Member m;
             m.isFunction = true; m.name = "addTask";
-            m.type = types_.function({ types_.function({}, types_.voidType()) },
+            m.type = types_.function({ types_.function({}, types_.unknownType()) },
                                      types_.voidType());
             m.decl = fd;
             ms.push_back(m);
@@ -891,7 +918,10 @@ void Sema::registerBuiltins() {
             m.decl = fd;
             ms.push_back(m);
         }
-        addHandleStruct("TaskGroup", ms);
+        TypeRecord* tgRec = addHandleStruct("TaskGroup", ms);
+        // `TaskGroup<T>` is instantiated per child-result type so `for await`
+        // knows how large each result is.
+        tgRec->genericParams = { "T" };
     }
 
     // `withTaskGroup { group in ... }` — runs the body with a fresh group and
@@ -925,11 +955,12 @@ void Sema::registerBuiltins() {
     }
 }
 
-void Sema::collectTypeDecl(Node* decl) {
+void Sema::collectTypeDecl(Node* decl, bool isStdlib) {
     auto* td = static_cast<TypeDecl*>(decl);
     auto rec = std::make_unique<TypeRecord>();
     rec->name = td->name;
     rec->decl = td;
+    rec->isStdlib = isStdlib;            // 来自受信任标准库（可定义 unsafe 类型）
     switch (td->kind) {
         case NodeKind::StructDecl: rec->kind = TypeDeclKind::Struct; break;
         case NodeKind::EnumDecl: rec->kind = TypeDeclKind::Enum; break;
@@ -1329,7 +1360,7 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
                         : resolveTypeRepr(nt->genericArgs[0].get(), context);
                     return types_.optional(e);
                 }
-                if (name == "Owned" || name == "Unmanaged") {
+                if (name == "Unmanaged") {
                     const Type* e = nt->genericArgs.empty()
                         ? types_.unknownType()
                         : resolveTypeRepr(nt->genericArgs[0].get(), context);
@@ -1357,19 +1388,24 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
                     "' may only be used inside an 'unsafe' block", rangeOf(repr));
             }
 
-            // Owned<T> / Unmanaged<T>：裸所有权包装（规范 6.4）。即便标准库未声明
-            // 也在此解析；并强制禁止 Owned<class>（与 ARC 多引用模型冲突）。
-            if (name == "Owned" || name == "Unmanaged") {
+            // Owned<T>：唯一所有权（规范 §6.4）。编译器原生识别，因为规范强制
+            // 在实例化 `Owned<class>` / `Owned<actor>` 时报错——这一规则无法仅靠
+            // 泛型约束表达。当标准库 `memory` 模块尚未声明真实 `struct Owned<T>`
+            // （当前情形）时在此合成；一旦 memory 模块给出该结构体，应改为依赖
+            // 其泛型约束并在 monomorphise 处校验，避免与本地合成冲突。
+            if (name == "Owned") {
                 const Type* e = nt->genericArgs.empty()
                     ? types_.unknownType()
                     : resolveTypeRepr(nt->genericArgs[0].get(), context);
-                if (name == "Owned" && e && e->kind == TypeKind::Named && e->record &&
+                // 规范 §6.4：Owned<T> 只能用于值类型或 Unmanaged<T>；T 为 class/actor
+                // （由 ARC 管理、允许多引用）时禁止，否则唯一所有权会与 ARC 冲突，
+                // 移动后原变量被禁用但其他 strong 引用仍存在，造成内存不安全。
+                if (e && e->kind == TypeKind::Named && e->record &&
                     (e->record->kind == TypeDeclKind::Class ||
-                     e->record->kind == TypeDeclKind::Actor)) {
-                    diags_.reportError("'Owned<class>' is not allowed; use a "
-                                       "reference type or 'Unmanaged' for class instances",
-                                       rangeOf(repr));
-                }
+                     e->record->kind == TypeDeclKind::Actor))
+                    diags_.reportError(
+                        "'Owned<T>' cannot wrap a class/actor type; 'T' must be a "
+                        "value type or Unmanaged<T> (spec §6.4)", rangeOf(repr));
                 return types_.ref(RefKind::Owned, e);
             }
 
@@ -2205,6 +2241,12 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                         break;
                     default: break;
                 }
+            }
+            // `for await x in seq` iterates an async sequence (Channel<T> /
+            // TaskGroup<T>); the loop variable takes the element type T.
+            if (f->isAsync && seq && seq->kind == TypeKind::Named &&
+                !seq->elements.empty()) {
+                elem = seq->elements[0];
             }
             // Declare the loop variable(s).
             if (f->pattern) {
@@ -3167,6 +3209,652 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         default:
             return types_.unknownType();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 宏展开（规范 5.6）
+//
+// 设计要点：
+//   * 宏展开在 parse 之后、Sema 类型解析之前完成；展开产物是普通 AST，复用现有
+//     Sema / codegen，不污染后端。
+//   * freestanding(expression) 宏体形如 `return #makeExpr("…\(x)…")`。模板字符串
+//     经普通字符串插值解析后，其 `\(x)` 变为 StrLitExpr 的 interpolation 表达式
+//     （此处为引用宏参数 x 的 IdentExpr）。展开时把每个 `\(x)` 替换为对应实参的
+//     *原始源代码文本*（由节点的 SourceRange.offset 在 source_ 中截取），再整体
+//     重新解析为表达式，就地替换调用点的 CallExpr。
+//   * 卫生性（hygiene）：展开体内新引入的绑定名按规范加 `__suki_macro_<scopeID>_`
+//     前缀；unquote 嵌入的节点保留调用方作用域（其文本来自调用点，天然保留作用域）。
+//     M1 仅实现表达式宏，通常无新绑定，故基础重命名已足够；`#unique` 生成保证唯一
+//     的标识符。声明位宏（@freestanding(declaration)）与 @attached 留待 M2。
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Sema::expandMacros(NodeList& decls) {
+    // 1. 注册全部宏声明。
+    for (auto& d : decls)
+        if (d && d->kind == NodeKind::MacroDecl)
+            collectMacro(static_cast<MacroDecl*>(d.get()));
+    // 1.5 @attached(member) 宏：把展开产物拼接到被注解类型的成员列表（M2）。
+    expandBudget_ = kMaxMacroComplexity_;
+    for (auto& d : decls) {
+        if (!d) continue;
+        switch (d->kind) {
+        case NodeKind::StructDecl: case NodeKind::EnumDecl:
+        case NodeKind::ClassDecl:  case NodeKind::ActorDecl:
+        case NodeKind::ProtocolDecl: case NodeKind::ExtensionDecl:
+            break;
+        default:
+            continue;
+        }
+        auto* td = static_cast<TypeDecl*>(d.get());
+        for (const auto& attr : td->attributes) {
+            auto it = macros_.find(attr);
+            if (it == macros_.end()) continue;
+            MacroDecl* md = it->second;
+            if (md->role == "attached" && md->kind == "member" && md->expansionKind_ == "decl") {
+                NodeList injected = tryExpandAttached(md, td->name);
+                for (auto& m : injected) td->members.push_back(std::move(m));
+            }
+        }
+    }
+    // 2. 递归展开（表达式位宏调用 + 声明位宏调用 + attached 注入成员的嵌套宏）。
+    expandDeclList(decls);
+    // 3. 宏声明为编译期构造，展开后即可从顶层移除，避免进入后续分析与 codegen。
+    decls.erase(std::remove_if(decls.begin(), decls.end(),
+                   [](const NodePtr& d) { return d && d->kind == NodeKind::MacroDecl; }),
+                decls.end());
+}
+
+void Sema::collectMacro(MacroDecl* md) {
+    macros_[md->name] = md;
+    // 提前抽取模板（确定 expansionKind_），使下方 gate 判断（role/kind）
+    // 与展开逻辑可立即使用，无需等到第一次展开调用。
+    if (!md->expansionExtracted && !md->extractionFailed)
+        extractTemplate(md);
+}
+
+bool Sema::extractTemplate(MacroDecl* md) {
+    md->expansionExtracted = true;
+    // 寻找 `return #makeExpr("…") / #makeDecl("…")`。
+    for (auto& st : md->body) {
+        if (!st || st->kind != NodeKind::ReturnStmt) continue;
+        Node* e = static_cast<ReturnStmt*>(st.get())->value.get();
+        if (!e) continue;
+        if (e->kind == NodeKind::ExprStmt)
+            e = static_cast<ExprStmt*>(e)->expr.get();
+        if (e->kind != NodeKind::CallExpr) continue;
+        auto* ce = static_cast<CallExpr*>(e);
+        if (!ce->callee || ce->callee->kind != NodeKind::IdentExpr) continue;
+        std::string callee = static_cast<IdentExpr*>(ce->callee.get())->name;
+        bool isMake = (callee == "#makeExpr" || callee == "#makeDecl");
+        if (!isMake || ce->arguments.empty()) continue;
+        md->expansionKind_ = (callee == "#makeDecl") ? "decl" : "expr";
+        Node* arg = ce->arguments[0].get();
+        if (!arg || arg->kind != NodeKind::StrLitExpr) return false;
+        auto* sl = static_cast<StrLitExpr*>(arg);
+        // StrLitExpr 约定：segments.size() == expressions.size() + 1。
+        md->templateSegments_ = sl->segments;
+        md->unquoteNames_.clear();
+        md->unquoteNames_.reserve(sl->expressions.size());
+        for (auto& ex : sl->expressions) {
+            if (ex && ex->kind == NodeKind::IdentExpr)
+                md->unquoteNames_.push_back(static_cast<IdentExpr*>(ex.get())->name);
+            else
+                md->unquoteNames_.push_back(std::string()); // 暂不支持的 unquote 形式
+        }
+        return true;
+    }
+    return false;
+}
+
+// ── AST→源码递归序列化（宏 unquote 实参还原） ────────────────────────────────
+// Parser 当前把所有节点的 range 都设成零长度单点，无法用区间截取源码，
+// 故采用递归序列化：把任意表达式/类型 AST 还原成与其源码等价的文本。
+bool Sema::macroArgNeedsParens_(Node* n) const {
+    if (!n) return false;
+    switch (n->kind) {
+    case NodeKind::BinaryExpr:
+    case NodeKind::UnaryExpr:       // 前缀运算符（如 -a）需保护
+    case NodeKind::TernaryExpr:
+    case NodeKind::RangeExpr:
+    case NodeKind::AsExpr:
+    case NodeKind::IsExpr:
+    case NodeKind::AssignmentExpr:
+    case NodeKind::MoveExpr:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::string Sema::exprToSource(Node* n) const {
+    std::string s;
+    if (!n) return s;
+    switch (n->kind) {
+    case NodeKind::IdentExpr:
+        s += static_cast<IdentExpr*>(n)->name; break;
+    case NodeKind::IntLitExpr:
+    case NodeKind::FloatLitExpr:
+    case NodeKind::CharLitExpr:
+        if (n->kind == NodeKind::IntLitExpr)      s += static_cast<IntLitExpr*>(n)->value;
+        else if (n->kind == NodeKind::FloatLitExpr) s += static_cast<FloatLitExpr*>(n)->value;
+        else                                       s += static_cast<CharLitExpr*>(n)->value;
+        break;
+    case NodeKind::BoolLitExpr:
+        s += static_cast<BoolLitExpr*>(n)->value ? "true" : "false"; break;
+    case NodeKind::NilLitExpr:
+        s += "nil"; break;
+    case NodeKind::StrLitExpr: {
+        auto* sl = static_cast<StrLitExpr*>(n);
+        s += sl->isRaw ? "#\"" : "\"";
+        for (const auto& seg : sl->segments) s += seg;
+        s += '"'; break;
+    }
+    case NodeKind::BinaryExpr: {
+        auto* e = static_cast<BinaryExpr*>(n);
+        s += exprToSource(e->lhs.get());
+        s += ' '; s += punctToString(e->op); s += ' ';
+        s += exprToSource(e->rhs.get()); break;
+    }
+    case NodeKind::UnaryExpr: {
+        auto* e = static_cast<UnaryExpr*>(n);
+        if (e->isPostfix) { s += exprToSource(e->operand.get()); s += punctToString(e->op); }
+        else              { s += punctToString(e->op); s += exprToSource(e->operand.get()); }
+        break;
+    }
+    case NodeKind::CallExpr: {
+        auto* e = static_cast<CallExpr*>(n);
+        s += exprToSource(e->callee.get());
+        s += '(';
+        for (size_t i = 0; i < e->arguments.size(); ++i) {
+            if (i) s += ", ";
+            if (i < e->argumentLabels.size() && !e->argumentLabels[i].empty()) {
+                s += e->argumentLabels[i]; s += ": ";
+            }
+            s += exprToSource(e->arguments[i].get());
+        }
+        s += ')'; break;
+    }
+    case NodeKind::MemberExpr: {
+        auto* e = static_cast<MemberExpr*>(n);
+        s += exprToSource(e->base.get());
+        if (e->optionalChain) s += '?';
+        s += '.'; s += e->member; break;
+    }
+    case NodeKind::SubscriptExpr: {
+        auto* e = static_cast<SubscriptExpr*>(n);
+        s += exprToSource(e->base.get());
+        s += '[';
+        for (size_t i = 0; i < e->indices.size(); ++i) {
+            if (i) s += ", ";
+            s += exprToSource(e->indices[i].get());
+        }
+        s += ']'; break;
+    }
+    case NodeKind::ParenExpr:
+        s += '('; s += exprToSource(static_cast<ParenExpr*>(n)->expr.get()); s += ')'; break;
+    case NodeKind::AsExpr: {
+        auto* e = static_cast<AsExpr*>(n);
+        s += exprToSource(e->expr.get());
+        s += (e->asKind == AsExpr::AsBang ? " as! " :
+              e->asKind == AsExpr::AsQuestion ? " as? " : " as ");
+        s += typeToSource(e->type.get()); break;
+    }
+    case NodeKind::IsExpr: {
+        auto* e = static_cast<IsExpr*>(n);
+        s += exprToSource(e->expr.get());
+        s += " is "; s += typeToSource(e->type.get()); break;
+    }
+    case NodeKind::RangeExpr: {
+        auto* e = static_cast<RangeExpr*>(n);
+        if (e->lower) s += exprToSource(e->lower.get());
+        s += e->halfOpen ? "..<" : "...";
+        if (e->upper) s += exprToSource(e->upper.get());
+        break;
+    }
+    case NodeKind::TernaryExpr: {
+        auto* e = static_cast<TernaryExpr*>(n);
+        s += exprToSource(e->condition.get()); s += " ? ";
+        s += exprToSource(e->thenValue.get());  s += " : ";
+        s += exprToSource(e->elseValue.get()); break;
+    }
+    case NodeKind::AssignmentExpr: {
+        auto* e = static_cast<AssignmentExpr*>(n);
+        s += exprToSource(e->lhs.get());
+        if (e->isCompound) { s += ' '; s += punctToString(e->compoundOp); s += ' '; }
+        else               { s += " = "; }
+        s += exprToSource(e->rhs.get()); break;
+    }
+    case NodeKind::ArrayLitExpr: {
+        auto* e = static_cast<ArrayLitExpr*>(n);
+        s += '[';
+        for (size_t i = 0; i < e->elements.size(); ++i) {
+            if (i) s += ", ";
+            s += exprToSource(e->elements[i].get());
+        }
+        s += ']'; break;
+    }
+    case NodeKind::TupleExpr: {
+        auto* e = static_cast<TupleExpr*>(n);
+        s += '(';
+        for (size_t i = 0; i < e->elements.size(); ++i) {
+            if (i) s += ", ";
+            if (i < e->labels.size() && !e->labels[i].empty()) { s += e->labels[i]; s += ": "; }
+            s += exprToSource(e->elements[i].get());
+        }
+        s += ')'; break;
+    }
+    case NodeKind::OptionalChainExpr:
+        s += exprToSource(static_cast<OptionalChainExpr*>(n)->expr.get()); break;
+    case NodeKind::ForceUnwrapExpr: {
+        auto* e = static_cast<ForceUnwrapExpr*>(n);
+        s += exprToSource(e->expr.get()); s += '!'; break;
+    }
+    case NodeKind::MoveExpr:
+        s += "move "; s += exprToSource(static_cast<MoveExpr*>(n)->operand.get()); break;
+    case NodeKind::ClosureExpr:
+        s += "{ /*closure*/ }"; break;  // M1：宏实参极少为闭包，占位即可
+    default:
+        break;
+    }
+    return s;
+}
+
+std::string Sema::typeToSource(Node* n) const {
+    if (!n) return std::string();
+    switch (n->kind) {
+    case NodeKind::NamedType: {
+        auto* t = static_cast<NamedType*>(n);
+        std::string s = t->name;
+        if (!t->genericArgs.empty()) {
+            s += '<';
+            for (size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) s += ", ";
+                s += typeToSource(t->genericArgs[i].get());
+            }
+            s += '>';
+        }
+        return s;
+    }
+    case NodeKind::OptionalType:
+        return typeToSource(static_cast<OptionalType*>(n)->wrapped.get()) + "?";
+    case NodeKind::ArrayType:
+        return "[" + typeToSource(static_cast<ArrayType*>(n)->element.get()) + "]";
+    case NodeKind::DictType: {
+        auto* t = static_cast<DictType*>(n);
+        return "[" + typeToSource(t->key.get()) + ": " + typeToSource(t->value.get()) + "]";
+    }
+    case NodeKind::TupleType: {
+        auto* t = static_cast<TupleType*>(n);
+        std::string s = "(";
+        for (size_t i = 0; i < t->elements.size(); ++i) {
+            if (i) s += ", ";
+            s += typeToSource(t->elements[i].get());
+        }
+        return s + ")";
+    }
+    case NodeKind::RefType:
+        return static_cast<RefType*>(n)->refKind + " " +
+               typeToSource(static_cast<RefType*>(n)->pointee.get());
+    case NodeKind::InoutType:
+        return "inout " + typeToSource(static_cast<InoutType*>(n)->pointee.get());
+    default:
+        return std::string();
+    }
+}
+
+// 由模板 + 实参构造展开源码字符串（表达式宏与声明宏共用）。
+// selfType 非空时允许模板内 \(Self) 引用被注解类型的名字（@attached 用）。
+std::string Sema::buildMacroCode(MacroDecl* md, CallExpr* call, const std::string& selfType) {
+    if (!md->expansionExtracted && !extractTemplate(md)) {
+        if (!md->extractionFailed) {
+            md->extractionFailed = true;
+            diags_.reportError("macro '" + md->name +
+                "' body must be 'return #makeExpr(\"...\")' or '#makeDecl(\"...\")'",
+                call->range);
+        }
+        return std::string();
+    }
+    if (md->templateSegments_.size() != md->unquoteNames_.size() + 1)
+        return std::string();
+    // 参数名 → 实参节点（按宏参数定义顺序映射）。
+    std::unordered_map<std::string, Node*> argOf;
+    for (size_t i = 0; i < md->params.size() && i < call->arguments.size(); ++i) {
+        const std::string& pname = md->params[i].internalName.empty()
+            ? md->params[i].externalName : md->params[i].internalName;
+        argOf[pname] = call->arguments[i].get();
+    }
+    std::string code;
+    for (size_t i = 0; i < md->templateSegments_.size(); ++i) {
+        code += md->templateSegments_[i];
+        if (i < md->unquoteNames_.size()) {
+            const std::string& p = md->unquoteNames_[i];
+            if (!selfType.empty() && (p == "Self" || p == "self")) {
+                code += selfType;
+            } else if (!p.empty() && p.front() == '#') {
+                // 编译期原语：#unique 生成卫生性唯一标识符。
+                if (p == "#unique")
+                    code += "__suki_unique_" + std::to_string(++uniqueCounter_);
+                else {
+                    diags_.reportError("unknown macro primitive '" + p + "'", call->range);
+                    code += p;
+                }
+            } else {
+                auto ait = argOf.find(p);
+                if (ait == argOf.end() || !ait->second) {
+                    diags_.reportError("macro unquote '\\(" + p +
+                        ")' has no matching argument", call->range);
+                    return std::string();
+                }
+                std::string argSrc = exprToSource(ait->second);
+                // 含运算符的实参需整体加括号，避免被模板中的运算符抢占优先级
+                // （如 (3 + 4) * 2 不能写成 3 + 4 * 2）。
+                if (macroArgNeedsParens_(ait->second))
+                    code += "(" + argSrc + ")";
+                else
+                    code += argSrc;
+            }
+        }
+    }
+    return code;
+}
+
+// 把一段模板源码重新解析为声明列表（@freestanding(declaration) / @attached(member) 共用）。
+NodeList Sema::expandDeclTemplate(MacroDecl* md, CallExpr* call, const std::string& selfType) {
+    NodeList out;
+    std::string code = buildMacroCode(md, call, selfType);
+    if (code.empty()) return out;
+    DiagnosticEngine subDiags;
+    Lexer lexer(code, subDiags);
+    auto toks = lexer.tokenizeAll();
+    Parser parser(std::move(toks), subDiags);
+    NodeList decls = parser.parseModule();
+    if (subDiags.hasErrors() || decls.empty()) {
+        std::string sub = subDiags.lastErrorMessage();
+        diags_.reportError("macro '" + md->name + "' produced invalid declaration expansion" +
+            (sub.empty() ? std::string("") : (": " + sub)), call->range);
+        return out;
+    }
+    // MacroExpansionTooComplex：节点数预算。
+    if (expandBudget_ > 0) {
+        long n = 0;
+        for (auto& d : decls) n += (long)countNodes(d.get());
+        if (expandBudget_ < n) {
+            diags_.reportError("macro expansion exceeded MacroExpansionTooComplex limit", call->range);
+            return out;
+        }
+        expandBudget_ -= n;
+    }
+    for (auto& d : decls) {
+        if (expandDepth_ < 64) { ++expandDepth_; expandInNode(d); --expandDepth_; }
+        expandDeclListContainers(d.get());
+    }
+    return decls;
+}
+
+// @freestanding(declaration) 宏：调用点 #name(...) 展开为声明列表。
+NodeList Sema::tryExpandDeclMacro(CallExpr* call, const std::string& selfType) {
+    NodeList out;
+    if (!call->callee || call->callee->kind != NodeKind::IdentExpr) return out;
+    std::string name = static_cast<IdentExpr*>(call->callee.get())->name;
+    if (name.empty() || name.front() != '#') return out;
+    name = name.substr(1);
+    auto it = macros_.find(name);
+    if (it == macros_.end()) return out;
+    MacroDecl* md = it->second;
+    if (md->role != "freestanding" || md->expansionKind_ != "decl") return out;
+    return expandDeclTemplate(md, call, selfType);
+}
+
+// @attached(member) 宏：被注解类型无显式实参，用合成空 CallExpr 触发模板展开。
+NodeList Sema::tryExpandAttached(MacroDecl* md, const std::string& selfType) {
+    if (md->expansionKind_ != "decl") return NodeList();
+    CallExpr synth;
+    return expandDeclTemplate(md, &synth, selfType);
+}
+
+// 判断节点是否为声明位宏调用（ExprStmt -> CallExpr(#name)，且 name 指向已注册的
+// freestanding(declaration) 宏）。
+bool Sema::isDeclMacroCall(Node* n) const {
+    if (!n || n->kind != NodeKind::ExprStmt) return false;
+    auto* es = static_cast<ExprStmt*>(n);
+    if (!es->expr || es->expr->kind != NodeKind::CallExpr) return false;
+    auto* ce = static_cast<CallExpr*>(es->expr.get());
+    if (!ce->callee || ce->callee->kind != NodeKind::IdentExpr) return false;
+    std::string name = static_cast<IdentExpr*>(ce->callee.get())->name;
+    if (name.empty() || name.front() != '#') return false;
+    auto it = macros_.find(name.substr(1));
+    if (it == macros_.end()) return false;
+    MacroDecl* md = it->second;
+    return md->role == "freestanding" && md->kind == "declaration";
+}
+
+// 统计 AST 节点总数（用于 MacroExpansionTooComplex 复杂度预算）。
+size_t Sema::countNodes(Node* n) {
+    if (!n) return 0;
+    size_t c = 1;
+    walkChildren(n, [&](NodePtr& child) { c += countNodes(child.get()); });
+    return c;
+}
+
+// 列表级展开：把列表里声明位宏调用（ExprStmt 承载的 #name(...)）就地替换为
+// 展开得到的声明列表，并递归处理嵌套的语句块/类型成员中的声明宏。
+void Sema::expandDeclList(NodeList& list) {
+    NodeList out;
+    for (auto& item : list) {
+        if (!item) { out.push_back(nullptr); continue; }
+        expandInNode(item); // 表达式位宏（M1）就地替换
+        if (isDeclMacroCall(item.get())) {
+            auto* es = static_cast<ExprStmt*>(item.get());
+            NodeList ex = tryExpandDeclMacro(static_cast<CallExpr*>(es->expr.get()), std::string());
+            for (auto& d : ex) out.push_back(std::move(d));
+        } else {
+            expandDeclListContainers(item.get());
+            out.push_back(std::move(item));
+        }
+    }
+    list = std::move(out);
+}
+
+// 对单个节点的「含声明列表」子容器递归调用 expandDeclList。
+void Sema::expandDeclListContainers(Node* n) {
+    if (!n) return;
+    auto each = [&](NodeList& l) { expandDeclList(l); };
+    switch (n->kind) {
+    case NodeKind::BlockStmt: each(static_cast<BlockStmt*>(n)->statements); break;
+    case NodeKind::IfStmt: {
+        auto* s = static_cast<IfStmt*>(n);
+        each(s->thenBody);
+        if (s->elseBranch) expandDeclListContainers(s->elseBranch.get());
+        break;
+    }
+    case NodeKind::GuardStmt: each(static_cast<GuardStmt*>(n)->elseBody); break;
+    case NodeKind::WhileStmt: each(static_cast<WhileStmt*>(n)->body); break;
+    case NodeKind::RepeatWhileStmt: each(static_cast<RepeatWhileStmt*>(n)->body); break;
+    case NodeKind::ForInStmt: each(static_cast<ForInStmt*>(n)->body); break;
+    case NodeKind::DoStmt: each(static_cast<DoStmt*>(n)->body); break;
+    case NodeKind::SwitchStmt:
+        for (auto& c : static_cast<SwitchStmt*>(n)->cases)
+            each(static_cast<CaseClause*>(c.get())->body);
+        break;
+    case NodeKind::StructDecl: case NodeKind::EnumDecl:
+    case NodeKind::ClassDecl:  case NodeKind::ActorDecl:
+    case NodeKind::ProtocolDecl: case NodeKind::ExtensionDecl:
+        each(static_cast<TypeDecl*>(n)->members); break;
+    case NodeKind::ClosureExpr: each(static_cast<ClosureExpr*>(n)->body); break;
+    default: break;
+    }
+}
+
+NodePtr Sema::tryExpandMacroCall(CallExpr* call, const std::string& macroName) {
+    auto it = macros_.find(macroName);
+    if (it == macros_.end()) return nullptr;
+    MacroDecl* md = it->second;
+    if (md->role != "freestanding" || md->kind != "expression")
+        return nullptr; // M1：仅 freestanding(expression) 实际展开
+    std::string code = buildMacroCode(md, call, std::string());
+    if (code.empty()) return nullptr;
+    // 重新解析为表达式。
+    DiagnosticEngine subDiags;
+    Lexer lexer(code, subDiags);
+    auto toks = lexer.tokenizeAll();
+    Parser parser(std::move(toks), subDiags);
+    NodePtr result = parser.parseExpression();
+    if (!result || subDiags.hasErrors()) {
+        std::string sub = subDiags.lastErrorMessage();
+        diags_.reportError("macro '" + md->name + "' produced invalid expansion" +
+            (sub.empty() ? std::string("") : (": " + sub)), call->range);
+        return nullptr;
+    }
+    // 嵌套展开（带深度上限防自引用死循环）。
+    if (expandBudget_ > 0) {
+        long n = (long)countNodes(result.get());
+        if (expandBudget_ < n) {
+            diags_.reportError("macro expansion exceeded MacroExpansionTooComplex limit", call->range);
+            return nullptr;
+        }
+        expandBudget_ -= n;
+    }
+    if (expandDepth_ < 64) {
+        ++expandDepth_;
+        expandInNode(result);
+        --expandDepth_;
+    }
+    return result;
+}
+
+void Sema::expandInNode(NodePtr& n) {
+    if (!n) return;
+    // 宏 *定义* 的体是模板，不应被就地展开。
+    if (n->kind != NodeKind::MacroDecl)
+        walkChildren(n.get(), [this](NodePtr& c) { expandInNode(c); });
+    // 宏调用替换：CallExpr 且 callee 为 "#name"。
+    if (n->kind == NodeKind::CallExpr) {
+        auto* ce = static_cast<CallExpr*>(n.get());
+        if (ce->callee && ce->callee->kind == NodeKind::IdentExpr) {
+            auto* id = static_cast<IdentExpr*>(ce->callee.get());
+            if (!id->name.empty() && id->name.front() == '#') {
+                NodePtr expanded = tryExpandMacroCall(ce, id->name.substr(1));
+                if (expanded) {
+                    n = std::move(expanded);
+                    if (expandDepth_ < 64) {
+                        ++expandDepth_;
+                        expandInNode(n);
+                        --expandDepth_;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void Sema::walkChildren(Node* n, std::function<void(NodePtr&)> fn) {
+    if (!n) return;
+    auto each  = [&](NodeList& list) { for (auto& e : list) fn(e); };
+    auto eachP = [&](std::vector<NodePtr>& list) { for (auto& e : list) fn(e); };
+    switch (n->kind) {
+    // ── 声明 ──
+    case NodeKind::FunctionDecl: { auto* d = static_cast<FunctionDecl*>(n);
+        fn(d->returnType);
+        for (auto& p : d->params) { fn(p.type); fn(p.defaultValue); }
+        each(d->body); break; }
+    case NodeKind::InitDecl: { auto* d = static_cast<InitDecl*>(n);
+        for (auto& p : d->params) { fn(p.type); fn(p.defaultValue); }
+        each(d->body); break; }
+    case NodeKind::DeinitDecl: { auto* d = static_cast<DeinitDecl*>(n);
+        each(d->body); break; }
+    case NodeKind::SubscriptDecl: { auto* d = static_cast<SubscriptDecl*>(n);
+        for (auto& p : d->params) { fn(p.type); fn(p.defaultValue); }
+        fn(d->elementType); each(d->getter); each(d->setter); break; }
+    case NodeKind::StructDecl: case NodeKind::EnumDecl:
+    case NodeKind::ClassDecl: case NodeKind::ActorDecl:
+    case NodeKind::ProtocolDecl: case NodeKind::ExtensionDecl: {
+        auto* d = static_cast<TypeDecl*>(n);
+        each(d->inherited); fn(d->whereClause); each(d->members); break; }
+    case NodeKind::VarDecl: { auto* d = static_cast<VarDecl*>(n);
+        fn(d->type); fn(d->initializer); eachP(d->accessors); break; }
+    case NodeKind::TypealiasDecl: { auto* d = static_cast<TypealiasDecl*>(n);
+        fn(d->underlying); break; }
+    case NodeKind::EnumCaseDecl: { auto* d = static_cast<EnumCaseDecl*>(n);
+        eachP(d->associatedTypes); break; }
+    case NodeKind::AssociatedTypeDecl: { auto* d = static_cast<AssociatedTypeDecl*>(n);
+        each(d->inherited); fn(d->defaultType); break; }
+    case NodeKind::MacroDecl: { auto* d = static_cast<MacroDecl*>(n);
+        fn(d->returnType); each(d->body); break; }
+    case NodeKind::AccessorDecl: { auto* d = static_cast<AccessorDecl*>(n);
+        each(d->body); break; }
+    // ── 语句 ──
+    case NodeKind::BlockStmt: { auto* s = static_cast<BlockStmt*>(n);
+        each(s->statements); break; }
+    case NodeKind::ExprStmt: { auto* s = static_cast<ExprStmt*>(n); fn(s->expr); break; }
+    case NodeKind::ReturnStmt: { auto* s = static_cast<ReturnStmt*>(n); fn(s->value); break; }
+    case NodeKind::IfStmt: { auto* s = static_cast<IfStmt*>(n);
+        fn(s->condition); each(s->thenBody); fn(s->elseBranch); break; }
+    case NodeKind::IfExpr: { auto* s = static_cast<IfExpr*>(n);
+        fn(s->condition); each(s->thenBody); fn(s->elseBranch); break; }
+    case NodeKind::GuardStmt: { auto* s = static_cast<GuardStmt*>(n);
+        fn(s->condition); each(s->elseBody); break; }
+    case NodeKind::WhileStmt: { auto* s = static_cast<WhileStmt*>(n);
+        fn(s->condition); each(s->body); break; }
+    case NodeKind::RepeatWhileStmt: { auto* s = static_cast<RepeatWhileStmt*>(n);
+        each(s->body); fn(s->condition); break; }
+    case NodeKind::ForInStmt: { auto* s = static_cast<ForInStmt*>(n);
+        fn(s->pattern); fn(s->sequence); each(s->body); break; }
+    case NodeKind::SwitchStmt: { auto* s = static_cast<SwitchStmt*>(n);
+        fn(s->subject); eachP(s->cases); break; }
+    case NodeKind::CaseClause: { auto* s = static_cast<CaseClause*>(n);
+        fn(s->pattern); fn(s->whereExpr); each(s->body); break; }
+    case NodeKind::DoStmt: { auto* s = static_cast<DoStmt*>(n);
+        each(s->body); eachP(s->catches); break; }
+    case NodeKind::CatchClause: { auto* s = static_cast<CatchClause*>(n);
+        fn(s->pattern); fn(s->whereExpr); each(s->body); break; }
+    case NodeKind::ThrowStmt: { auto* s = static_cast<ThrowStmt*>(n); fn(s->value); break; }
+    case NodeKind::DeferStmt: { auto* s = static_cast<DeferStmt*>(n); fn(s->body); break; }
+    case NodeKind::UnsafeStmt: { auto* s = static_cast<UnsafeStmt*>(n); each(s->body); break; }
+    // ── 表达式 ──
+    case NodeKind::BinaryExpr: { auto* e = static_cast<BinaryExpr*>(n);
+        fn(e->lhs); fn(e->rhs); break; }
+    case NodeKind::UnaryExpr: { auto* e = static_cast<UnaryExpr*>(n); fn(e->operand); break; }
+    case NodeKind::CallExpr: { auto* e = static_cast<CallExpr*>(n);
+        fn(e->callee); each(e->arguments); break; }
+    case NodeKind::MemberExpr: { auto* e = static_cast<MemberExpr*>(n); fn(e->base); break; }
+    case NodeKind::SubscriptExpr: { auto* e = static_cast<SubscriptExpr*>(n);
+        fn(e->base); each(e->indices); break; }
+    case NodeKind::OptionalChainExpr: { auto* e = static_cast<OptionalChainExpr*>(n); fn(e->expr); break; }
+    case NodeKind::ForceUnwrapExpr: { auto* e = static_cast<ForceUnwrapExpr*>(n); fn(e->expr); break; }
+    case NodeKind::TupleExpr: { auto* e = static_cast<TupleExpr*>(n); each(e->elements); break; }
+    case NodeKind::ArrayLitExpr: { auto* e = static_cast<ArrayLitExpr*>(n); each(e->elements); break; }
+    case NodeKind::DictLitExpr: { auto* e = static_cast<DictLitExpr*>(n);
+        each(e->keys); each(e->values); break; }
+    case NodeKind::SetLitExpr: { auto* e = static_cast<SetLitExpr*>(n); each(e->elements); break; }
+    case NodeKind::ClosureExpr: { auto* e = static_cast<ClosureExpr*>(n);
+        fn(e->returnType); each(e->body);
+        for (auto& p : e->params) { fn(p.type); fn(p.defaultValue); } break; }
+    case NodeKind::ParenExpr: { auto* e = static_cast<ParenExpr*>(n); fn(e->expr); break; }
+    case NodeKind::AsExpr: { auto* e = static_cast<AsExpr*>(n); fn(e->expr); fn(e->type); break; }
+    case NodeKind::IsExpr: { auto* e = static_cast<IsExpr*>(n); fn(e->expr); fn(e->type); break; }
+    case NodeKind::AssignmentExpr: { auto* e = static_cast<AssignmentExpr*>(n); fn(e->lhs); fn(e->rhs); break; }
+    case NodeKind::RangeExpr: { auto* e = static_cast<RangeExpr*>(n); fn(e->lower); fn(e->upper); break; }
+    case NodeKind::GenericExpr: { auto* e = static_cast<GenericExpr*>(n); fn(e->base); each(e->args); break; }
+    case NodeKind::MoveExpr: { auto* e = static_cast<MoveExpr*>(n); fn(e->operand); break; }
+    case NodeKind::StrLitExpr: { auto* e = static_cast<StrLitExpr*>(n); each(e->expressions); break; }
+    case NodeKind::TernaryExpr: { auto* e = static_cast<TernaryExpr*>(n);
+        fn(e->condition); fn(e->thenValue); fn(e->elseValue); break; }
+    case NodeKind::NamedType: { auto* t = static_cast<NamedType*>(n); eachP(t->genericArgs); break; }
+    case NodeKind::OptionalType: { auto* t = static_cast<OptionalType*>(n); fn(t->wrapped); break; }
+    case NodeKind::ArrayType: { auto* t = static_cast<ArrayType*>(n); fn(t->element); break; }
+    case NodeKind::DictType: { auto* t = static_cast<DictType*>(n); fn(t->key); fn(t->value); break; }
+    case NodeKind::TupleType: { auto* t = static_cast<TupleType*>(n); eachP(t->elements); break; }
+    case NodeKind::FuncType: { auto* t = static_cast<FuncType*>(n); eachP(t->params); fn(t->ret); break; }
+    case NodeKind::RefType: { auto* t = static_cast<RefType*>(n); fn(t->pointee); break; }
+    case NodeKind::InoutType: { auto* t = static_cast<InoutType*>(n); fn(t->pointee); break; }
+    case NodeKind::MetatypeType: { auto* t = static_cast<MetatypeType*>(n); fn(t->base); break; }
+    case NodeKind::AsmExpr: { auto* a = static_cast<AsmExpr*>(n);
+        for (auto& o : a->outputs) fn(o.expr);
+        for (auto& i : a->inputs)  fn(i.expr);
+        break; }
+    default:
+        break;
     }
 }
 

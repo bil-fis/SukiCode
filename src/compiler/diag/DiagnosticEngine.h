@@ -39,6 +39,13 @@ public:
     uint32_t warningCount() const { return warningCount_; }
     size_t count() const { return diagnostics_.size(); }
 
+    // 返回最近一条错误诊断的消息文本（供宏展开等场景把子诊断透传给用户）。
+    std::string lastErrorMessage() const {
+        for (auto it = diagnostics_.rbegin(); it != diagnostics_.rend(); ++it)
+            if (it->isError()) return it->message();
+        return std::string();
+    }
+
     // Print all collected diagnostics to the given stream.
     // Returns false if any error/fatal was reported.
     bool emit(FILE* out = stderr, bool printSummary = true);

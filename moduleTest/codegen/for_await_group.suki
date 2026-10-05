@@ -1,0 +1,25 @@
+// for await（规范 7.6）：对 TaskGroup<T> 按提交顺序收集各子任务结果。
+// Spec 7.6: drain a typed TaskGroup<T>, collecting each child's result in order.
+//
+// 期望行为：5 个子任务各返回 1..5，`for await` 收齐后求和为 15，退出码 0。
+
+@main
+func main() -> Int {
+    let g = TaskGroup<Int>()
+    g.addTask { return 1 }
+    g.addTask { return 2 }
+    g.addTask { return 3 }
+    g.addTask { return 4 }
+    g.addTask { return 5 }
+    g.waitForAll()
+    var total = 0
+    for await v in g {
+        total = total + v
+    }
+    if total != 15 {
+        print("FAIL total=", total)
+        return 1
+    }
+    print("ok total=", total)
+    return 0
+}

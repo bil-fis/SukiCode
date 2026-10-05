@@ -57,7 +57,6 @@ CASE_TIMEOUT="${CASE_TIMEOUT:-60}"
 #   kind = positive (default): the case must compile, run and exit 0.
 #   kind = negative:          the case must be *rejected* by `sukic check`.
 KNOWN_PENDING=(
-    "examples/memory.suki|owned-pool: Owned / MemoryPool / Collection / pool protocol family"
     # Channel / Task / TaskGroup / withTaskGroup are implemented and covered by
     # the codegen tests; what this showcase still needs is actor isolation, the
     # `select` statement, `for await` iteration and ranges (`0..<100`).

@@ -641,6 +641,28 @@ void suki_mutex_unlock(SukiMutex* m) {
 
 void suki_mutex_destroy(SukiMutex* m) { (void)m; }
 
+// ─── raw pointer helpers ───────────────────────────────────────────────────────
+// Exposed to @unsafe contexts through the `memory` standard-library module. The
+// address is passed as an `Int` by the generated code (LP64 makes an 8-byte
+// pointer and an int64 the same width), so no opaque-pointer type is needed on
+// the C side. The helpers simply reinterpret the bits as a pointer.
+void* suki_ptr_alloc(int64_t n) {
+    return suki_alloc((size_t)(n > 0 ? n : 1));
+}
+
+int64_t suki_ptr_drop(void* p) { suki_free(p); return 0; }
+
+int64_t suki_ptr_read_int(void* p) {
+    if (!p) return 0;
+    return *(int64_t*)p;
+}
+
+int64_t suki_ptr_write_int(void* p, int64_t v) {
+    if (!p) return 0;
+    *(int64_t*)p = v;
+    return 0;
+}
+
 int64_t suki_atomic_load_i64(const int64_t* p) {
     return p ? __atomic_load_n(p, __ATOMIC_ACQUIRE) : 0;
 }
@@ -983,15 +1005,40 @@ struct SukiTaskGroup {
     SukiFuture**  futures;
     int64_t       count;
     int64_t       capacity;
+    int64_t       elemSize;   // byte size of a child's result, 0 for none
 };
 
-SukiTaskGroup* suki_taskgroup_create(void) {
+SukiTaskGroup* suki_taskgroup_create(int64_t elemSize) {
     SukiTaskGroup* g = (SukiTaskGroup*)suki_alloc(sizeof(SukiTaskGroup));
     g->capacity = 8;
     g->count = 0;
+    g->elemSize = elemSize > 0 ? elemSize : 0;
     g->futures = (SukiFuture**)suki_alloc(sizeof(SukiFuture*) * (size_t)g->capacity);
     suki_bmtx_init(&g->mtx);
     return g;
+}
+
+int64_t suki_taskgroup_count(SukiTaskGroup* g) {
+    if (!g) return 0;
+    suki_bmtx_lock(&g->mtx);
+    int64_t n = g->count;
+    suki_bmtx_unlock(&g->mtx);
+    return n;
+}
+
+int32_t suki_taskgroup_result_at(SukiTaskGroup* g, int64_t index,
+                                 void* out_elem) {
+    if (!g || !out_elem || index < 0) return -1;
+    suki_bmtx_lock(&g->mtx);
+    if (index >= g->count) { suki_bmtx_unlock(&g->mtx); return -1; }
+    SukiFuture* f = g->futures[index];
+    suki_bmtx_unlock(&g->mtx);
+    if (!f) return -1;
+    // Await outside the lock: the child signals completion without needing it.
+    int64_t dummy = 0;
+    if (g->elemSize > 0) suki_future_await(f, out_elem);
+    else suki_future_await(f, &dummy);
+    return g->elemSize > 0 ? 0 : -1;
 }
 
 void suki_taskgroup_add(SukiTaskGroup* g, SukiFuture* f) {

@@ -1,0 +1,46 @@
+// 规范 5.6：宏系统 M1 —— @freestanding(expression) 端到端可用。
+// Spec 5.6: macro system M1 — @freestanding(expression) end-to-end.
+// 验证：宏声明解析、#makeExpr 模板、\(arg) unquote、重解析与就地替换，
+//       以及嵌套宏调用与复杂实参（二元表达式 / 成员访问 / 函数调用）。
+
+@freestanding(expression)
+macro doubleValue(x: Int) -> Int {
+    return #makeExpr("(\(x) * 2)")
+}
+
+@freestanding(expression)
+macro square(n: Int) -> Int {
+    return #makeExpr("(\(n) * \(n))")
+}
+
+struct Point {
+    var x, y: Int
+}
+
+func myMax(a: Int, b: Int) -> Int {
+    if (a > b) { return a } else { return b }
+}
+
+@main
+func main() -> Int {
+    // 基本 unquote：实参为字面量
+    if (#doubleValue(21) != 42) { return 1 }
+
+    // unquote 实参为二元表达式（需递归序列化）
+    if (#doubleValue(3 + 4) != 14) { return 2 }
+
+    // unquote 实参为成员访问
+    let p = Point(x: 10, y: 20)
+    if (#doubleValue(p.x) != 20) { return 3 }
+
+    // unquote 实参为函数调用（带标签）
+    if (#doubleValue(myMax(a: 2, b: 8)) != 16) { return 4 }
+
+    // 嵌套宏调用：实参自身是另一个宏展开
+    if (#doubleValue(#square(3)) != 18) { return 5 }
+
+    // 多 unquote（两个 \(n) 槽位）
+    if (#square(7) != 49) { return 6 }
+
+    return 0
+}

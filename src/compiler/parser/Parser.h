@@ -41,6 +41,7 @@ private:
 
     // ── declarations ─────────────────────────────────────────────────────────
     NodePtr parseDecl();
+    NodePtr parseMacroDecl();   // 规范 5.6：macro 声明
     std::vector<std::string> parseModifiers();
     NodePtr parseFunctionDecl(std::vector<std::string> modifiers);
     NodePtr parseInitializerDecl(std::vector<std::string> modifiers);
@@ -141,6 +142,9 @@ private:
     std::string pendingCdeclName_;
     // @enum(C) 捕获的 C 兼容枚举标记暂存区（规范 1.5）。
     bool pendingCEnum_ = false;
+    // 宏声明属性捕获（规范 5.6）：@freestanding(expression) / @attached(member) 等。
+    std::string pendingMacroRole_;
+    std::string pendingMacroKind_;
 };
 
 } // namespace suki

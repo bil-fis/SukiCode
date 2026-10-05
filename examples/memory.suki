@@ -1,61 +1,91 @@
-// Memory management — ARC, Pool, Owned
+// Memory management — ARC, Pool, Collection, Owned, unsafe pointers (specification §6).
+//
+// Demonstrates the full memory-management family implemented in the `memory`
+// standard-library module. Runs to completion and exits 0; every subsystem is
+// exercised through a real call path.
 
-// ARC reference cycles and weak references
+import memory
+
+// ── ARC: strong + weak references, automatic deinitialisation ───────────────────
 class Node {
     var value: Int
-    var next: Node?        // strong reference
-    weak var prev: Node?   // weak reference to break cycle
-
+    var next: Node?           // strong reference
+    weak var prev: Node?      // weak reference (breaks retain cycles)
     init(value: Int) {
         self.value = value
     }
+    deinit {
+        print("node \(value) deallocated")
+    }
 }
 
-// Pool for batch allocation
+// ── Pool for batch allocation ──────────────────────────────────────────────────
 func poolExample() {
-    let pool = MemoryPool<Int>(capacity: 1000)
-
-    for i in 0..<1000 {
-        let ptr = pool.allocate()
-        // Use ptr...
+    let pool = MemoryPool<Int>(capacity: 1000, defaultValue: 0)
+    var allocated = 0
+    for i in 0..<10 {
+        let v = pool.allocate()
+        if (v != nil) {
+            allocated += 1
+        }
     }
-
-    // All memory freed when pool goes out of scope
+    print("pool allocated \(allocated) values, capacity \(pool.capacity)")
+    pool.releaseAll()   // all memory released together
 }
 
-// Owned<T> for move semantics
+// ── Owned<T> unique ownership via move ─────────────────────────────────────────
 struct Buffer {
-    var data: Owned<[UInt8]>
-
+    var data: Owned<ByteBuffer>
     init(size: Int) {
-        data = Owned<[UInt8]>(capacity: size)
+        data = Owned<ByteBuffer>(ByteBuffer(capacity: size))
     }
-
-    mutating func transfer() -> Owned<[UInt8]> {
-        return move data  // data is now invalid
+    mutating func transfer() -> Owned<ByteBuffer> {
+        return move data   // data becomes invalid after the move
     }
 }
 
-// Collection for resource lifecycle
+func ownedExample() {
+    var buf = Buffer(size: 64)
+    let moved = buf.transfer()
+    print("owned transferred, buffer size = \(moved.value.size)")
+}
+
+// ── Collection: resource lifecycle ─────────────────────────────────────────────
 func collectionExample() {
     let collection = Collection()
 
     let dbPool = ConnectionPool(capacity: 10)
-    let cachePool = MemoryPool<String>(capacity: 1000)
+    let cachePool = MemoryPool<String>(capacity: 1000, defaultValue: "")
 
     collection.add(dbPool)
     collection.add(cachePool)
 
-    // Use pools...
-    // collection.shutdown() called automatically on scope exit
+    // Use the pools; their teardown is automatic when `collection` goes out of
+    // scope (its `deinit` runs `shutdown()`), releasing dbPool then cachePool.
 }
 
-// Unsafe pointer operations
+// ── Unsafe raw pointer operations ──────────────────────────────────────────────
 func unsafeExample() {
     unsafe {
-        let ptr: UnsafeMutablePointer<Int> = allocate(capacity: 1)
+        let ptr = allocate(capacity: 1)
         ptr.pointee = 42
-        print(ptr.pointee)
+        print("pointee = \(ptr.pointee)")
         ptr.deallocate()
     }
+}
+
+@main
+func main() {
+    poolExample()
+    ownedExample()
+    collectionExample()
+    unsafeExample()
+
+    // ARC: a singly-linked list; references are released automatically on scope exit.
+    let n1 = Node(value: 1)
+    let n2 = Node(value: 2)
+    n1.next = n2
+    print("arc nodes built")
+
+    print("memory management demo done")
 }

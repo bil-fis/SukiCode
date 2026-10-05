@@ -66,37 +66,2729 @@ private:
         b_ = std::make_unique<llvm::IRBuilder<>>(*ctx_);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // 协作组件：并发 lowering（async / Future / Channel<T> / select / TaskGroup /
+    // Task / for await）。该组件持有对 Impl 的回指（owner_），共享 module_ / b_ /
+    // ctx_ / layout_ 与函数/局部符号表；组件间（与表达式生成、ARC、异常）通过
+    // owner_ 互相调用，保持调用点不变。这样把「最容易出竞争问题」的并发代码从
+    // 巨型 Impl 中隔离出来，单独推理。
+    // ─────────────────────────────────────────────────────────────────────────
+    class ConcurrencyLowerer {
+    public:
+        explicit ConcurrencyLowerer(Impl* o) : owner_(o) {}
+        Impl* owner_;
+
+        // Synchronous runtime builtins with fixed C prototypes.
+        llvm::Value* genSyncBuiltin(const std::string& name, CallExpr* e) {
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Type* i64p = llvm::PointerType::getUnqual(i64);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            std::string cname;
+            std::vector<llvm::Type*> ptys;
+            llvm::Type* rty = voidTy;
+            if (name == "atomicAdd")         { cname = "suki_atomic_add_i64"; ptys = {i64p, i64}; rty = i64; }
+            else if (name == "mutexLock")    { cname = "suki_spin_lock";      ptys = {i64p};      rty = voidTy; }
+            else if (name == "mutexUnlock")  { cname = "suki_spin_unlock";    ptys = {i64p};      rty = voidTy; }
+            else return nullptr;
+            llvm::Function* fn = owner_->declareExternalSig(cname, ptys, rty);
+            std::vector<llvm::Value*> args;
+            for (auto& a : e->arguments) {
+                llvm::Value* v = owner_->genExpr(a.get());
+                if (!v) return nullptr;
+                args.push_back(v);
+            }
+            for (size_t i = 0; i < args.size() && i < ptys.size(); ++i)
+                args[i] = owner_->coerce(args[i], ptys[i]);
+            return owner_->b_->CreateCall(fn, args);
+        }
+
+        // Runtime entry points used by async lowering.
+        llvm::Function* asyncAllocFn() {
+            return owner_->declareExternalSig("suki_alloc", { llvm::Type::getInt64Ty(*owner_->ctx_) },
+                                              llvm::PointerType::get(*owner_->ctx_, 0));
+        }
+        llvm::Function* asyncFreeFn() {
+            return owner_->declareExternalSig("suki_free", { llvm::PointerType::get(*owner_->ctx_, 0) },
+                                              llvm::Type::getVoidTy(*owner_->ctx_));
+        }
+        llvm::Function* asyncFutureCreateFn() {
+            return owner_->declareExternalSig("suki_future_create",
+                                              { llvm::Type::getInt64Ty(*owner_->ctx_) },
+                                              llvm::PointerType::get(*owner_->ctx_, 0));
+        }
+
+        // Emit `<sym>_spawn` for an async function.
+        void genAsyncSpawn(FunctionDecl* fn, const std::string& sym) {
+            const std::string spawnSym = sym + "_spawn";
+            if (owner_->fns_.count(spawnSym)) return;
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+
+            std::vector<llvm::Type*> ptys;
+            for (auto& p : fn->params)
+                ptys.push_back(p.semaType ? owner_->layout_->lower(p.semaType) : i64);
+
+            const Type* rt = fn->returnType ? fn->returnType->semaType : nullptr;
+            const bool isVoid = !rt || rt->kind == TypeKind::Void ||
+                                rt->kind == TypeKind::Unknown;
+            llvm::Type* rty = isVoid ? nullptr : owner_->layout_->lower(rt);
+            const int64_t rsize = isVoid ? 0 : (int64_t)owner_->sizeOf(rty);
+
+            std::vector<llvm::Type*> ctys = ptys;
+            ctys.push_back(i8p);
+            llvm::StructType* ctxTy = llvm::StructType::get(*owner_->ctx_, ctys, false);
+            const unsigned futIdx = (unsigned)ptys.size();
+
+            llvm::Function* bodyFn = owner_->fns_[fn->name];
+            if (!bodyFn) bodyFn = owner_->declareAs(fn, fn->name);
+
+            llvm::Function* storeFn = owner_->declareExternalSig("suki_future_store",
+                                                                { i8p, i8p }, voidTy);
+            llvm::Function* finishFn = owner_->declareExternalSig("suki_future_finish",
+                                                                 { i8p }, voidTy);
+
+            llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
+            llvm::Function* tramp = llvm::Function::Create(
+                trampTy, llvm::GlobalValue::InternalLinkage, sym + "_tramp",
+                owner_->module_.get());
+            {
+                llvm::BasicBlock* tb = llvm::BasicBlock::Create(*owner_->ctx_, "entry", tramp);
+                owner_->b_->SetInsertPoint(tb);
+                llvm::Value* rawCtx = tramp->getArg(0);
+                llvm::Value* cp = owner_->b_->CreateBitCast(rawCtx,
+                    llvm::PointerType::getUnqual(ctxTy), "ctx");
+                std::vector<llvm::Value*> callArgs;
+                for (size_t i = 0; i < ptys.size(); ++i) {
+                    llvm::Value* fp = owner_->b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
+                                                                  "arg.addr");
+                    callArgs.push_back(owner_->b_->CreateLoad(ptys[i], fp));
+                }
+                llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
+                llvm::Value* fut = owner_->b_->CreateLoad(i8p, futAddr, "fut");
+                if (!isVoid) {
+                    llvm::Value* v = owner_->b_->CreateCall(bodyFn, callArgs);
+                    llvm::Value* slot = owner_->b_->CreateAlloca(rty, nullptr, "result");
+                    owner_->b_->CreateStore(v, slot);
+                    owner_->b_->CreateCall(storeFn, { fut, owner_->b_->CreateBitCast(slot, i8p) });
+                } else {
+                    owner_->b_->CreateCall(bodyFn, callArgs);
+                }
+                owner_->b_->CreateCall(finishFn, { fut });
+                owner_->b_->CreateCall(asyncFreeFn(), { rawCtx });
+                owner_->b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
+            }
+
+            llvm::FunctionType* sft = llvm::FunctionType::get(i8p, ptys, false);
+            llvm::Function* spawnFn = llvm::Function::Create(
+                sft, llvm::GlobalValue::InternalLinkage, spawnSym, owner_->module_.get());
+            {
+                llvm::BasicBlock* sb = llvm::BasicBlock::Create(*owner_->ctx_, "entry", spawnFn);
+                owner_->b_->SetInsertPoint(sb);
+                llvm::Value* fut = owner_->b_->CreateCall(asyncFutureCreateFn(),
+                                                  { llvm::ConstantInt::get(i64, rsize) });
+                llvm::Value* rawCtx = owner_->b_->CreateCall(asyncAllocFn(),
+                    { llvm::ConstantInt::get(i64, (int64_t)owner_->sizeOf(ctxTy)) });
+                llvm::Value* cp = owner_->b_->CreateBitCast(rawCtx,
+                    llvm::PointerType::getUnqual(ctxTy), "ctx");
+                for (size_t i = 0; i < ptys.size(); ++i) {
+                    llvm::Value* fp = owner_->b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
+                                                                  "arg.addr");
+                    owner_->b_->CreateStore(spawnFn->getArg((unsigned)i), fp);
+                }
+                llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
+                owner_->b_->CreateStore(fut, futAddr);
+
+                llvm::Function* startFn = owner_->declareExternalSig("suki_thread_start",
+                    { llvm::PointerType::getUnqual(trampTy), i8p },
+                    llvm::Type::getInt32Ty(*owner_->ctx_));
+                llvm::Value* started = owner_->b_->CreateCall(startFn, { tramp, rawCtx },
+                                                              "started");
+                llvm::Value* failed = owner_->b_->CreateICmpNE(started,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(*owner_->ctx_), 0));
+                llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*owner_->ctx_, "inline",
+                                                                      spawnFn);
+                llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*owner_->ctx_, "spawned",
+                                                                    spawnFn);
+                owner_->b_->CreateCondBr(failed, inlineBB, doneBB);
+                owner_->b_->SetInsertPoint(inlineBB);
+                owner_->b_->CreateCall(tramp, { rawCtx });
+                owner_->b_->CreateBr(doneBB);
+                owner_->b_->SetInsertPoint(doneBB);
+                owner_->b_->CreateRet(fut);
+            }
+            owner_->fns_[spawnSym] = spawnFn;
+        }
+
+        // `Channel<T>` allocation.
+        llvm::Value* genChannelInit(const Type* instTy, CallExpr* e) {
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            const Type* elemTy = (!instTy->elements.empty())
+                                     ? instTy->elements[0] : nullptr;
+            llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : i64;
+            const int64_t esz = (int64_t)owner_->sizeOf(elemLLVM);
+
+            llvm::Value* cap = llvm::ConstantInt::get(i64, 1);
+            if (!e->arguments.empty()) {
+                llvm::Value* cv = owner_->genExpr(e->arguments[0].get());
+                if (cv) cap = owner_->coerce(cv, i64);
+            }
+            llvm::Function* createFn = owner_->declareExternalSig("suki_channel_create",
+                                                              { i64, i64 }, i8p);
+            llvm::Value* handle = owner_->b_->CreateCall(createFn,
+                { cap, llvm::ConstantInt::get(i64, esz) });
+
+            llvm::Type* sty = owner_->layout_->lower(instTy);
+            if (!sty || !sty->isStructTy()) return nullptr;
+            llvm::Value* slot = owner_->b_->CreateAlloca(sty, nullptr, "channel.tmp");
+            owner_->b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
+            llvm::Value* hp = owner_->b_->CreateStructGEP(sty, slot, 0, "handle.addr");
+            owner_->b_->CreateStore(handle, hp);
+            return owner_->b_->CreateLoad(sty, slot);
+        }
+
+        // Channel methods are runtime-backed.
+        void genChannelMethodBody(const std::string& method, const Type* instTy,
+                                  llvm::Function* f) {
+            if (!f || !f->empty()) return;
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            const Type* elemTy = (!instTy->elements.empty())
+                                     ? instTy->elements[0] : nullptr;
+            llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : i64;
+
+            llvm::Type* selfTy = f->getFunctionType()->getParamType(0);
+            owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+            llvm::Value* selfSlot = owner_->b_->CreateAlloca(selfTy, nullptr, "self");
+            owner_->b_->CreateStore(f->getArg(0), selfSlot);
+            llvm::Value* hp = owner_->b_->CreateStructGEP(selfTy, selfSlot, 0, "handle.addr");
+            llvm::Value* handle = owner_->b_->CreateLoad(i8p, hp, "handle");
+
+            if (method == "send") {
+                llvm::Value* vSlot = owner_->b_->CreateAlloca(elemLLVM, nullptr, "value");
+                owner_->b_->CreateStore(owner_->coerce(f->getArg(1), elemLLVM), vSlot);
+                llvm::Function* sf = owner_->declareExternalSig("suki_channel_send",
+                                                                { i8p, i8p }, voidTy);
+                owner_->b_->CreateCall(sf, { handle, owner_->b_->CreateBitCast(vSlot, i8p) });
+                owner_->b_->CreateRetVoid();
+            } else if (method == "receive") {
+                llvm::Value* out = owner_->b_->CreateAlloca(elemLLVM, nullptr, "out");
+                llvm::Function* rf = owner_->declareExternalSig("suki_channel_receive",
+                                                                { i8p, i8p },
+                                                                llvm::Type::getInt32Ty(*owner_->ctx_));
+                owner_->b_->CreateCall(rf, { handle, owner_->b_->CreateBitCast(out, i8p) });
+                owner_->b_->CreateRet(owner_->b_->CreateLoad(elemLLVM, out));
+            } else if (method == "close") {
+                llvm::Function* cf = owner_->declareExternalSig("suki_channel_close",
+                                                                { i8p }, voidTy);
+                owner_->b_->CreateCall(cf, { handle });
+                owner_->b_->CreateRetVoid();
+            } else {
+                owner_->b_->CreateRetVoid();
+            }
+        }
+
+        // ── 并发剩余：select / for await / Future / Channel 方法 / Task / TaskGroup ──
+        void genSelect(SwitchStmt* s) {
+            if (!s) return;
+            llvm::Function* cur = owner_->b_->GetInsertBlock()->getParent();
+            llvm::BasicBlock* retry = llvm::BasicBlock::Create(*owner_->ctx_, "select.retry", cur);
+            llvm::BasicBlock* done = llvm::BasicBlock::Create(*owner_->ctx_, "select.done", cur);
+            owner_->b_->CreateBr(retry);
+            owner_->b_->SetInsertPoint(retry);
+
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+
+            for (auto& c : s->cases) {
+                if (!c || c->kind != NodeKind::CaseClause) continue;
+                auto* cc = static_cast<CaseClause*>(c.get());
+                if (cc->isDefault || !cc->pattern) continue;
+                if (cc->pattern->kind != NodeKind::BinaryExpr) continue;
+                auto* be = static_cast<BinaryExpr*>(cc->pattern.get());
+                if (be->op != PunctuatorID::LeftArrow) continue;
+
+                const bool isReceive = cc->isBindingPattern || (!cc->bindings.empty());
+                const Type* chTy = be->rhs ? be->rhs->semaType : nullptr;
+                const Type* elemTy = (chTy && !chTy->elements.empty())
+                                         ? chTy->elements[0] : nullptr;
+                llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : i64;
+                llvm::Value* chVal = owner_->genExpr(be->rhs.get());
+                if (!chVal) continue;
+                llvm::Type* chStruct = chVal->getType();
+                llvm::Value* chSlot = owner_->b_->CreateAlloca(chStruct, nullptr, "sel.chan");
+                owner_->b_->CreateStore(chVal, chSlot);
+                llvm::Value* hp = owner_->b_->CreateStructGEP(chStruct, chSlot, 0, "sel.h");
+                llvm::Value* handle = owner_->b_->CreateLoad(i8p, hp, "sel.handle");
+
+                llvm::Value* ok = nullptr;
+                llvm::Value* outSlot = nullptr;
+                if (isReceive) {
+                    outSlot = owner_->b_->CreateAlloca(elemLLVM, nullptr, "sel.recv");
+                    llvm::Function* tf = owner_->declareExternalSig("suki_channel_try_receive",
+                        { i8p, i8p }, llvm::Type::getInt32Ty(*owner_->ctx_));
+                    ok = owner_->b_->CreateCall(tf, { handle,
+                        owner_->b_->CreateBitCast(outSlot, i8p) });
+                } else {
+                    llvm::Value* v = owner_->genExpr(be->lhs.get());
+                    if (!v) continue;
+                    llvm::Value* vSlot = owner_->b_->CreateAlloca(elemLLVM, nullptr, "sel.send");
+                    owner_->b_->CreateStore(owner_->coerce(v, elemLLVM), vSlot);
+                    llvm::Function* tf = owner_->declareExternalSig("suki_channel_try_send",
+                        { i8p, i8p }, llvm::Type::getInt32Ty(*owner_->ctx_));
+                    ok = owner_->b_->CreateCall(tf, { handle,
+                        owner_->b_->CreateBitCast(vSlot, i8p) });
+                }
+                llvm::Value* ready = owner_->b_->CreateICmpEQ(ok,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(*owner_->ctx_), 1));
+                llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*owner_->ctx_, "sel.case", cur);
+                llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(*owner_->ctx_, "sel.next", cur);
+                owner_->b_->CreateCondBr(ready, bodyBB, nextBB);
+                owner_->b_->SetInsertPoint(bodyBB);
+                if (isReceive && outSlot && !cc->bindings.empty()) {
+                    llvm::Value* val = owner_->b_->CreateLoad(elemLLVM, outSlot, "sel.value");
+                    llvm::Value* slot = owner_->b_->CreateAlloca(elemLLVM, nullptr,
+                                                                 cc->bindings[0]);
+                    owner_->b_->CreateStore(val, slot);
+                    owner_->locals_[cc->bindings[0]] = slot;
+                }
+                for (auto& st : cc->body) owner_->genStmt(st.get());
+                owner_->b_->CreateBr(done);
+                owner_->b_->SetInsertPoint(nextBB);
+            }
+
+            bool hasDefault = false;
+            for (auto& c : s->cases) {
+                if (!c || c->kind != NodeKind::CaseClause) continue;
+                if (static_cast<CaseClause*>(c.get())->isDefault) { hasDefault = true; break; }
+            }
+            if (hasDefault) {
+                for (auto& c : s->cases) {
+                    if (!c || c->kind != NodeKind::CaseClause) continue;
+                    auto* cc = static_cast<CaseClause*>(c.get());
+                    if (!cc->isDefault) continue;
+                    for (auto& st : cc->body) owner_->genStmt(st.get());
+                    break;
+                }
+                owner_->b_->CreateBr(done);
+            } else {
+                llvm::Function* sleepFn = owner_->declareExternalSig("suki_sleep", { i64 },
+                                                                     voidTy);
+                owner_->b_->CreateCall(sleepFn, { llvm::ConstantInt::get(i64, 1) });
+                owner_->b_->CreateBr(retry);
+            }
+            owner_->b_->SetInsertPoint(done);
+        }
+
+        void genForAwait(ForInStmt* fr) {
+            llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* i32 = llvm::Type::getInt32Ty(*owner_->ctx_);
+
+            llvm::Value* seq = fr->sequence ? owner_->genExpr(fr->sequence.get()) : nullptr;
+            if (!seq) return;
+            llvm::Type* seqTy = seq->getType();
+
+            const Type* seqType = fr->sequence ? fr->sequence->semaType : nullptr;
+            const Type* elemTy = (seqType && seqType->kind == TypeKind::Named &&
+                                  !seqType->elements.empty()) ? seqType->elements[0]
+                                                             : nullptr;
+            llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : i64;
+
+            const std::string seqName = (seqType && seqType->kind == TypeKind::Named)
+                                           ? seqType->name : std::string();
+            const bool isTaskGroup = (seqName.rfind("TaskGroup", 0) == 0);
+
+            llvm::Value* hslot = owner_->b_->CreateAlloca(seqTy, nullptr, "fa.seq");
+            owner_->b_->CreateStore(seq, hslot);
+            llvm::Value* hp = owner_->b_->CreateStructGEP(seqTy, hslot, 0, "fa.handle.addr");
+            llvm::Value* handle = owner_->b_->CreateLoad(i8p, hp, "fa.handle");
+
+            std::string vname;
+            VarDecl* pat = fr->pattern && fr->pattern->kind == NodeKind::VarDecl
+                               ? static_cast<VarDecl*>(fr->pattern.get()) : nullptr;
+            if (pat && !pat->name.empty()) vname = pat->name;
+
+            llvm::Value* out = owner_->b_->CreateAlloca(elemLLVM, nullptr, "fa.out");
+            llvm::Value* idxSlot = nullptr;
+            if (isTaskGroup)
+                idxSlot = owner_->b_->CreateAlloca(i64, nullptr, "fa.i");
+            llvm::BasicBlock* headBB = llvm::BasicBlock::Create(*owner_->ctx_, "fa.head", f);
+            llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*owner_->ctx_, "fa.body", f);
+            llvm::BasicBlock* stepBB = llvm::BasicBlock::Create(*owner_->ctx_, "fa.step", f);
+            llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(*owner_->ctx_, "fa.exit", f);
+            if (isTaskGroup)
+                owner_->b_->CreateStore(llvm::ConstantInt::get(i64, 0), idxSlot);
+            owner_->b_->CreateBr(headBB);
+            owner_->b_->SetInsertPoint(headBB);
+
+            if (isTaskGroup) {
+                llvm::Value* cnt = owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_taskgroup_count", { i8p }, i64), { handle });
+                llvm::Value* i = owner_->b_->CreateLoad(i64, idxSlot);
+                owner_->b_->CreateCondBr(owner_->b_->CreateICmpSLT(i, cnt), bodyBB, exitBB);
+                owner_->b_->SetInsertPoint(bodyBB);
+                llvm::Value* ii = owner_->b_->CreateLoad(i64, idxSlot);
+                owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_taskgroup_result_at", { i8p, i64, i8p }, i32),
+                    { handle, ii, owner_->b_->CreateBitCast(out, i8p) });
+            } else {
+                llvm::Value* ok = owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_channel_receive", { i8p, i8p }, i32),
+                    { handle, owner_->b_->CreateBitCast(out, i8p) });
+                owner_->b_->CreateCondBr(owner_->b_->CreateICmpEQ(ok, llvm::ConstantInt::get(i32, 0)),
+                                         bodyBB, exitBB);
+                owner_->b_->SetInsertPoint(bodyBB);
+            }
+
+            if (!vname.empty()) {
+                llvm::Value* vslot = owner_->b_->CreateAlloca(elemLLVM, nullptr, vname);
+                owner_->b_->CreateStore(owner_->b_->CreateLoad(elemLLVM, out), vslot);
+                owner_->locals_[vname] = vslot;
+                owner_->trackScopedRef(vname, pat && pat->semaType ? pat->semaType : nullptr);
+            }
+            owner_->breakTargets_.push_back(exitBB);
+            owner_->continueTargets_.push_back(stepBB);
+            for (auto& st : fr->body) owner_->genStmt(st.get());
+            owner_->breakTargets_.pop_back();
+            owner_->continueTargets_.pop_back();
+            if (!owner_->b_->GetInsertBlock()->getTerminator())
+                owner_->b_->CreateBr(stepBB);
+            owner_->b_->SetInsertPoint(stepBB);
+            if (isTaskGroup && idxSlot) {
+                llvm::Value* ni = owner_->b_->CreateAdd(owner_->b_->CreateLoad(i64, idxSlot),
+                                                       llvm::ConstantInt::get(i64, 1));
+                owner_->b_->CreateStore(ni, idxSlot);
+            }
+            owner_->b_->CreateBr(headBB);
+            owner_->b_->SetInsertPoint(exitBB);
+        }
+
+        // 已完成的 Future，供运行时支撑的 async 成员使用。
+        llvm::Value* asyncCompletedFuture(llvm::Type* valueTy, llvm::Value* valuePtr) {
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            const int64_t sz = valueTy ? (int64_t)owner_->sizeOf(valueTy) : 0;
+            llvm::Value* fut = owner_->b_->CreateCall(asyncFutureCreateFn(),
+                { llvm::ConstantInt::get(i64, sz) });
+            if (valueTy && valuePtr)
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_future_store",
+                    { i8p, i8p }, voidTy), { fut, owner_->b_->CreateBitCast(valuePtr, i8p) });
+            owner_->b_->CreateCall(owner_->declareExternalSig("suki_future_finish",
+                { i8p }, voidTy), { fut });
+            return fut;
+        }
+
+        void genChannelMethod(FunctionDecl* mf, const Type* instTy) {
+            const std::string mkey = std::string(instTy->record->name) + "." + mf->name;
+            if (owner_->methodFns_.count(mkey)) return;
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            const Type* elemTy = (!instTy->elements.empty()) ? instTy->elements[0] : nullptr;
+            llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : i64;
+            llvm::Type* selfTy = owner_->layout_->lower(instTy);
+            if (!selfTy) return;
+
+            std::vector<llvm::Type*> ptys{ selfTy };
+            if (mf->name == "send") ptys.push_back(elemLLVM);
+            llvm::FunctionType* fty = llvm::FunctionType::get(i8p, ptys, false);
+            llvm::Function* f = llvm::Function::Create(fty,
+                llvm::GlobalValue::InternalLinkage, mkey, owner_->module_.get());
+            owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+
+            llvm::Value* selfSlot = owner_->b_->CreateAlloca(selfTy, nullptr, "self");
+            owner_->b_->CreateStore(f->getArg(0), selfSlot);
+            llvm::Value* hp = owner_->b_->CreateStructGEP(selfTy, selfSlot, 0, "handle.addr");
+            llvm::Value* handle = owner_->b_->CreateLoad(i8p, hp, "handle");
+
+            if (mf->name == "send") {
+                llvm::Value* vSlot = owner_->b_->CreateAlloca(elemLLVM, nullptr, "value");
+                owner_->b_->CreateStore(owner_->coerce(f->getArg(1), elemLLVM), vSlot);
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_channel_send",
+                    { i8p, i8p }, voidTy), { handle, owner_->b_->CreateBitCast(vSlot, i8p) });
+                owner_->b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+            } else if (mf->name == "receive") {
+                llvm::Value* out = owner_->b_->CreateAlloca(elemLLVM, nullptr, "out");
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_channel_receive",
+                    { i8p, i8p }, llvm::Type::getInt32Ty(*owner_->ctx_)),
+                    { handle, owner_->b_->CreateBitCast(out, i8p) });
+                owner_->b_->CreateRet(asyncCompletedFuture(elemLLVM, out));
+            } else if (mf->name == "close") {
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_channel_close",
+                    { i8p }, voidTy), { handle });
+                owner_->b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+            } else {
+                owner_->b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+            }
+            owner_->methodFns_[mkey] = f;
+        }
+
+        void genTaskGroupMethod(FunctionDecl* mf, const Type* instTy) {
+            const std::string mkey = std::string(instTy->name) + "." + mf->name;
+            if (owner_->methodFns_.count(mkey)) return;
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            const Type* elemTy = (!instTy->elements.empty()) ? instTy->elements[0] : nullptr;
+            llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : nullptr;
+            llvm::Type* selfTy = owner_->layout_->lower(instTy);
+            if (!selfTy) return;
+
+            if (mf->name == "waitForAll") {
+                llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { selfTy }, false);
+                llvm::Function* f = llvm::Function::Create(fty,
+                    llvm::GlobalValue::InternalLinkage, mkey, owner_->module_.get());
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+                llvm::Value* g = loadHandle(f->getArg(0), selfTy);
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_wait_all",
+                    { i8p }, voidTy), { g });
+                owner_->b_->CreateRetVoid();
+                owner_->methodFns_[mkey] = f;
+                return;
+            }
+            if (mf->name != "addTask") return;
+
+            llvm::StructType* clTy = llvm::cast<llvm::StructType>(
+                owner_->layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
+            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { selfTy, clTy }, false);
+            llvm::Function* f = llvm::Function::Create(fty,
+                llvm::GlobalValue::InternalLinkage, mkey, owner_->module_.get());
+            owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+            llvm::Value* g = loadHandle(f->getArg(0), selfTy);
+            llvm::Value* fut = startClosureTask(f->getArg(1), f, elemLLVM);
+            owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_add",
+                { i8p, i8p }, voidTy), { g, fut });
+            owner_->b_->CreateRetVoid();
+            owner_->methodFns_[mkey] = f;
+        }
+
+        llvm::StructType* handleStructTy(const std::string& name) {
+            if (llvm::StructType* t = llvm::StructType::getTypeByName(
+                    owner_->module_->getContext(), "suki." + name))
+                return t;
+            return llvm::StructType::create(*owner_->ctx_,
+                { llvm::PointerType::get(*owner_->ctx_, 0) }, "suki." + name);
+        }
+        llvm::Value* makeHandleValue(llvm::StructType* sty, llvm::Value* handle) {
+            llvm::Value* slot = owner_->b_->CreateAlloca(sty, nullptr, "handle.tmp");
+            owner_->b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
+            llvm::Value* hp = owner_->b_->CreateStructGEP(sty, slot, 0, "handle.addr");
+            owner_->b_->CreateStore(handle, hp);
+            return owner_->b_->CreateLoad(sty, slot);
+        }
+        llvm::Value* loadHandle(llvm::Value* selfVal, llvm::Type* selfTy) {
+            llvm::Value* slot = owner_->b_->CreateAlloca(selfTy, nullptr, "self.tmp");
+            owner_->b_->CreateStore(selfVal, slot);
+            llvm::Value* hp = owner_->b_->CreateStructGEP(selfTy, slot, 0, "handle.addr");
+            return owner_->b_->CreateLoad(llvm::PointerType::get(*owner_->ctx_, 0), hp, "handle");
+        }
+        // 在独立线程上启动闭包体，返回完成时完成的 Future。
+        llvm::Value* startClosureTask(llvm::Value* cv, llvm::Function* cur,
+                                      llvm::Type* resultTy) {
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            llvm::Value* ctxv = owner_->b_->CreateExtractValue(cv, {0}, "task.ctx");
+            llvm::Value* fnv  = owner_->b_->CreateExtractValue(cv, {1}, "task.fn");
+            const int64_t rsz = resultTy ? (int64_t)owner_->sizeOf(resultTy) : 0;
+            llvm::Value* fut = owner_->b_->CreateCall(asyncFutureCreateFn(),
+                { llvm::ConstantInt::get(i64, rsz) });
+
+            llvm::StructType* cctxTy = llvm::StructType::get(*owner_->ctx_,
+                { i8p, i8p, i8p }, false);
+            llvm::FunctionType* tt = llvm::FunctionType::get(voidTy, { i8p }, false);
+            llvm::Function* tramp = llvm::Function::Create(tt,
+                llvm::GlobalValue::InternalLinkage,
+                "suki_closure_tramp_" + std::to_string(++owner_->trampCounter_),
+                owner_->module_.get());
+            llvm::BasicBlock* savedBB = owner_->b_->GetInsertBlock();
+            {
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", tramp));
+                llvm::Value* raw = tramp->getArg(0);
+                llvm::Value* cp = owner_->b_->CreateBitCast(raw,
+                    llvm::PointerType::getUnqual(cctxTy), "cctx");
+                llvm::Value* cctx = owner_->b_->CreateLoad(i8p,
+                    owner_->b_->CreateStructGEP(cctxTy, cp, 0));
+                llvm::Value* cfn = owner_->b_->CreateLoad(i8p,
+                    owner_->b_->CreateStructGEP(cctxTy, cp, 1));
+                llvm::Value* cfut = owner_->b_->CreateLoad(i8p,
+                    owner_->b_->CreateStructGEP(cctxTy, cp, 2));
+                llvm::FunctionType* cfty = resultTy
+                    ? llvm::FunctionType::get(resultTy, { i8p }, false)
+                    : llvm::FunctionType::get(voidTy, { i8p }, false);
+                llvm::Value* fp = owner_->b_->CreatePointerCast(cfn, cfty->getPointerTo());
+                if (resultTy) {
+                    llvm::Value* v = owner_->b_->CreateCall(cfty, fp, { cctx });
+                    llvm::Value* slot = owner_->b_->CreateAlloca(resultTy, nullptr, "result");
+                    owner_->b_->CreateStore(v, slot);
+                    owner_->b_->CreateCall(owner_->declareExternalSig("suki_future_store",
+                        { i8p, i8p }, voidTy), { cfut, owner_->b_->CreateBitCast(slot, i8p) });
+                } else {
+                    owner_->b_->CreateCall(cfty, fp, { cctx });
+                }
+                owner_->b_->CreateCall(asyncFreeFn(), { raw });
+                owner_->b_->CreateRetVoid();
+                owner_->b_->SetInsertPoint(savedBB);
+            }
+
+            llvm::Value* cctxPtr = owner_->b_->CreateCall(asyncAllocFn(),
+                { llvm::ConstantInt::get(i64, (int64_t)owner_->sizeOf(cctxTy)) });
+            llvm::Value* cp = owner_->b_->CreateBitCast(cctxPtr,
+                llvm::PointerType::getUnqual(cctxTy));
+            owner_->b_->CreateStore(ctxv, owner_->b_->CreateStructGEP(cctxTy, cp, 0));
+            owner_->b_->CreateStore(fnv,  owner_->b_->CreateStructGEP(cctxTy, cp, 1));
+            owner_->b_->CreateStore(fut,  owner_->b_->CreateStructGEP(cctxTy, cp, 2));
+
+            llvm::Function* startFn = owner_->declareExternalSig("suki_closure_thread_start",
+                { i8p, i8p, i8p }, llvm::Type::getInt32Ty(*owner_->ctx_));
+            llvm::Value* st = owner_->b_->CreateCall(startFn, { tramp, cctxPtr, fut });
+            llvm::Value* failed = owner_->b_->CreateICmpNE(st,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*owner_->ctx_), 0));
+            llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*owner_->ctx_, "task.inline", cur);
+            llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*owner_->ctx_, "task.done", cur);
+            owner_->b_->CreateCondBr(failed, inlineBB, doneBB);
+            owner_->b_->SetInsertPoint(inlineBB);
+            owner_->b_->CreateCall(tramp, { cctxPtr });
+            owner_->b_->CreateCall(owner_->declareExternalSig("suki_future_finish",
+                { i8p }, voidTy), { fut });
+            owner_->b_->CreateBr(doneBB);
+            owner_->b_->SetInsertPoint(doneBB);
+            return fut;
+        }
+
+        llvm::Value* genTaskInit(CallExpr* e) {
+            Node* clNode = e->arguments.empty() ? nullptr : e->arguments[0].get();
+            if (!clNode || clNode->kind != NodeKind::ClosureExpr) return nullptr;
+            llvm::Function* cur = owner_->b_->GetInsertBlock()->getParent();
+            llvm::Value* cv = owner_->emitClosure(static_cast<ClosureExpr*>(clNode));
+            if (!cv) return nullptr;
+            llvm::Value* fut = startClosureTask(cv, cur, nullptr);
+            return makeHandleValue(handleStructTy("Task"), fut);
+        }
+
+        llvm::Value* genTaskGroupInit(const Type* elemTy) {
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            const int64_t esz = elemTy ? (int64_t)owner_->sizeOf(owner_->layout_->lower(elemTy)) : 0;
+            llvm::Function* cf = owner_->declareExternalSig("suki_taskgroup_create", { i64 }, i8p);
+            return makeHandleValue(handleStructTy("TaskGroup"),
+                owner_->b_->CreateCall(cf, { llvm::ConstantInt::get(i64, esz) }));
+        }
+
+        void genConcurrencyBuiltinMethod(const std::string& base, const std::string& mem) {
+            const std::string key = base + "." + mem;
+            if (owner_->methodFns_.count(key)) return;
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::StructType* taskSty = handleStructTy("Task");
+            llvm::StructType* grpSty = handleStructTy("TaskGroup");
+
+            if (base == "Task" && mem == "wait") {
+                llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { taskSty }, false);
+                llvm::Function* f = llvm::Function::Create(fty,
+                    llvm::GlobalValue::InternalLinkage, "Task.wait", owner_->module_.get());
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+                llvm::Value* fut = loadHandle(f->getArg(0), taskSty);
+                llvm::Value* tmp = owner_->b_->CreateAlloca(i64, nullptr, "wait.tmp");
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_future_await",
+                    { i8p, i8p }, voidTy), { fut, owner_->b_->CreateBitCast(tmp, i8p) });
+                owner_->b_->CreateRetVoid();
+                owner_->methodFns_["Task.wait"] = f;
+                return;
+            }
+            if (base == "TaskGroup" && mem == "waitForAll") {
+                llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { grpSty }, false);
+                llvm::Function* f = llvm::Function::Create(fty,
+                    llvm::GlobalValue::InternalLinkage, "TaskGroup.waitForAll",
+                    owner_->module_.get());
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+                llvm::Value* g = loadHandle(f->getArg(0), grpSty);
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_wait_all",
+                    { i8p }, voidTy), { g });
+                owner_->b_->CreateRetVoid();
+                owner_->methodFns_["TaskGroup.waitForAll"] = f;
+                return;
+            }
+            if (base == "TaskGroup" && mem == "addTask") {
+                llvm::StructType* clTy = llvm::cast<llvm::StructType>(
+                    owner_->layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
+                llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { grpSty, clTy }, false);
+                llvm::Function* f = llvm::Function::Create(fty,
+                    llvm::GlobalValue::InternalLinkage, "TaskGroup.addTask",
+                    owner_->module_.get());
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
+                llvm::Value* g = loadHandle(f->getArg(0), grpSty);
+                llvm::Value* fut = startClosureTask(f->getArg(1), f, nullptr);
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_add",
+                    { i8p, i8p }, voidTy), { g, fut });
+                owner_->b_->CreateRetVoid();
+                owner_->methodFns_["TaskGroup.addTask"] = f;
+                return;
+            }
+        }
+
+        void genSleepSpawn() {
+            if (owner_->fns_.count("sleep_spawn")) return;
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+
+            llvm::Function* sleepFn = owner_->declareExternalSig("suki_sleep", { i64 }, voidTy);
+            llvm::StructType* ctxTy = llvm::StructType::get(*owner_->ctx_, { i64, i8p }, false);
+            llvm::Function* finishFn = owner_->declareExternalSig("suki_future_finish",
+                { i8p }, voidTy);
+
+            llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
+            llvm::Function* tramp = llvm::Function::Create(trampTy,
+                llvm::GlobalValue::InternalLinkage, "sleep_tramp", owner_->module_.get());
+            {
+                llvm::BasicBlock* tb = llvm::BasicBlock::Create(*owner_->ctx_, "entry", tramp);
+                owner_->b_->SetInsertPoint(tb);
+                llvm::Value* rawCtx = tramp->getArg(0);
+                llvm::Value* cp = owner_->b_->CreateBitCast(rawCtx,
+                    llvm::PointerType::getUnqual(ctxTy), "ctx");
+                llvm::Value* msAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 0, "ms.addr");
+                llvm::Value* ms = owner_->b_->CreateLoad(i64, msAddr, "ms");
+                llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+                llvm::Value* fut = owner_->b_->CreateLoad(i8p, futAddr, "fut");
+                owner_->b_->CreateCall(sleepFn, { ms });
+                owner_->b_->CreateCall(finishFn, { fut });
+                owner_->b_->CreateCall(asyncFreeFn(), { rawCtx });
+                owner_->b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
+            }
+
+            llvm::FunctionType* sft = llvm::FunctionType::get(i8p, { i64 }, false);
+            llvm::Function* f = llvm::Function::Create(sft,
+                llvm::GlobalValue::InternalLinkage, "sleep_spawn", owner_->module_.get());
+            {
+                llvm::BasicBlock* sb = llvm::BasicBlock::Create(*owner_->ctx_, "entry", f);
+                owner_->b_->SetInsertPoint(sb);
+                llvm::Value* fut = owner_->b_->CreateCall(asyncFutureCreateFn(),
+                    { llvm::ConstantInt::get(i64, 0) });
+                llvm::Value* rawCtx = owner_->b_->CreateCall(asyncAllocFn(),
+                    { llvm::ConstantInt::get(i64, (int64_t)owner_->sizeOf(ctxTy)) });
+                llvm::Value* cp = owner_->b_->CreateBitCast(rawCtx,
+                    llvm::PointerType::getUnqual(ctxTy), "ctx");
+                llvm::Value* msAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 0, "ms.addr");
+                owner_->b_->CreateStore(f->getArg(0), msAddr);
+                llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+                owner_->b_->CreateStore(fut, futAddr);
+
+                llvm::Function* startFn = owner_->declareExternalSig("suki_thread_start",
+                    { llvm::PointerType::getUnqual(trampTy), i8p },
+                    llvm::Type::getInt32Ty(*owner_->ctx_));
+                llvm::Value* started = owner_->b_->CreateCall(startFn, { tramp, rawCtx }, "started");
+                llvm::Value* failed = owner_->b_->CreateICmpNE(started,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(*owner_->ctx_), 0));
+                llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*owner_->ctx_, "inline", f);
+                llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*owner_->ctx_, "spawned", f);
+                owner_->b_->CreateCondBr(failed, inlineBB, doneBB);
+                owner_->b_->SetInsertPoint(inlineBB);
+                owner_->b_->CreateCall(tramp, { rawCtx });
+                owner_->b_->CreateBr(doneBB);
+                owner_->b_->SetInsertPoint(doneBB);
+                owner_->b_->CreateRet(fut);
+            }
+            owner_->fns_["sleep_spawn"] = f;
+        }
+
+        void genWithTaskGroupSpawn() {
+            if (owner_->fns_.count("withTaskGroup_spawn")) return;
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::StructType* grpSty = handleStructTy("TaskGroup");
+            llvm::StructType* clTy = llvm::cast<llvm::StructType>(
+                owner_->layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
+
+            llvm::FunctionType* bodyTy = llvm::FunctionType::get(voidTy, { clTy }, false);
+            llvm::Function* body = llvm::Function::Create(bodyTy,
+                llvm::GlobalValue::InternalLinkage, "withTaskGroup", owner_->module_.get());
+            {
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", body));
+                llvm::Value* cv = body->getArg(0);
+                llvm::Value* g = owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_taskgroup_create", { i64 }, i8p),
+                    { llvm::ConstantInt::get(i64, 0) });
+                llvm::Value* gv = makeHandleValue(grpSty, g);
+                llvm::Value* ctxv = owner_->b_->CreateExtractValue(cv, {0}, "body.ctx");
+                llvm::Value* fnv = owner_->b_->CreateExtractValue(cv, {1}, "body.fn");
+                llvm::FunctionType* cfty = llvm::FunctionType::get(voidTy, { i8p, grpSty }, false);
+                llvm::Value* fp = owner_->b_->CreatePointerCast(fnv, cfty->getPointerTo());
+                owner_->b_->CreateCall(cfty, fp, { ctxv, gv });
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_wait_all",
+                    { i8p }, voidTy), { g });
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_free",
+                    { i8p }, voidTy), { g });
+                owner_->b_->CreateRetVoid();
+            }
+            owner_->fns_["withTaskGroup"] = body;
+
+            llvm::StructType* ctxTy = llvm::StructType::get(*owner_->ctx_, { clTy, i8p }, false);
+            llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
+            llvm::Function* tramp = llvm::Function::Create(trampTy,
+                llvm::GlobalValue::InternalLinkage, "withTaskGroup_tramp", owner_->module_.get());
+            {
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", tramp));
+                llvm::Value* raw = tramp->getArg(0);
+                llvm::Value* cp = owner_->b_->CreateBitCast(raw,
+                    llvm::PointerType::getUnqual(ctxTy), "ctx");
+                llvm::Value* cvAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 0, "cl.addr");
+                llvm::Value* cv = owner_->b_->CreateLoad(clTy, cvAddr);
+                llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+                llvm::Value* fut = owner_->b_->CreateLoad(i8p, futAddr, "fut");
+                owner_->b_->CreateCall(body, { cv });
+                owner_->b_->CreateCall(owner_->declareExternalSig("suki_future_finish",
+                    { i8p }, voidTy), { fut });
+                owner_->b_->CreateCall(asyncFreeFn(), { raw });
+                owner_->b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
+            }
+
+            llvm::FunctionType* sft = llvm::FunctionType::get(i8p, { clTy }, false);
+            llvm::Function* sp = llvm::Function::Create(sft,
+                llvm::GlobalValue::InternalLinkage, "withTaskGroup_spawn", owner_->module_.get());
+            {
+                owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", sp));
+                llvm::Value* fut = owner_->b_->CreateCall(asyncFutureCreateFn(),
+                    { llvm::ConstantInt::get(i64, 0) });
+                llvm::Value* raw = owner_->b_->CreateCall(asyncAllocFn(),
+                    { llvm::ConstantInt::get(i64, (int64_t)owner_->sizeOf(ctxTy)) });
+                llvm::Value* cp = owner_->b_->CreateBitCast(raw,
+                    llvm::PointerType::getUnqual(ctxTy), "ctx");
+                llvm::Value* cvAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 0, "cl.addr");
+                owner_->b_->CreateStore(sp->getArg(0), cvAddr);
+                llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
+                owner_->b_->CreateStore(fut, futAddr);
+                llvm::Function* startFn = owner_->declareExternalSig("suki_thread_start",
+                    { llvm::PointerType::getUnqual(trampTy), i8p },
+                    llvm::Type::getInt32Ty(*owner_->ctx_));
+                llvm::Value* st = owner_->b_->CreateCall(startFn, { tramp, raw }, "started");
+                llvm::Value* failed = owner_->b_->CreateICmpNE(st,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(*owner_->ctx_), 0));
+                llvm::BasicBlock* ib = llvm::BasicBlock::Create(*owner_->ctx_, "inline", sp);
+                llvm::BasicBlock* db = llvm::BasicBlock::Create(*owner_->ctx_, "spawned", sp);
+                owner_->b_->CreateCondBr(failed, ib, db);
+                owner_->b_->SetInsertPoint(ib);
+                owner_->b_->CreateCall(tramp, { raw });
+                owner_->b_->CreateBr(db);
+                owner_->b_->SetInsertPoint(db);
+                owner_->b_->CreateRet(fut);
+            }
+            owner_->fns_["withTaskGroup_spawn"] = sp;
+        }
+    };
+
+    // ── ARC 处理组件 ───────────────────────────────────────────────────────────
+    // 引用计数遵循分析器保证的所有权规则：新建对象已持有一份引用（计数为 1），
+    // 因此「共享」已有引用要 retain，「覆写」某位置要释放它此前持有的值。所有
+    // 运行时入口内部使用 acquire/release 序，绝不使用 relaxed。
+    class ARCPass {
+    public:
+        explicit ARCPass(Impl* o) : owner_(o) {}
+        Impl* owner_;
+
+        llvm::Function* arcRetain() {
+            llvm::Type* p = llvm::PointerType::get(*owner_->ctx_, 0);
+            return owner_->declareExternalSig("suki_arc_retain", { p },
+                                              llvm::Type::getInt64Ty(*owner_->ctx_));
+        }
+        llvm::Function* arcRelease() {
+            llvm::Type* p = llvm::PointerType::get(*owner_->ctx_, 0);
+            return owner_->declareExternalSig("suki_arc_release", { p },
+                                              llvm::Type::getInt64Ty(*owner_->ctx_));
+        }
+        // 只对受管引用 retain/release；其余类型一律 no-op，调用方可放心传任意值。
+        void arcRetainIfRef(llvm::Value* v, const Type* t) {
+            if (!v || !t || !owner_->layout_->isReferenceType(t)) return;
+            owner_->b_->CreateCall(arcRetain(), { v });
+        }
+        void arcReleaseIfRef(llvm::Value* v, const Type* t) {
+            if (!v || !t || !owner_->layout_->isReferenceType(t)) return;
+            owner_->b_->CreateCall(arcRelease(), { v });
+        }
+    };
+
+    // ── 异常 lowering 组件 ───────────────────────────────────────────────────────
+    // 错误模型：调用约定追加一个 `i8**` 错误槽；throw 把错误写入堆单元格并跳转到
+    // 最近 catch 分发器或返回传播；do/catch 用独立分发块按声明顺序匹配各子句。
+    class ExceptionLowerer {
+    public:
+        explicit ExceptionLowerer(Impl* o) : owner_(o) {}
+        Impl* owner_;
+
+        // 抛出调用应写入的错误槽。
+        llvm::Value* errorSlotForCall() {
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            if (owner_->optionalTrySlot_) return owner_->optionalTrySlot_;
+            if (owner_->currentErrorSlot_) return owner_->currentErrorSlot_;
+            llvm::Value* tmp = owner_->b_->CreateAlloca(i8p, nullptr, "err.tmp");
+            owner_->b_->CreateStore(llvm::ConstantPointerNull::get(i8p), tmp);
+            return tmp;
+        }
+
+        // 抛出调用之后：跳转到就近 handler，或在错误传播时返回。
+        void finishThrowingCall(llvm::Value* slot) {
+            if (!slot) return;
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            if (owner_->optionalTrySlot_) return;
+            llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+            llvm::Value* err = owner_->b_->CreateLoad(i8p, slot, "err");
+            llvm::Value* has = owner_->b_->CreateIsNotNull(err, "hasError");
+            llvm::BasicBlock* land = llvm::BasicBlock::Create(*owner_->ctx_, "try.fail", f);
+            llvm::BasicBlock* cont = llvm::BasicBlock::Create(*owner_->ctx_, "try.cont", f);
+            owner_->b_->CreateCondBr(has, land, cont);
+            owner_->b_->SetInsertPoint(land);
+            if (!owner_->catchTargets_.empty()) {
+                owner_->b_->CreateBr(owner_->catchTargets_.back());
+            } else {
+                if (owner_->currentErrorSlot_) owner_->b_->CreateStore(err, owner_->currentErrorSlot_);
+                if (owner_->currentRet_ && !owner_->currentRet_->isVoidTy())
+                    owner_->b_->CreateRet(llvm::Constant::getNullValue(owner_->currentRet_));
+                else
+                    owner_->b_->CreateRetVoid();
+            }
+            owner_->b_->SetInsertPoint(cont);
+        }
+
+        // `throw e`：构造错误单元、记录并离开函数（或跳到就近 catch）。
+        llvm::Value* genThrow(ThrowStmt* t) {
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Value* v = t->value ? owner_->genExpr(t->value.get()) : nullptr;
+            llvm::Function* alloc = owner_->declareExternalSig("suki_alloc", { i64 }, i8p);
+            llvm::Value* cell = owner_->b_->CreateCall(alloc, { llvm::ConstantInt::get(i64, 24) });
+            llvm::Value* typed = owner_->b_->CreatePointerCast(cell, owner_->errorTy()->getPointerTo());
+            const std::string typeName =
+                (t->value && t->value->semaType && t->value->semaType->record)
+                    ? t->value->semaType->record->name
+                    : std::string("Error");
+            owner_->b_->CreateStore(owner_->b_->CreateGlobalStringPtr(typeName),
+                                    owner_->b_->CreateStructGEP(owner_->errorTy(), typed, 0));
+            llvm::Value* tag = llvm::ConstantInt::get(i64, 0);
+            llvm::Value* payload = llvm::ConstantPointerNull::get(i8p);
+            if (v && owner_->isTaggedUnion(v->getType())) {
+                tag = owner_->b_->CreateExtractValue(v, {0});
+                payload = owner_->b_->CreateExtractValue(v, {1});
+            } else if (v && v->getType()->isIntegerTy(64)) {
+                tag = v;
+            }
+            owner_->b_->CreateStore(tag, owner_->b_->CreateStructGEP(owner_->errorTy(), typed, 1));
+            owner_->b_->CreateStore(payload, owner_->b_->CreateStructGEP(owner_->errorTy(), typed, 2));
+            llvm::Value* err = owner_->b_->CreatePointerCast(typed, i8p);
+            if (!owner_->catchTargets_.empty()) {
+                owner_->b_->CreateStore(err, owner_->currentErrorSlot_);
+                owner_->b_->CreateBr(owner_->catchTargets_.back());
+            } else if (owner_->currentErrorSlot_) {
+                owner_->b_->CreateStore(err, owner_->currentErrorSlot_);
+                if (owner_->currentRet_ && !owner_->currentRet_->isVoidTy())
+                    owner_->b_->CreateRet(llvm::Constant::getNullValue(owner_->currentRet_));
+                else
+                    owner_->b_->CreateRetVoid();
+            } else {
+                owner_->b_->CreateCall(owner_->declareExternalSig("panic", { i8p }),
+                                       { owner_->b_->CreateGlobalStringPtr(
+                                           "error thrown from a non-throwing context") });
+                if (owner_->currentRet_ && !owner_->currentRet_->isVoidTy())
+                    owner_->b_->CreateRet(llvm::Constant::getNullValue(owner_->currentRet_));
+                else
+                    owner_->b_->CreateRetVoid();
+            }
+            return nullptr;
+        }
+
+        // `do { … } catch { … }`：body 运行于全新错误槽；任何错误分支到分发器，
+        // 分发器按声明顺序遍历 catch 子句。
+        void genDoStmt(DoStmt* d) {
+            llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+            llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+            llvm::Value* slot = owner_->b_->CreateAlloca(i8p, nullptr, "err.slot");
+            owner_->b_->CreateStore(llvm::ConstantPointerNull::get(i8p), slot);
+            llvm::BasicBlock* dispatch = llvm::BasicBlock::Create(*owner_->ctx_, "catch.dispatch", f);
+            llvm::BasicBlock* done = llvm::BasicBlock::Create(*owner_->ctx_, "do.cont", f);
+            llvm::Value* savedSlot = owner_->currentErrorSlot_;
+            owner_->currentErrorSlot_ = slot;
+            owner_->catchTargets_.push_back(dispatch);
+            for (auto& st : d->body) owner_->genStmt(st.get());
+            owner_->catchTargets_.pop_back();
+            owner_->currentErrorSlot_ = savedSlot;
+            if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(done);
+            owner_->b_->SetInsertPoint(dispatch);
+            llvm::Value* err = owner_->b_->CreateLoad(i8p, slot, "err");
+            for (auto& c : d->catches) {
+                auto* cc = static_cast<CatchClause*>(c.get());
+                llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*owner_->ctx_, "catch.body", f);
+                llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(*owner_->ctx_, "catch.next", f);
+                bool unconditional = true;
+                if (cc->pattern && cc->pattern->kind == NodeKind::VarDecl) {
+                    auto* vd = static_cast<VarDecl*>(cc->pattern.get());
+                    std::string want = owner_->typeReprName(vd->type.get());
+                    if (!want.empty()) {
+                        llvm::Value* typed = owner_->b_->CreatePointerCast(err, owner_->errorTy()->getPointerTo());
+                        llvm::Value* tn = owner_->b_->CreateLoad(
+                            i8p, owner_->b_->CreateStructGEP(owner_->errorTy(), typed, 0), "err.type");
+                        llvm::Function* cmp = owner_->declareExternalSig(
+                            "strcmp", { i8p, i8p }, llvm::Type::getInt32Ty(*owner_->ctx_));
+                        llvm::Value* eq = owner_->b_->CreateICmpEQ(
+                            owner_->b_->CreateCall(cmp, { tn, owner_->b_->CreateGlobalStringPtr(want) }),
+                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*owner_->ctx_), 0));
+                        owner_->b_->CreateCondBr(eq, bodyBB, nextBB);
+                        unconditional = false;
+                    }
+                }
+                if (unconditional) owner_->b_->CreateBr(bodyBB);
+                owner_->b_->SetInsertPoint(bodyBB);
+                if (cc->pattern && cc->pattern->kind == NodeKind::VarDecl) {
+                    auto* vd = static_cast<VarDecl*>(cc->pattern.get());
+                    if (!vd->name.empty()) {
+                        llvm::Value* bs = owner_->b_->CreateAlloca(i8p, nullptr, vd->name);
+                        owner_->b_->CreateStore(err, bs);
+                        owner_->locals_[vd->name] = bs;
+                    }
+                }
+                if (cc->whereExpr) owner_->genExpr(cc->whereExpr.get());
+                for (auto& st : cc->body) owner_->genStmt(st.get());
+                if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(done);
+                owner_->b_->SetInsertPoint(nextBB);
+            }
+            if (owner_->currentErrorSlot_) owner_->b_->CreateStore(err, owner_->currentErrorSlot_);
+            owner_->b_->CreateBr(done);
+            owner_->b_->SetInsertPoint(done);
+        }
+    };
+
+    // ── 类型注册组件 ───────────────────────────────────────────────────────────
+    // 负责把 Suki 的类型体系落到 LLVM：名字→基础类型、声明/登记函数、对外签名、
+    // 语义类型下沉、声明类型下沉、以及强制转换。类型缓存（kindCache_/typeCache_）
+    // 仍驻留 Impl，组件经 owner_-> 访问，避免跨组件状态归属混乱。
+    class TypeRegistry {
+    public:
+        explicit TypeRegistry(Impl* o) : owner_(o) {}
+        Impl* owner_;
+
+        llvm::Type* lowerSema(const Type* t) {
+            if (!t || !owner_->layout_) return nullptr;
+            return owner_->layout_->lower(t);
+        }
+        // Conservative gate: only scalars take the semaType route for now.
+        bool semaIsScalar(const Type* t) {
+            return t && owner_->layout_ && !owner_->layout_->isAggregate(t) &&
+                   !owner_->layout_->isReferenceType(t);
+        }
+        llvm::Type* tyByName(const std::string& n) {
+            auto& C = *owner_->ctx_;
+            if (n.empty() || n == "Void") return llvm::Type::getVoidTy(C);
+            if (n == "Bool") return llvm::Type::getInt1Ty(C);
+            if (n == "Int8" || n == "UInt8") return llvm::Type::getInt8Ty(C);
+            if (n == "Int16" || n == "UInt16") return llvm::Type::getInt16Ty(C);
+            if (n == "Int32" || n == "UInt32") return llvm::Type::getInt32Ty(C);
+            if (n == "Int64" || n == "UInt64" || n == "Int" || n == "UInt" ||
+                n == "ISize" || n == "USize")
+                return llvm::Type::getInt64Ty(C);
+            if (n == "Float" || n == "Float32") return llvm::Type::getFloatTy(C);
+            if (n == "Double" || n == "Float64") return llvm::Type::getDoubleTy(C);
+            // String/Char are i8* in the default address space (0).
+            if (n == "String" || n == "Char") return llvm::PointerType::get(C, 0);
+            return llvm::Type::getInt64Ty(C);
+        }
+
+        // Declare (or reuse) the LLVM function for a Suki FunctionDecl under a
+        // specific symbol name. Shared by `declare()` and the monomorphiser.
+        llvm::Function* declareAs(FunctionDecl* fn, const std::string& symName) {
+            auto it = owner_->fns_.find(symName);
+            if (it != owner_->fns_.end()) return it->second;
+            bool isMain = (symName == "main") || hasAttr(fn, "main");
+            // `main` is the C entry point: it cannot carry the hidden error slot.
+            const bool throws = fn->isThrows && !isMain;
+            std::vector<llvm::Type*> params;
+            if (!isMain)
+                for (auto& p : fn->params)
+                    params.push_back(lowerDeclType(p.semaType, p.type.get()));
+            if (throws) params.push_back(llvm::PointerType::get(*owner_->ctx_, 0));
+            // Opaque return types (spec 5.5): only when the return type is
+            // `some P` do we prefer the Sema-inferred concrete type; generics
+            // keep using fn->returnType->semaType to avoid signature mismatch.
+            const Type* rt =
+                (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
+                 static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
+                 fn->semaType && fn->semaType->kind == TypeKind::Function && fn->semaType->ret)
+                    ? fn->semaType->ret
+                    : (fn->returnType ? fn->returnType->semaType : nullptr);
+            llvm::Type* ret = isMain
+                ? llvm::Type::getInt32Ty(*owner_->ctx_)
+                : (rt ? lowerDeclType(rt, fn->returnType.get())
+                       : llvm::Type::getVoidTy(*owner_->ctx_));
+            owner_->fnThrows_[symName] = throws;
+            llvm::Function* f = llvm::Function::Create(
+                llvm::FunctionType::get(ret, params, false),
+                llvm::GlobalValue::ExternalLinkage, symName,
+                owner_->module_.get());
+            // @_cdecl("name"): foreign functions use the given C symbol name.
+            if (fn->isForeign && !fn->cdeclName.empty()) f->setName(fn->cdeclName);
+            owner_->fns_[symName] = f;
+            owner_->fnDecls_[fn->name] = fn;
+            owner_->pendingBodies_.emplace_back(fn, symName);
+            owner_->isMainFns_[symName] = isMain;
+            return f;
+        }
+
+        llvm::Function* declare(FunctionDecl* fn) {
+            return declareAs(fn, fn->name);
+        }
+
+        // Declare (or reuse) an external function with an explicit signature.
+        llvm::Function* declareExternalSig(const std::string& name,
+                                           const std::vector<llvm::Type*>& params,
+                                           llvm::Type* ret = nullptr) {
+            auto it = owner_->fns_.find(name);
+            if (it != owner_->fns_.end()) return it->second;
+            llvm::Function* f = llvm::Function::Create(
+                llvm::FunctionType::get(
+                    ret ? ret : llvm::Type::getVoidTy(*owner_->ctx_),
+                    params, false),
+                llvm::GlobalValue::ExternalLinkage, name,
+                owner_->module_.get());
+            owner_->fns_[name] = f;
+            return f;
+        }
+
+        // Lower a type for a declaration position: prefer the Sema-annotated
+        // type, fall back to the syntactic name when Sema did not annotate.
+        llvm::Type* lowerDeclType(const Type* sema, Node* typeRepr) {
+            if (sema) return owner_->layout_->lower(sema);
+            return tyByName(typeReprName(typeRepr));
+        }
+
+        // Explicit numeric/string conversion (`Int(x)`, `Double(n)`,
+        // `Char("A")`). Unlike the implicit `coerce`, a cast to a narrower
+        // integer truncates and a cast to `String` goes through the runtime.
+        llvm::Value* coerceForCast(llvm::Value* v, llvm::Type* target,
+                                   const Type* to) {
+            if (!v || !target) return v;
+            llvm::Type* from = v->getType();
+            if (from == target) return v;
+            if (target->isIntegerTy() && from->isIntegerTy()) {
+                unsigned fb = from->getIntegerBitWidth(),
+                         tb = target->getIntegerBitWidth();
+                // Char is a Unicode scalar (i32) and must not be sign-extended
+                // through a signed 8/16-bit detour; widen from the source.
+                return fb < tb ? owner_->b_->CreateZExt(v, target)
+                               : owner_->b_->CreateTrunc(v, target);
+            }
+            if (target->isFloatingPointTy() && from->isIntegerTy())
+                return owner_->b_->CreateSIToFP(v, target);
+            if (target->isIntegerTy() && from->isFloatingPointTy())
+                return owner_->b_->CreateFPToSI(v, target);
+            // `Int("42")` / `Double("1.5")`: parse the String through runtime.
+            if ((target->isIntegerTy() || target->isFloatingPointTy()) &&
+                from->isStructTy()) {
+                llvm::Type* sty = owner_->layout_->stringTy();
+                if (from == sty) {
+                    bool wantFloat = target->isFloatingPointTy();
+                    llvm::Function* f = declareExternalSig(
+                        wantFloat ? "suki_str_to_double" : "suki_str_to_int",
+                        { sty },
+                        wantFloat ? llvm::Type::getDoubleTy(*owner_->ctx_)
+                                  : llvm::Type::getInt64Ty(*owner_->ctx_));
+                    llvm::Value* r = owner_->b_->CreateCall(f, { v });
+                    return coerce(r, target);
+                }
+            }
+            // `String(x)` from a scalar: format through the runtime.
+            if (target->isStructTy() && from->isIntegerTy()) {
+                bool fromChar = from->getIntegerBitWidth() == 32;
+                llvm::Function* f = declareExternalSig(
+                    fromChar ? "suki_char_to_string" : "suki_int_to_string",
+                    { llvm::Type::getInt64Ty(*owner_->ctx_) },
+                    owner_->layout_->stringTy());
+                return owner_->b_->CreateCall(
+                    f, { coerce(v, llvm::Type::getInt64Ty(*owner_->ctx_)) });
+            }
+            return coerce(v, target);
+        }
+
+        // Implicit value coercion (widening, int<->float, and boxing into a
+        // pointer-typed slot).
+        llvm::Value* coerce(llvm::Value* v, llvm::Type* to) {
+            if (!v || !to) return v;
+            llvm::Type* from = v->getType();
+            if (from == to) return v;
+            if (to->isIntegerTy() && from->isIntegerTy()) {
+                unsigned fb = from->getIntegerBitWidth(),
+                         tb = to->getIntegerBitWidth();
+                if (fb < tb) return owner_->b_->CreateSExt(v, to);
+                if (fb > tb) return owner_->b_->CreateTrunc(v, to);
+                return v;
+            }
+            if (to->isFloatingPointTy() && from->isIntegerTy())
+                return owner_->b_->CreateSIToFP(v, to);
+            if (to->isIntegerTy() && from->isFloatingPointTy())
+                return owner_->b_->CreateFPToSI(v, to);
+            if (to->isFloatingPointTy() && from->isFloatingPointTy())
+                return owner_->b_->CreateFPExt(v, to);
+            // Boxing: a value landing in a pointer slot is copied to the heap
+            // and its address is returned (Optional payload for aggregates).
+            if (to->isPointerTy() && !from->isPointerTy()) {
+                llvm::Value* slot = owner_->b_->CreateAlloca(from, nullptr, "box");
+                owner_->b_->CreateStore(v, slot);
+                return owner_->b_->CreatePointerCast(slot, to);
+            }
+            return v;
+        }
+    };
+
+    // 表达式/声明编排组件：genStmt / genExpr / genVarDecl 的承载。
+    class ExprGen {
+    public:
+        explicit ExprGen(Impl* o) : owner_(o) {}
+        Impl* owner_;
+
+        // 变量声明（含元组解构）的生成。
+        void genVarDecl(VarDecl* vd) {
+            // 元组解构 `let (a, b) = (1, 2)`：为每个名字建槽，逐分量 extract。
+            if (!vd->tupleNames.empty()) {
+                llvm::Value* init = vd->initializer ? owner_->genExpr(vd->initializer.get())
+                                                    : nullptr;
+                llvm::Type* ity = init ? init->getType()
+                                       : llvm::Type::getInt64Ty(*owner_->ctx_);
+                auto* ist = llvm::dyn_cast<llvm::StructType>(ity);
+                if (!ist) return;
+                for (size_t i = 0; i < vd->tupleNames.size(); ++i) {
+                    unsigned idx = static_cast<unsigned>(i);
+                    if (idx >= ist->getNumElements()) break;
+                    llvm::Type* et = ist->getElementType(idx);
+                    llvm::Value* slot =
+                        owner_->b_->CreateAlloca(et, nullptr, vd->tupleNames[i]);
+                    owner_->b_->CreateStore(
+                        owner_->b_->CreateExtractValue(init, {idx}), slot);
+                    owner_->locals_[vd->tupleNames[i]] = slot;
+                }
+                return;
+            }
+            llvm::Value* init = vd->initializer ? owner_->genExpr(vd->initializer.get())
+                                                : nullptr;
+            // Prefer the analyser-resolved type; fall back to syntactic inference.
+            llvm::Type* ty = nullptr;
+            const Type* st = vd->semaType;
+            // The analyser-resolved type is authoritative for every type.
+            if (st && owner_->layout_) ty = owner_->layout_->lower(st);
+            if (!ty) {
+                std::string tname = typeReprName(vd->type.get());
+                ty = tname.empty()
+                         ? (init ? init->getType()
+                                 : llvm::Type::getInt64Ty(*owner_->ctx_))
+                         : owner_->tyByName(tname);
+            }
+            if (init) init = owner_->coerce(init, ty);
+            // A freshly constructed object already starts at count 1, so it must
+            // not be retained again; binding an existing reference must.
+            bool needsRetain = false;
+            if (init && vd->semaType &&
+                owner_->layout_->isReferenceType(vd->semaType) && vd->initializer) {
+                Node* src = vd->initializer.get();
+                bool isConstruction = false;
+                if (src->kind == NodeKind::CallExpr) {
+                    auto* ce = static_cast<CallExpr*>(src);
+                    if (ce->callee && ce->callee->kind == NodeKind::IdentExpr)
+                        isConstruction =
+                            owner_->classTypes_.count(
+                                static_cast<IdentExpr*>(ce->callee.get())->name) > 0;
+                }
+                needsRetain = !isConstruction;
+            }
+            if (needsRetain) owner_->arcRetainIfRef(init, vd->semaType);
+            llvm::Value* slot = owner_->b_->CreateAlloca(ty, nullptr, vd->name);
+            if (init) owner_->b_->CreateStore(init, slot);
+            owner_->locals_[vd->name] = slot;
+            // A strong reference held by this local must be given back at scope exit.
+            owner_->trackScopedRef(vd->name, vd->semaType);
+        }
+
+        // 语句编排：分发到各语句节点的代码生成路径。
+        void genStmt(Node* s) {
+            if (!s) return;
+            switch (s->kind) {
+                case NodeKind::VarDecl: owner_->genVarDecl(static_cast<VarDecl*>(s)); break;
+                case NodeKind::BlockStmt: {
+                    // A nested block ends the lifetime of anything it declared.
+                    owner_->scopeMarks_.push_back(owner_->scopeRefs_.size());
+                    for (auto& st : static_cast<BlockStmt*>(s)->statements)
+                        owner_->genStmt(st.get());
+                    owner_->scopeMarks_.push_back(owner_->scopeRefs_.size());
+                    owner_->releaseScopeTo(owner_->scopeMarks_.back());
+                    owner_->scopeMarks_.pop_back();
+                    owner_->scopeMarks_.pop_back();
+                    break;
+                }
+                    break;
+                case NodeKind::UnsafeStmt: {
+                    // `unsafe` 仅影响语义检查（规范 8.6），codegen 直接生成块内语句。
+                    auto* us = static_cast<UnsafeStmt*>(s);
+                    for (auto& st : us->body) owner_->genStmt(st.get());
+                    break;
+                }
+                case NodeKind::ExprStmt: owner_->genExpr(static_cast<ExprStmt*>(s)->expr.get()); break;
+                case NodeKind::ThrowStmt: owner_->genThrow(static_cast<ThrowStmt*>(s)); return;
+                case NodeKind::DoStmt: owner_->genDoStmt(static_cast<DoStmt*>(s)); return;
+                case NodeKind::BreakStmt: {
+                    // `break` leaves the innermost enclosing loop or switch.
+                    if (!owner_->breakTargets_.empty())
+                        owner_->b_->CreateBr(owner_->breakTargets_.back());
+                    return;
+                }
+                case NodeKind::ContinueStmt: {
+                    // `continue` jumps to the innermost loop's step block.
+                    if (!owner_->continueTargets_.empty())
+                        owner_->b_->CreateBr(owner_->continueTargets_.back());
+                    return;
+                }
+                case NodeKind::RepeatWhileStmt: {
+                    // `repeat { … } while cond` — the body always runs at least once.
+                    auto* rw = static_cast<RepeatWhileStmt*>(s);
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*owner_->ctx_, "repeat.body", f);
+                    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(*owner_->ctx_, "repeat.cond", f);
+                    llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(*owner_->ctx_, "repeat.exit", f);
+                    owner_->b_->CreateBr(bodyBB);
+                    owner_->b_->SetInsertPoint(bodyBB);
+                    owner_->breakTargets_.push_back(exitBB);
+                    owner_->continueTargets_.push_back(condBB);
+                    for (auto& st : rw->body) owner_->genStmt(st.get());
+                    owner_->breakTargets_.pop_back();
+                    owner_->continueTargets_.pop_back();
+                    if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(condBB);
+                    owner_->b_->SetInsertPoint(condBB);
+                    llvm::Value* c = rw->condition ? owner_->genExpr(rw->condition.get()) : nullptr;
+                    if (!c) { owner_->b_->CreateBr(exitBB); owner_->b_->SetInsertPoint(exitBB); return; }
+                    c = owner_->coerce(c, llvm::Type::getInt1Ty(*owner_->ctx_));
+                    owner_->b_->CreateCondBr(c, bodyBB, exitBB);
+                    owner_->b_->SetInsertPoint(exitBB);
+                    return;
+                }
+                case NodeKind::ReturnStmt: {
+                    auto* r = static_cast<ReturnStmt*>(s);
+                    llvm::Value* v = r->value ? owner_->genExpr(r->value.get()) : nullptr;
+                    if (v && !owner_->currentRet_->isVoidTy()) v = owner_->coerce(v, owner_->currentRet_);
+                    // Scoped references die here; the returned value keeps its own ref.
+                    owner_->releaseScopeTo(owner_->currentScopeMark_);
+                    if (owner_->currentRet_ && owner_->currentRet_->isVoidTy()) { owner_->b_->CreateRetVoid(); return; }
+                    if (!v) v = llvm::Constant::getNullValue(owner_->currentRet_);
+                    owner_->b_->CreateRet(v);
+                    return;
+                }
+                case NodeKind::IfStmt: {
+                    auto* ifs = static_cast<IfStmt*>(s);
+                    // `if let x = opt { … }`: the condition is a binding.
+                    VarDecl* binding = ifs->condition &&
+                                       ifs->condition->kind == NodeKind::VarDecl
+                                           ? static_cast<VarDecl*>(ifs->condition.get())
+                                           : nullptr;
+                    llvm::Value* payload = nullptr;
+                    llvm::Value* c = binding ? owner_->genOptionalBinding(binding, payload)
+                                             : (ifs->condition ? owner_->genExpr(ifs->condition.get())
+                                                               : nullptr);
+                    if (!c) return;
+                    c = owner_->coerce(c, llvm::Type::getInt1Ty(*owner_->ctx_));
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    auto* tBB = llvm::BasicBlock::Create(*owner_->ctx_, "then", f);
+                    auto* eBB = llvm::BasicBlock::Create(*owner_->ctx_, "else", f);
+                    auto* mBB = llvm::BasicBlock::Create(*owner_->ctx_, "ifcont", f);
+                    owner_->b_->CreateCondBr(c, tBB, eBB);
+                    owner_->b_->SetInsertPoint(tBB);
+                    if (binding) owner_->bindOptionalPayload(binding, payload);
+                    for (auto& st : ifs->thenBody) owner_->genStmt(st.get());
+                    if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(mBB);
+                    owner_->b_->SetInsertPoint(eBB);
+                    if (ifs->elseBranch) owner_->genStmt(ifs->elseBranch.get());
+                    if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(mBB);
+                    owner_->b_->SetInsertPoint(mBB);
+                    return;
+                }
+                case NodeKind::GuardStmt: {
+                    // `guard cond else { … }` — the else branch must transfer control.
+                    auto* g = static_cast<GuardStmt*>(s);
+                    VarDecl* binding = g->condition &&
+                                       g->condition->kind == NodeKind::VarDecl
+                                           ? static_cast<VarDecl*>(g->condition.get())
+                                           : nullptr;
+                    llvm::Value* payload = nullptr;
+                    llvm::Value* c = binding ? owner_->genOptionalBinding(binding, payload)
+                                             : (g->condition ? owner_->genExpr(g->condition.get())
+                                                             : nullptr);
+                    if (!c) return;
+                    c = owner_->coerce(c, llvm::Type::getInt1Ty(*owner_->ctx_));
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    auto* fBB = llvm::BasicBlock::Create(*owner_->ctx_, "guard.cont", f);
+                    auto* eBB = llvm::BasicBlock::Create(*owner_->ctx_, "guard.else", f);
+                    owner_->b_->CreateCondBr(c, fBB, eBB);
+                    owner_->b_->SetInsertPoint(eBB);
+                    for (auto& st : g->elseBody) owner_->genStmt(st.get());
+                    if (!owner_->b_->GetInsertBlock()->getTerminator()) {
+                        owner_->b_->CreateUnreachable();
+                    }
+                    owner_->b_->SetInsertPoint(fBB);
+                    if (binding) owner_->bindOptionalPayload(binding, payload);
+                    return;
+                }
+                case NodeKind::WhileStmt: {
+                    auto* w = static_cast<WhileStmt*>(s);
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    auto* cBB = llvm::BasicBlock::Create(*owner_->ctx_, "while.cond", f);
+                    auto* bBB = llvm::BasicBlock::Create(*owner_->ctx_, "while.body", f);
+                    auto* xBB = llvm::BasicBlock::Create(*owner_->ctx_, "while.exit", f);
+                    owner_->b_->CreateBr(cBB);
+                    owner_->b_->SetInsertPoint(cBB);
+                    llvm::Value* c = w->condition ? owner_->genExpr(w->condition.get()) : nullptr;
+                    if (!c) { owner_->b_->CreateBr(xBB); owner_->b_->SetInsertPoint(xBB); return; }
+                    c = owner_->coerce(c, llvm::Type::getInt1Ty(*owner_->ctx_));
+                    owner_->b_->CreateCondBr(c, bBB, xBB);
+                    owner_->b_->SetInsertPoint(bBB);
+                    owner_->breakTargets_.push_back(xBB);
+                    owner_->continueTargets_.push_back(cBB);
+                    for (auto& st : w->body) owner_->genStmt(st.get());
+                    owner_->breakTargets_.pop_back();
+                    owner_->continueTargets_.pop_back();
+                    if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(cBB);
+                    owner_->b_->SetInsertPoint(xBB);
+                    return;
+                }
+                case NodeKind::ForInStmt: {
+                    auto* fr = static_cast<ForInStmt*>(s);
+                    if (fr->isAsync) { owner_->conc_.genForAwait(fr); return; }
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                    llvm::Value* seqSlot = nullptr;
+                    llvm::Type* seqTy = nullptr;
+                    llvm::Value* lo = nullptr;
+                    llvm::Value* hi = nullptr;
+                    bool halfOpen = true;
+                    if (fr->sequence && fr->sequence->kind == NodeKind::RangeExpr) {
+                        auto* r = static_cast<RangeExpr*>(fr->sequence.get());
+                        halfOpen = r->halfOpen;
+                        lo = owner_->genExpr(r->lower.get());
+                        hi = owner_->genExpr(r->upper.get());
+                        if (lo) lo = owner_->coerce(lo, i64);
+                        if (hi) hi = owner_->coerce(hi, i64);
+                    } else {
+                        llvm::Value* seq = fr->sequence ? owner_->genExpr(fr->sequence.get()) : nullptr;
+                        if (!seq) return;
+                        seqTy = seq->getType();
+                        seqSlot = owner_->b_->CreateAlloca(seqTy, nullptr, "for.seq");
+                        owner_->b_->CreateStore(seq, seqSlot);
+                    }
+                    VarDecl* pat = fr->pattern && fr->pattern->kind == NodeKind::VarDecl
+                                       ? static_cast<VarDecl*>(fr->pattern.get())
+                                       : nullptr;
+                    std::vector<std::string> names;
+                    if (pat) {
+                        if (!pat->tupleNames.empty()) names = pat->tupleNames;
+                        else if (!pat->name.empty()) names.push_back(pat->name);
+                    } else if (fr->pattern && fr->pattern->kind == NodeKind::TupleExpr) {
+                        for (auto& el : static_cast<TupleExpr*>(fr->pattern.get())->elements) {
+                            if (!el) { names.emplace_back(); continue; }
+                            if (el->kind == NodeKind::IdentExpr)
+                                names.push_back(static_cast<IdentExpr*>(el.get())->name);
+                            else if (el->kind == NodeKind::VarDecl)
+                                names.push_back(static_cast<VarDecl*>(el.get())->name);
+                            else names.emplace_back();
+                        }
+                    }
+                    llvm::BasicBlock* headBB = llvm::BasicBlock::Create(*owner_->ctx_, "for.head", f);
+                    llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*owner_->ctx_, "for.body", f);
+                    llvm::BasicBlock* stepBB = llvm::BasicBlock::Create(*owner_->ctx_, "for.step", f);
+                    llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(*owner_->ctx_, "for.exit", f);
+                    llvm::Value* idx = owner_->b_->CreateAlloca(i64, nullptr, "for.i");
+                    owner_->b_->CreateStore(lo ? lo : llvm::ConstantInt::get(i64, 0), idx);
+                    owner_->b_->CreateBr(headBB);
+                    llvm::Type* elemTy = i64;
+                    llvm::Type* keyTy = i64;
+                    llvm::Type* valTy = i64;
+                    const Type* seqType = fr->sequence ? fr->sequence->semaType : nullptr;
+                    if (seqType) {
+                        if (seqType->kind == TypeKind::Array && seqType->element)
+                            elemTy = owner_->layout_->lower(seqType->element);
+                        else if (seqType->kind == TypeKind::Set && seqType->element) {
+                            elemTy = owner_->layout_->lower(seqType->element);
+                            keyTy = elemTy;
+                        } else if (seqType->kind == TypeKind::Dict) {
+                            if (seqType->key) keyTy = owner_->layout_->lower(seqType->key);
+                            if (seqType->value) valTy = owner_->layout_->lower(seqType->value);
+                        } else if (seqType->kind == TypeKind::String)
+                            elemTy = llvm::Type::getInt32Ty(*owner_->ctx_);
+                    }
+                    owner_->b_->SetInsertPoint(headBB);
+                    llvm::Value* i = owner_->b_->CreateLoad(i64, idx);
+                    llvm::Value* more;
+                    if (lo && hi) {
+                        more = halfOpen ? owner_->b_->CreateICmpSLT(i, hi, "for.more")
+                                        : owner_->b_->CreateICmpSLE(i, hi, "for.more");
+                    } else {
+                        llvm::Value* coll = owner_->b_->CreateLoad(seqTy, seqSlot, "for.coll");
+                        llvm::Value* count;
+                        if (owner_->isDictAggregate(coll, seqType)) {
+                            count = owner_->b_->CreateCall(
+                                owner_->declareExternalSig("suki_dict_entry_count",
+                                    { llvm::PointerType::get(*owner_->ctx_, 0) }, i64),
+                                { seqSlot });
+                        } else if (seqType && seqType->kind == TypeKind::String) {
+                            count = owner_->b_->CreateCall(
+                                owner_->declareExternalSig("suki_str_length",
+                                    { owner_->layout_->stringTy() }, i64), { coll });
+                        } else {
+                            count = owner_->b_->CreateExtractValue(coll, {1}, "for.count");
+                        }
+                        more = owner_->b_->CreateICmpSLT(i, count, "for.more");
+                    }
+                    owner_->b_->CreateCondBr(more, bodyBB, exitBB);
+                    owner_->b_->SetInsertPoint(bodyBB);
+                    if (lo) {
+                        if (!names.empty()) {
+                            owner_->locals_[names[0]] = owner_->b_->CreateAlloca(i64, nullptr, names[0]);
+                            owner_->b_->CreateStore(i, owner_->locals_[names[0]]);
+                        }
+                    } else {
+                        llvm::Value* coll = owner_->b_->CreateLoad(seqTy, seqSlot, "for.coll");
+                        if (owner_->isDictAggregate(coll, seqType)) {
+                            llvm::Value* keySlot = owner_->b_->CreateAlloca(
+                                keyTy, nullptr, names.empty() ? "k" : names[0]);
+                            llvm::Value* valSlot = owner_->b_->CreateAlloca(
+                                valTy, nullptr, names.size() > 1 ? names[1] : "v");
+                            owner_->b_->CreateCall(
+                                owner_->declareExternalSig("suki_dict_entry_at",
+                                    { llvm::PointerType::get(*owner_->ctx_, 0), i64,
+                                      llvm::PointerType::get(*owner_->ctx_, 0),
+                                      llvm::PointerType::get(*owner_->ctx_, 0) },
+                                    llvm::Type::getInt32Ty(*owner_->ctx_)),
+                                { seqSlot, i, keySlot, valSlot });
+                            if (!names.empty()) owner_->locals_[names[0]] = keySlot;
+                            if (names.size() > 1) owner_->locals_[names[1]] = valSlot;
+                        } else if (seqType && seqType->kind == TypeKind::String) {
+                            llvm::Value* scalar = owner_->b_->CreateCall(
+                                owner_->declareExternalSig("suki_str_utf8_get",
+                                    { owner_->layout_->stringTy(), llvm::Type::getInt32Ty(*owner_->ctx_) },
+                                    llvm::Type::getInt32Ty(*owner_->ctx_)),
+                                { coll, owner_->b_->CreateSExt(i, llvm::Type::getInt32Ty(*owner_->ctx_)) });
+                            if (!names.empty()) {
+                                owner_->locals_[names[0]] = owner_->b_->CreateAlloca(
+                                    llvm::Type::getInt32Ty(*owner_->ctx_), nullptr, names[0]);
+                                owner_->b_->CreateStore(scalar, owner_->locals_[names[0]]);
+                            }
+                        } else {
+                            llvm::Value* data =
+                                owner_->b_->CreateExtractValue(coll, {0}, "for.data");
+                            llvm::Value* slot = owner_->b_->CreateAlloca(
+                                elemTy, nullptr, names.empty() ? "for.elem" : names[0]);
+                            owner_->b_->CreateStore(
+                                owner_->b_->CreateLoad(elemTy, owner_->b_->CreateGEP(elemTy, data, {i})),
+                                slot);
+                            if (!names.empty()) {
+                                owner_->locals_[names[0]] = slot;
+                                owner_->trackScopedRef(names[0],
+                                    pat && pat->semaType ? pat->semaType : nullptr);
+                            }
+                        }
+                    }
+                    owner_->breakTargets_.push_back(exitBB);
+                    owner_->continueTargets_.push_back(stepBB);
+                    for (auto& st : fr->body) owner_->genStmt(st.get());
+                    owner_->breakTargets_.pop_back();
+                    owner_->continueTargets_.pop_back();
+                    if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(stepBB);
+                    owner_->b_->SetInsertPoint(stepBB);
+                    llvm::Value* next = owner_->b_->CreateAdd(owner_->b_->CreateLoad(i64, idx),
+                                                              llvm::ConstantInt::get(i64, 1));
+                    owner_->b_->CreateStore(next, idx);
+                    owner_->b_->CreateBr(headBB);
+                    owner_->b_->SetInsertPoint(exitBB);
+                    return;
+                }
+                case NodeKind::SwitchStmt: {
+                    auto* sw = static_cast<SwitchStmt*>(s);
+                    if (sw->isSelect) { owner_->conc_.genSelect(sw); return; }
+                    llvm::Value* subject = sw->subject ? owner_->genExpr(sw->subject.get()) : nullptr;
+                    if (!subject) return;
+                    llvm::Value* switchVal = subject;
+                    if (llvm::StructType* st = llvm::dyn_cast<llvm::StructType>(
+                            subject->getType())) {
+                        if (st->getNumElements() == 2 &&
+                            st->getElementType(0)->isIntegerTy(64) &&
+                            st->getElementType(1)->isPointerTy()) {
+                            switchVal = owner_->b_->CreateExtractValue(subject, {0}, "tag");
+                        }
+                    }
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    llvm::BasicBlock* entry = owner_->b_->GetInsertBlock();
+                    llvm::BasicBlock* merge = llvm::BasicBlock::Create(*owner_->ctx_, "sw.cont", f);
+                    std::vector<CaseClause*> arms;
+                    CaseClause* defaultArm = nullptr;
+                    for (auto& c : sw->cases) {
+                        if (!c || c->kind != NodeKind::CaseClause) continue;
+                        auto* cc = static_cast<CaseClause*>(c.get());
+                        if (cc->isDefault) defaultArm = cc;
+                        else arms.push_back(cc);
+                    }
+                    std::vector<std::pair<int64_t, llvm::BasicBlock*>> armsInt;
+                    auto caseTagValue = [this](CaseClause* cc) -> int64_t {
+                        if (!cc || cc->whereExpr || cc->isBindingPattern ||
+                            !cc->bindings.empty() || !cc->alternatives.empty() ||
+                            endsWithFallthrough(cc) || !cc->pattern)
+                            return -1;
+                        if (cc->pattern->kind == NodeKind::IntLitExpr)
+                            return parseIntLiteral(static_cast<IntLitExpr*>(cc->pattern.get())->value);
+                        if (cc->pattern->kind == NodeKind::MemberExpr)
+                            return owner_->enumCaseTag(static_cast<MemberExpr*>(cc->pattern.get()));
+                        return -1;
+                    };
+                    bool intSwitch = !arms.empty() && switchVal->getType()->isIntegerTy() &&
+                                     switchVal->getType()->getIntegerBitWidth() <= 64;
+                    for (CaseClause* cc : arms) {
+                        if (caseTagValue(cc) < 0) { intSwitch = false; break; }
+                    }
+                    if (intSwitch) {
+                        llvm::BasicBlock* defTarget = merge;
+                        if (defaultArm) {
+                            defTarget = llvm::BasicBlock::Create(*owner_->ctx_, "sw.default", f);
+                            owner_->b_->SetInsertPoint(defTarget);
+                            owner_->bindCaseBindings(defaultArm, subject);
+                            for (auto& st : defaultArm->body) owner_->genStmt(st.get());
+                            if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(merge);
+                        }
+                        for (CaseClause* cc : arms) {
+                            llvm::BasicBlock* armBB =
+                                llvm::BasicBlock::Create(*owner_->ctx_, "sw.arm", f);
+                            owner_->b_->SetInsertPoint(armBB);
+                            for (auto& st : cc->body) owner_->genStmt(st.get());
+                            if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(merge);
+                            armsInt.push_back({caseTagValue(cc), armBB});
+                        }
+                        owner_->b_->SetInsertPoint(entry);
+                        llvm::SwitchInst* si = owner_->b_->CreateSwitch(
+                            switchVal, defTarget, static_cast<unsigned>(armsInt.size()));
+                        for (auto& kv : armsInt) {
+                            si->addCase(llvm::cast<llvm::ConstantInt>(
+                                            llvm::ConstantInt::get(switchVal->getType(),
+                                                                  kv.first)),
+                                        kv.second);
+                        }
+                        owner_->b_->SetInsertPoint(merge);
+                        return;
+                    }
+                    std::vector<llvm::BasicBlock*> tests, bodies;
+                    for (size_t i = 0; i < arms.size(); ++i) {
+                        tests.push_back(llvm::BasicBlock::Create(*owner_->ctx_, "sw.test", f));
+                        bodies.push_back(llvm::BasicBlock::Create(*owner_->ctx_, "sw.arm", f));
+                    }
+                    llvm::BasicBlock* defBody = defaultArm
+                        ? llvm::BasicBlock::Create(*owner_->ctx_, "sw.default", f)
+                        : nullptr;
+                    auto continuation = [&](size_t i) -> llvm::BasicBlock* {
+                        if (i + 1 < tests.size()) return tests[i + 1];
+                        return defBody ? defBody : merge;
+                    };
+                    for (size_t i = 0; i < arms.size(); ++i) {
+                        CaseClause* cc = arms[i];
+                        owner_->b_->SetInsertPoint(bodies[i]);
+                        owner_->bindCaseBindings(cc, subject);
+                        if (cc->whereExpr) {
+                            llvm::BasicBlock* okBB = llvm::BasicBlock::Create(*owner_->ctx_, "sw.ok", f);
+                            llvm::Value* w = owner_->genExpr(cc->whereExpr.get());
+                            owner_->b_->CreateCondBr(w ? owner_->toBool(w) : owner_->trueVal(), okBB,
+                                             i + 1 < bodies.size() ? bodies[i + 1]
+                                                                   : (defBody ? defBody : merge));
+                            owner_->b_->SetInsertPoint(okBB);
+                        }
+                        for (auto& st : cc->body) owner_->genStmt(st.get());
+                        if (!owner_->b_->GetInsertBlock()->getTerminator()) {
+                            llvm::BasicBlock* next = i + 1 < bodies.size() ? bodies[i + 1]
+                                                        : (defBody ? defBody : merge);
+                            owner_->b_->CreateBr(endsWithFallthrough(cc) ? next : merge);
+                        }
+                    }
+                    if (defaultArm) {
+                        owner_->b_->SetInsertPoint(defBody);
+                        owner_->bindCaseBindings(defaultArm, subject);
+                        if (defaultArm->whereExpr) {
+                            llvm::BasicBlock* okBB = llvm::BasicBlock::Create(*owner_->ctx_, "sw.ok", f);
+                            llvm::Value* w = owner_->genExpr(defaultArm->whereExpr.get());
+                            owner_->b_->CreateCondBr(w ? owner_->toBool(w) : owner_->trueVal(), okBB, merge);
+                            owner_->b_->SetInsertPoint(okBB);
+                        }
+                        for (auto& st : defaultArm->body) owner_->genStmt(st.get());
+                        if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(merge);
+                    }
+                    owner_->b_->SetInsertPoint(entry);
+                    if (!tests.empty()) owner_->b_->CreateBr(tests[0]);
+                    else if (defBody) owner_->b_->CreateBr(defBody);
+                    else owner_->b_->CreateBr(merge);
+                    for (size_t i = 0; i < arms.size(); ++i) {
+                        owner_->b_->SetInsertPoint(tests[i]);
+                        llvm::Value* cond = owner_->genCaseCondition(arms[i], switchVal);
+                        owner_->b_->CreateCondBr(cond ? cond : owner_->trueVal(), bodies[i],
+                                         continuation(i));
+                    }
+                    owner_->b_->SetInsertPoint(merge);
+                    return;
+                }
+                default: owner_->genExpr(s); break;
+            }
+        }
+
+    llvm::Value* genExpr(Node* e) {
+        if (!e) return nullptr;
+        switch (e->kind) {
+            case NodeKind::IntLitExpr: {
+                return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*owner_->ctx_),
+                    parseIntLiteral(static_cast<IntLitExpr*>(e)->value));
+            }
+            case NodeKind::FloatLitExpr:
+                return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*owner_->ctx_),
+                    std::strtod(static_cast<FloatLitExpr*>(e)->value.c_str(), nullptr));
+            case NodeKind::BoolLitExpr:
+                return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*owner_->ctx_),
+                                              static_cast<BoolLitExpr*>(e)->value ? 1 : 0);
+            case NodeKind::StrLitExpr: {
+                // A String value is `{ i8* data, i64 length }`, not a bare
+                // pointer: the length is what makes embedded NUL bytes and
+                // slice/UTF-8 operations well defined.
+                auto* s = static_cast<StrLitExpr*>(e);
+                llvm::Type* sty = owner_->layout_->stringTy();
+                auto makeStr = [&](const std::string& text) -> llvm::Value* {
+                    llvm::Value* p = owner_->b_->CreateGlobalStringPtr(text);
+                    llvm::Value* v = llvm::UndefValue::get(sty);
+                    v = owner_->b_->CreateInsertValue(v, p, {0});
+                    v = owner_->b_->CreateInsertValue(
+                        v, llvm::ConstantInt::get(llvm::Type::getInt64Ty(*owner_->ctx_),
+                                                  static_cast<uint64_t>(text.size())),
+                        {1});
+                    return v;
+                };
+                if (s->expressions.empty()) {
+                    std::string all;
+                    for (auto& seg : s->segments) all += seg;
+                    // In a `Char`-typed context a one-scalar string literal
+                    // denotes a character (规范 1.5): the value is the Unicode
+                    // scalar (i32), not a String.
+                    if (e->semaType && e->semaType->kind == TypeKind::Char)
+                        return owner_->charScalarOf(makeStr(all));
+                    return makeStr(all);
+                }
+                // Interpolated literal: fold `segments[i] + expr[i] + ...` with
+                // runtime concatenation so any length is handled.
+                llvm::Function* cat = owner_->declareExternalSig(
+                    "suki_str_concat", {sty, sty}, sty);
+                llvm::Value* acc = makeStr(s->segments.empty() ? "" : s->segments[0]);
+                for (size_t i = 0; i < s->expressions.size(); ++i) {
+                    llvm::Value* ev = genExpr(s->expressions[i].get());
+                    if (ev) acc = owner_->b_->CreateCall(cat, {acc, owner_->interpolateToString(ev)});
+                    if (i + 1 < s->segments.size())
+                        acc = owner_->b_->CreateCall(cat, {acc, makeStr(s->segments[i + 1])});
+                }
+                return acc;
+            }
+            case NodeKind::IdentExpr: {
+                const std::string& n = static_cast<IdentExpr*>(e)->name;
+                auto it = owner_->locals_.find(n);
+                if (it != owner_->locals_.end()) {
+                    // A local slot is usually an alloca, but a captured
+                    // variable inside a closure body is a pointer produced by
+                    // reinterpreting the capture context, so its element type
+                    // has to be recovered from the semantic type instead of
+                    // assuming the value is an AllocaInst.
+                    llvm::Value* slot = it->second;
+                    // `self` of a `mutating`-owning type is bound directly to the
+                    // incoming pointer argument (see `genAccessorBody`); its slot
+                    // is an `Argument`, not an `AllocaInst`, and `self` usually
+                    // carries no semantic type. The argument already *is* the
+                    // address/value the rest of codegen expects (a class pointer,
+                    // or a `T*` for a value type), so return it verbatim instead
+                    // of trying to recover a type and load through it — doing the
+                    // latter returns null and silently breaks `self.prop` inside a
+                    // computed getter (e.g. `Box.tripled` calling `self.doubled`).
+                    if (llvm::isa<llvm::Argument>(slot))
+                        return slot;
+                    // inout 形参：槽中存放的是调用方地址 T*，读取时需再解引用
+                    // 一次得到值（规范 3.1）。赋值时 owner_->genAddr 直接返回该地址，
+                    // 从而写回调用方的变量。
+                    if (owner_->inoutLocals_.count(n)) {
+                        // inout 形参：槽中存放调用方地址 T*，需多解引用一次取值。
+                        llvm::Type* pty = slot->getType();
+                        if (!pty->isPointerTy()) return nullptr;
+                        llvm::Type* elemTy = (e->semaType && e->semaType->element)
+                            ? owner_->layout_->lower(e->semaType->element) : nullptr;
+                        if (!elemTy) return nullptr;
+                        llvm::Value* addr = owner_->b_->CreateLoad(pty, slot);
+                        return owner_->b_->CreateLoad(elemTy, addr);
+                    }
+                    llvm::Type* slotTy = nullptr;
+                    if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(slot))
+                        slotTy = ai->getAllocatedType();
+                    else if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(slot))
+                        slotTy = gv->getValueType();
+                    else if (e->semaType)
+                        slotTy = owner_->layout_->lower(e->semaType);
+                    if (!slotTy) return nullptr;
+                    return owner_->b_->CreateLoad(slotTy, slot);
+                }
+                auto f = owner_->fns_.find(n);
+                if (f != owner_->fns_.end()) return f->second;
+                // A module-level variable is a global. It is looked up before
+                // the implicit-`self` fallback, so a global is not mistaken for
+                // a property of the enclosing type.
+                {
+                    auto git = owner_->globalsMap_.find(n);
+                    if (git != owner_->globalsMap_.end())
+                        return owner_->b_->CreateLoad(git->second->getValueType(),
+                                              git->second, n);
+                }
+                // Inside a method body a bare property name means `self.name`
+                // (Sema resolves it the same way).
+                if (llvm::Value* fld = owner_->genImplicitSelfField(n)) return fld;
+                return nullptr;
+            }
+            case NodeKind::ParenExpr:
+                return genExpr(static_cast<ParenExpr*>(e)->expr.get());
+            case NodeKind::ForceUnwrapExpr:
+                return genExpr(static_cast<UnaryExpr*>(e)->operand.get());
+            case NodeKind::OptionalChainExpr:
+                // `x?` promotes a value to Optional. The body keeps its own
+                // type; only the declared type of the binding changes, so the
+                // value is passed through (the flag is set where it is stored).
+                return genExpr(static_cast<OptionalChainExpr*>(e)->expr.get());
+            case NodeKind::UnaryExpr: {
+                auto* u = static_cast<UnaryExpr*>(e);
+                // `try?` turns a thrown error into nil instead of propagating
+                // it (规范 9.2): the error is captured, then folded into the
+                // Optional result.
+                if (u->isOptionalTry) {
+                    llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+                    llvm::Value* slot = owner_->b_->CreateAlloca(i8p, nullptr, "try.slot");
+                    owner_->b_->CreateStore(llvm::ConstantPointerNull::get(i8p), slot);
+                    llvm::Value* saved = owner_->optionalTrySlot_;
+                    owner_->optionalTrySlot_ = slot;
+                    llvm::Value* v = genExpr(u->operand.get());
+                    owner_->optionalTrySlot_ = saved;
+                    llvm::Value* err = owner_->b_->CreateLoad(i8p, slot, "try.err");
+                    llvm::Value* failed = owner_->b_->CreateIsNotNull(err, "try.failed");
+                    llvm::Type* optTy = e->semaType && e->semaType->kind == TypeKind::Optional
+                                            ? owner_->layout_->lower(e->semaType)
+                                            : (v ? owner_->layout_->optionalTy(v->getType()) : nullptr);
+                    if (!optTy) return nullptr;
+                    llvm::Type* payloadTy = optTy->getStructElementType(0);
+                    llvm::Value* some = llvm::UndefValue::get(optTy);
+                    some = owner_->b_->CreateInsertValue(
+                        some, v ? owner_->coerce(v, payloadTy)
+                                : llvm::Constant::getNullValue(payloadTy), {0});
+                    some = owner_->b_->CreateInsertValue(some, owner_->trueVal(), {1});
+                    llvm::Value* none = llvm::Constant::getNullValue(optTy);
+                    return owner_->b_->CreateSelect(failed, none, some);
+                }
+                // `try!` asserts that nothing is thrown: an error panics.
+                if (u->isForcedTry) {
+                    llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+                    llvm::Value* slot = owner_->b_->CreateAlloca(i8p, nullptr, "try.slot");
+                    owner_->b_->CreateStore(llvm::ConstantPointerNull::get(i8p), slot);
+                    llvm::Value* saved = owner_->optionalTrySlot_;
+                    owner_->optionalTrySlot_ = slot;
+                    llvm::Value* v = genExpr(u->operand.get());
+                    owner_->optionalTrySlot_ = saved;
+                    llvm::Value* err = owner_->b_->CreateLoad(i8p, slot, "try.err");
+                    llvm::Value* failed = owner_->b_->CreateIsNotNull(err, "try.failed");
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    llvm::BasicBlock* bad = llvm::BasicBlock::Create(*owner_->ctx_, "try.bang.fail", f);
+                    llvm::BasicBlock* ok = llvm::BasicBlock::Create(*owner_->ctx_, "try.bang.cont", f);
+                    owner_->b_->CreateCondBr(failed, bad, ok);
+                    owner_->b_->SetInsertPoint(bad);
+                    owner_->b_->CreateCall(owner_->declareExternalSig("panic", { i8p }),
+                                   { owner_->b_->CreateGlobalStringPtr(
+                                       "try! unexpectedly raised an error") });
+                    owner_->b_->CreateUnreachable();
+                    owner_->b_->SetInsertPoint(ok);
+                    return v;
+                }
+                llvm::Value* v = genExpr(u->operand.get());
+                if (!v) return nullptr;
+                // `try` passes the operand value through unchanged. `await` expects a
+                // Future handle (i8*) already produced by the async call and unboxes
+                // the boxed result of the awaited type.
+                if (u->isTry) return v;
+                if (u->isAwait) {
+                    if (!v) return nullptr;
+                    llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
+                    llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
+                    llvm::Function* awaitFn = owner_->declareExternalSig(
+                        "suki_future_await", { i8p, i8p }, voidTy);
+                    llvm::Function* freeFn = owner_->declareExternalSig(
+                        "suki_future_free", { i8p }, voidTy);
+                    const Type* rt = u->semaType;
+                    if (!rt || rt->kind == TypeKind::Void ||
+                        rt->kind == TypeKind::Unknown) {
+                        // Awaiting a `Void` async call still waits for completion,
+                        // then releases the handle; no value is produced.
+                        llvm::Value* tmp = owner_->b_->CreateAlloca(
+                            llvm::Type::getInt64Ty(*owner_->ctx_), nullptr, "await.void");
+                        owner_->b_->CreateCall(awaitFn, { v, owner_->b_->CreateBitCast(tmp, i8p) });
+                        owner_->b_->CreateCall(freeFn, { v });
+                        return llvm::Constant::getNullValue(
+                            llvm::Type::getInt32Ty(*owner_->ctx_));
+                    }
+                    llvm::Type* rty = owner_->layout_->lower(rt);
+                    if (!rty) return nullptr;
+                    llvm::Value* out = owner_->b_->CreateAlloca(rty, nullptr, "awaited");
+                    owner_->b_->CreateCall(awaitFn, { v, owner_->b_->CreateBitCast(out, i8p) });
+                    owner_->b_->CreateCall(freeFn, { v });
+                    return owner_->b_->CreateLoad(rty, out);
+                }
+                switch (u->op) {
+                    case PunctuatorID::Minus:
+                        return v->getType()->isFloatingPointTy() ? owner_->b_->CreateFNeg(v)
+                                                                 : owner_->b_->CreateNeg(v);
+                    case PunctuatorID::Bang:
+                        return owner_->b_->CreateNot(owner_->coerce(v, llvm::Type::getInt1Ty(*owner_->ctx_)));
+                    case PunctuatorID::Tilde: return owner_->b_->CreateNot(v);
+                    // `&x` 取地址：inout 参数据此按引用传递（规范 3.1）。
+                    case PunctuatorID::Amp: return owner_->genAddr(u->operand.get());
+                    default: return v;
+                }
+            }
+            case NodeKind::BinaryExpr: {
+                auto* b = static_cast<BinaryExpr*>(e);
+                // `x == nil` / `x != nil` compares an Optional's flag rather
+                // than its payload: `nil` has no value of its own to compare.
+                if ((b->op == PunctuatorID::EqualEqual ||
+                     b->op == PunctuatorID::BangEqual) && b->lhs && b->rhs) {
+                    Node* nilSide = b->rhs->kind == NodeKind::NilLitExpr ? b->rhs.get()
+                                  : b->lhs->kind == NodeKind::NilLitExpr ? b->lhs.get()
+                                                                         : nullptr;
+                    if (nilSide) {
+                        Node* other = nilSide == b->rhs.get() ? b->lhs.get() : b->rhs.get();
+                        if (llvm::Value* v = genExpr(other)) {
+                            if (isOptionalShape(v->getType())) {
+                                llvm::Value* has = owner_->b_->CreateExtractValue(v, {1}, "hasValue");
+                                // `!= nil` is "has a value"; `== nil` is its negation.
+                                return b->op == PunctuatorID::BangEqual
+                                           ? has : owner_->b_->CreateNot(has, "isNil");
+                            }
+                            // A reference type is nil exactly when the pointer is null.
+                            if (v->getType()->isPointerTy()) {
+                                llvm::Value* nonNull = owner_->b_->CreateIsNotNull(v, "nonNull");
+                                return b->op == PunctuatorID::BangEqual
+                                           ? nonNull : owner_->b_->CreateNot(nonNull, "isNil");
+                            }
+                        }
+                    }
+                }
+                // `+` on Strings is concatenation, not arithmetic.
+                if (b->op == PunctuatorID::Plus && b->lhs && b->rhs &&
+                    b->lhs->semaType && b->rhs->semaType &&
+                    b->lhs->semaType->kind == TypeKind::String &&
+                    b->rhs->semaType->kind == TypeKind::String) {
+                    llvm::Value* l = genExpr(b->lhs.get());
+                    llvm::Value* r = genExpr(b->rhs.get());
+                    if (!l || !r) return nullptr;
+                    llvm::Type* sty = owner_->layout_->stringTy();
+                    return owner_->b_->CreateCall(
+                        owner_->declareExternalSig("suki_str_concat",
+                                           {sty, sty}, sty),
+                        {owner_->coerce(l, sty), owner_->coerce(r, sty)});
+                }
+                return owner_->genBinary(b);
+            }
+            case NodeKind::ClosureExpr:
+                return owner_->emitClosure(static_cast<ClosureExpr*>(e));
+            case NodeKind::CallExpr: {
+                // A built-in scalar type in callee position is a conversion:
+                // `Int(x)`, `Double(n)`, `Char("A")`. Sema has already typed the
+                // expression as the target type; here it becomes the actual cast.
+                if (auto* c = static_cast<CallExpr*>(e);
+                    c->callee && c->callee->kind == NodeKind::IdentExpr &&
+                    c->arguments.size() == 1 && e->semaType) {
+                    const std::string& n =
+                        static_cast<IdentExpr*>(c->callee.get())->name;
+                    static const char* kScalars[] = {
+                        "Int", "UInt", "Int8", "Int16", "Int32", "Int64", "UInt8",
+                        "UInt16", "UInt32", "UInt64", "Float", "Double", "Char",
+                        "Bool", "String"};
+                    bool isScalar = false;
+                    for (const char* s : kScalars)
+                        if (n == s) { isScalar = true; break; }
+                    if (isScalar && !owner_->classTypes_.count(n)) {
+                        llvm::Value* v = genExpr(c->arguments[0].get());
+                        if (!v) return nullptr;
+                        llvm::Type* target = owner_->layout_->lower(e->semaType);
+                        // Char keeps its i32 width; other scalars owner_->coerce to their
+                        // declared width (i64 for Int, i32 for Int8, ...).
+                        if (target->isIntegerTy() && target->getIntegerBitWidth() == 32 &&
+                            e->semaType->kind != TypeKind::Char) {
+                            // A narrower integer keeps its own width; the value
+                            // is sign/zero extended by owner_->coerce below.
+                        }
+                        return owner_->coerceForCast(v, target, e->semaType);
+                    }
+                }
+                // `Enum.case(payload...)` builds a tagged union: a tag plus a
+                // heap box holding the case's payload fields.
+                if (auto* c = static_cast<CallExpr*>(e);
+                    c->callee && c->callee->kind == NodeKind::MemberExpr) {
+                    auto* m = static_cast<MemberExpr*>(c->callee.get());
+                    int64_t tag = -1;
+                    if (const TypeRecord* rec = owner_->enumCaseOf(m, &tag)) {
+                        const Type* et = nullptr;
+                        if (m->base && m->base->kind == NodeKind::IdentExpr) {
+                            const std::string& bn =
+                                static_cast<IdentExpr*>(m->base.get())->name;
+                            auto eit = owner_->enumTypes_.find(bn);
+                            if (eit != owner_->enumTypes_.end()) et = eit->second;
+                        }
+                        llvm::Type* ety = et ? owner_->layout_->lower(et) : llvm::Type::getInt64Ty(*owner_->ctx_);
+                        llvm::Value* boxed = nullptr;
+                        if (llvm::StructType* pt = owner_->casePayloadType(rec, (size_t)tag)) {
+                            llvm::Value* buf = owner_->b_->CreateAlloca(pt, nullptr, "payload");
+                            for (size_t i = 0; i < c->arguments.size(); ++i) {
+                                llvm::Value* av = genExpr(c->arguments[i].get());
+                                if (!av) continue;
+                                unsigned fi = static_cast<unsigned>(i);
+                                if (fi >= pt->getNumElements()) break;
+                                owner_->b_->CreateStore(av, owner_->b_->CreateStructGEP(
+                                    pt, buf, fi));
+                            }
+                            boxed = owner_->b_->CreateBitCast(
+                                buf, llvm::PointerType::get(*owner_->ctx_, 0));
+                        }
+                        llvm::Value* v = llvm::UndefValue::get(ety);
+                        v = owner_->b_->CreateInsertValue(v, owner_->tagConstant(tag), {0});
+                        v = owner_->b_->CreateInsertValue(v,
+                            boxed ? boxed
+                                  : llvm::ConstantPointerNull::get(
+                                        llvm::PointerType::get(*owner_->ctx_, 0)), {1});
+                        return v;
+                    }
+                }
+                return owner_->genCall(static_cast<CallExpr*>(e));
+            }
+            case NodeKind::ArrayLitExpr: {
+                // Build via repeated runtime push so one code path serves both
+                // literals and `append`.
+                auto* a = static_cast<ArrayLitExpr*>(e);
+                llvm::Type* aty = owner_->layout_->lower(a->semaType);
+                if (!aty || !aty->isStructTy()) return nullptr;
+                const Type* elemT = a->semaType && a->semaType->kind == TypeKind::Array
+                    ? a->semaType->element : nullptr;
+                llvm::Type* elemTy = elemT ? owner_->layout_->lower(elemT)
+                                           : llvm::Type::getInt64Ty(*owner_->ctx_);
+                int64_t esz = owner_->sizeOf(elemTy);
+                llvm::Value* cap = llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*owner_->ctx_),
+                    a->elements.empty() ? 0 : (int64_t)a->elements.size());
+                llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                // The array aggregate lives in a temporary slot; runtime entry
+                // points take it by pointer (see runtime.h for why).
+                llvm::Value* slot = owner_->b_->CreateAlloca(aty, nullptr, "arr.tmp");
+                owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_array_new",
+                        { i64, i64, llvm::PointerType::getUnqual(aty) }),
+                    { llvm::ConstantInt::get(i64, esz), cap, slot });
+                llvm::Function* push = owner_->declareExternalSig("suki_array_push",
+                    { llvm::PointerType::getUnqual(aty), i64,
+                      llvm::PointerType::getUnqual(elemTy) });
+                for (auto& el : a->elements) {
+                    llvm::Value* v = genExpr(el.get());
+                    if (!v) continue;
+                    llvm::Value* ev = owner_->b_->CreateAlloca(elemTy);
+                    owner_->b_->CreateStore(owner_->coerce(v, elemTy), ev);
+                    owner_->b_->CreateCall(push, { slot,
+                        llvm::ConstantInt::get(i64, esz), ev });
+                }
+                return owner_->b_->CreateLoad(aty, slot);
+            }
+            case NodeKind::DictLitExpr: {
+                // Lower a dictionary literal by allocating the table once and
+                // inserting each pair, mirroring the array-literal path.
+                auto* dl = static_cast<DictLitExpr*>(e);
+                llvm::Type* dty = owner_->layout_->lower(dl->semaType);
+                if (!dty || !dty->isStructTy()) return nullptr;
+                const Type* bt = dl->semaType;
+                llvm::Type* kTy = (bt->kind == TypeKind::Dict && bt->key)
+                    ? owner_->layout_->lower(bt->key) : llvm::Type::getInt64Ty(*owner_->ctx_);
+                llvm::Type* vTy = (bt->kind == TypeKind::Dict && bt->value)
+                    ? owner_->layout_->lower(bt->value) : llvm::Type::getInt64Ty(*owner_->ctx_);
+                int64_t ksz = (int64_t)(kTy->getPrimitiveSizeInBits() + 7) / 8;
+                int64_t vsz = (int64_t)(vTy->getPrimitiveSizeInBits() + 7) / 8;
+                if (ksz <= 0) ksz = 1;
+                llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                llvm::Value* slot = owner_->b_->CreateAlloca(dty, nullptr, "dict.tmp");
+                // Size the table to the literal's pair count; the runtime grows
+                // it automatically if the estimate is too small.
+                owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_dict_new",
+                        { i64, i64, i64, llvm::PointerType::getUnqual(dty) }),
+                    { llvm::ConstantInt::get(i64, ksz),
+                      llvm::ConstantInt::get(i64, vsz),
+                      llvm::ConstantInt::get(i64, (int64_t)dl->keys.size()),
+                      slot });
+                for (size_t i = 0; i < dl->keys.size() && i < dl->values.size(); ++i) {
+                    llvm::Value* k = genExpr(dl->keys[i].get());
+                    llvm::Value* v = genExpr(dl->values[i].get());
+                    if (!k || !v) continue;
+                    llvm::Value* ka = owner_->b_->CreateAlloca(kTy);
+                    owner_->b_->CreateStore(owner_->coerce(k, kTy), ka);
+                    llvm::Value* va = owner_->b_->CreateAlloca(vTy);
+                    owner_->b_->CreateStore(owner_->coerce(v, vTy), va);
+                    owner_->b_->CreateCall(
+                        owner_->declareExternalSig("suki_dict_set",
+                            { llvm::PointerType::getUnqual(dty), i64, i64,
+                              llvm::PointerType::getUnqual(kTy),
+                              llvm::PointerType::getUnqual(vTy) }),
+                        { slot, llvm::ConstantInt::get(i64, ksz),
+                          llvm::ConstantInt::get(i64, vsz), ka, va });
+                }
+                return owner_->b_->CreateLoad(dty, slot);
+            }
+            case NodeKind::SetLitExpr: {
+                // A set is the runtime's hash table with no value payload, so
+                // each element is inserted for its uniqueness alone.
+                auto* sl = static_cast<SetLitExpr*>(e);
+                const Type* bt = sl->semaType;
+                if (!bt || bt->kind != TypeKind::Set) return nullptr;
+                llvm::Type* sty = owner_->layout_->lower(bt);
+                llvm::Type* kTy = bt->element ? owner_->layout_->lower(bt->element)
+                                              : llvm::Type::getInt64Ty(*owner_->ctx_);
+                llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                llvm::Value* box = owner_->b_->CreateAlloca(sty, nullptr, "set.tmp");
+                owner_->b_->CreateCall(
+                    owner_->declareExternalSig("suki_dict_new",
+                        { i64, i64, i64, llvm::PointerType::getUnqual(sty) }),
+                    { llvm::ConstantInt::get(i64, owner_->sizeOf(kTy)),
+                      llvm::ConstantInt::get(i64, 0),
+                      llvm::ConstantInt::get(i64, (int64_t)sl->elements.size()),
+                      box });
+                for (auto& el : sl->elements) {
+                    llvm::Value* v = genExpr(el.get());
+                    if (!v) continue;
+                    llvm::Value* ka = owner_->b_->CreateAlloca(kTy);
+                    owner_->b_->CreateStore(owner_->coerce(v, kTy), ka);
+                    owner_->b_->CreateCall(
+                        owner_->declareExternalSig("suki_dict_set",
+                            { llvm::PointerType::getUnqual(sty), i64, i64,
+                              llvm::PointerType::getUnqual(kTy),
+                              llvm::PointerType::getUnqual(kTy) }),
+                        { box, llvm::ConstantInt::get(i64, owner_->sizeOf(kTy)),
+                          llvm::ConstantInt::get(i64, 0), ka, ka });
+                }
+                return owner_->b_->CreateLoad(sty, box);
+            }
+            case NodeKind::TernaryExpr: {
+                // `c ? a : b` — a real branch, because only one side may run.
+                // The result travels through a temporary slot instead of a PHI:
+                // for a *nested* conditional the PHI would be defined in a block
+                // that does not dominate the outer merge, while a slot always
+                // holds a value on every path.
+                auto* t = static_cast<TernaryExpr*>(e);
+                llvm::Value* c = genExpr(t->condition.get());
+                if (!c) return nullptr;
+                c = owner_->coerce(c, llvm::Type::getInt1Ty(*owner_->ctx_));
+                llvm::Type* rt = nullptr;
+                if (const Type* st = t->semaType) rt = owner_->layout_->lower(st);
+                if (!rt) rt = llvm::Type::getInt64Ty(*owner_->ctx_);
+                llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                const unsigned cid = ++owner_->condCounter_;
+                const std::string tag = "." + std::to_string(cid);
+                llvm::BasicBlock* tBB =
+                    llvm::BasicBlock::Create(*owner_->ctx_, "cond.true" + tag, f);
+                llvm::BasicBlock* eBB =
+                    llvm::BasicBlock::Create(*owner_->ctx_, "cond.false" + tag, f);
+                llvm::BasicBlock* mBB =
+                    llvm::BasicBlock::Create(*owner_->ctx_, "cond.end" + tag, f);
+                llvm::Value* slot = owner_->b_->CreateAlloca(rt, nullptr, "cond.tmp");
+                owner_->b_->CreateCondBr(c, tBB, eBB);
+
+                owner_->b_->SetInsertPoint(tBB);
+                if (llvm::Value* tv = genExpr(t->thenValue.get()))
+                    owner_->b_->CreateStore(owner_->coerce(tv, rt), slot);
+                owner_->b_->CreateBr(mBB);
+
+                owner_->b_->SetInsertPoint(eBB);
+                if (llvm::Value* ev = genExpr(t->elseValue.get()))
+                    owner_->b_->CreateStore(owner_->coerce(ev, rt), slot);
+                owner_->b_->CreateBr(mBB);
+
+                owner_->b_->SetInsertPoint(mBB);
+                return owner_->b_->CreateLoad(rt, slot, "cond");
+            }
+            case NodeKind::TupleExpr: {
+                // Build a tuple value by inserting each element in turn.
+                auto* t = static_cast<TupleExpr*>(e);
+                if (!t->semaType || t->semaType->kind != TypeKind::Tuple) return nullptr;
+                llvm::Type* ty = owner_->layout_->lower(t->semaType);
+                llvm::Value* v = llvm::UndefValue::get(ty);
+                for (size_t i = 0; i < t->elements.size(); ++i) {
+                    if (i >= t->semaType->elements.size()) break;
+                    llvm::Value* el = genExpr(t->elements[i].get());
+                    if (!el) continue;
+                    v = owner_->b_->CreateInsertValue(v, el, {static_cast<unsigned>(i)});
+                }
+                return v;
+            }
+            case NodeKind::SubscriptExpr: {
+                // `xs[i]` — the array is a runtime structure, so element access
+                // goes through the runtime rather than a GEP.
+                auto* sx = static_cast<SubscriptExpr*>(e);
+                const Type* bt = sx->base ? sx->base->semaType : nullptr;
+                if (sx->indices.empty()) return nullptr;
+                llvm::Value* recv = genExpr(sx->base.get());
+                if (!recv) return nullptr;
+                llvm::Value* idx = genExpr(sx->indices[0].get());
+                if (!idx) return nullptr;
+                if (bt && bt->kind == TypeKind::Array) {
+                    llvm::Type* aty = owner_->layout_->lower(bt);
+                    const Type* et = bt->element;
+                    llvm::Type* elemTy = et ? owner_->layout_->lower(et)
+                                            : llvm::Type::getInt64Ty(*owner_->ctx_);
+                    llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                    recv = owner_->coerce(recv, aty);
+                    llvm::Value* slot = owner_->b_->CreateAlloca(aty, nullptr, "arr.tmp");
+                    owner_->b_->CreateStore(recv, slot);
+                    llvm::Value* raw = owner_->b_->CreateCall(
+                        owner_->declareExternalSig("suki_array_get",
+                            { llvm::PointerType::getUnqual(aty), i64 },
+                            llvm::PointerType::getUnqual(elemTy)),
+                        { slot, owner_->coerce(idx, i64) });
+                    if (!raw) return nullptr;
+                    return owner_->b_->CreateLoad(elemTy, raw, "elem");
+                }
+                if (bt && (bt->kind == TypeKind::Dict || bt->kind == TypeKind::Set)) {
+                    // Dictionaries and sets share the runtime hash table.
+                    llvm::Type* dty = owner_->layout_->lower(bt);
+                    llvm::Type* kTy = bt->kind == TypeKind::Dict
+                        ? owner_->layout_->lower(bt->key) : owner_->layout_->lower(bt->element);
+                    llvm::Type* vTy = bt->kind == TypeKind::Dict
+                        ? owner_->layout_->lower(bt->value) : kTy;
+                    if (!kTy || !vTy) return nullptr;
+                    llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                    int64_t ksz = owner_->sizeOf(kTy);
+                    int64_t vsz = owner_->sizeOf(vTy);
+                    llvm::Value* box = owner_->b_->CreateAlloca(dty, nullptr, "dict.tmp");
+                    owner_->b_->CreateStore(owner_->coerce(recv, dty), box);
+                    llvm::Value* ka = owner_->b_->CreateAlloca(kTy);
+                    owner_->b_->CreateStore(owner_->coerce(idx, kTy), ka);
+                    llvm::Value* out = owner_->b_->CreateAlloca(vTy, nullptr, "dict.out");
+                    owner_->b_->CreateStore(llvm::Constant::getNullValue(vTy), out);
+                    owner_->b_->CreateCall(
+                        owner_->declareExternalSig("suki_dict_get",
+                            { llvm::PointerType::getUnqual(dty), i64, i64,
+                              llvm::PointerType::getUnqual(kTy),
+                              llvm::PointerType::getUnqual(vTy) },
+                            llvm::Type::getInt32Ty(*owner_->ctx_)),
+                        { box, llvm::ConstantInt::get(i64, ksz),
+                          llvm::ConstantInt::get(i64, vsz), ka, out });
+                    return owner_->b_->CreateLoad(vTy, out);
+                }
+                // 自定义下标（规范 3.1）：在具名类型上查找 subscript 成员的 getter。
+                if (bt && bt->kind == TypeKind::Named) {
+                    std::string key = bt->name + ".subscript.get";
+                    auto sit = owner_->methodFns_.find(key);
+                    if (sit != owner_->methodFns_.end() && sit->second) {
+                        llvm::Function* gf = sit->second;
+                        llvm::FunctionType* gfty = gf->getFunctionType();
+                        llvm::Value* recv = nullptr;
+                        bool selfByPointer = gfty->getNumParams() &&
+                            gfty->getParamType(0)->isPointerTy();
+                        if (selfByPointer && !owner_->layout_->isReferenceType(bt))
+                            recv = owner_->genAddr(sx->base.get());
+                        else
+                            recv = genExpr(sx->base.get());
+                        if (!recv) return nullptr;
+                        std::vector<llvm::Value*> a{recv};
+                        for (auto& ix : sx->indices) {
+                            llvm::Value* iv = genExpr(ix.get());
+                            if (iv) a.push_back(iv);
+                        }
+                        for (size_t i = 0; i < a.size() && i < gfty->getNumParams(); ++i)
+                            a[i] = owner_->coerce(a[i], gfty->getParamType(i));
+                        return owner_->b_->CreateCall(gf, a);
+                    }
+                }
+                return nullptr;
+            }
+            case NodeKind::AsmExpr: {
+                auto* a = static_cast<AsmExpr*>(e);
+                // 输入操作数求值（rvalue）。
+                std::vector<llvm::Value*> inVals;
+                std::vector<llvm::Type*> inTys;
+                for (auto& inp : a->inputs) {
+                    llvm::Value* v = genExpr(inp.expr.get());
+                    if (!v) return nullptr;
+                    inVals.push_back(v);
+                    inTys.push_back(v->getType());
+                }
+                // 约束串：输出在前（含 '='），输入在后，逗号分隔。
+                std::string constraints;
+                bool first = true;
+                std::vector<llvm::Type*> outTys;
+                for (auto& o : a->outputs) {
+                    llvm::Type* ot = o.expr->semaType ? owner_->layout_->lower(o.expr->semaType)
+                                                      : nullptr;
+                    if (!ot) return nullptr;
+                    outTys.push_back(ot);
+                    if (!first) constraints += ",";
+                    constraints += o.constraint;
+                    first = false;
+                }
+                for (auto& inp : a->inputs) {
+                    if (!first) constraints += ",";
+                    constraints += inp.constraint;
+                    first = false;
+                }
+                llvm::Type* retTy;
+                if (outTys.empty()) retTy = llvm::Type::getVoidTy(*owner_->ctx_);
+                else if (outTys.size() == 1) retTy = outTys[0];
+                else retTy = llvm::StructType::get(*owner_->ctx_, outTys);
+                llvm::FunctionType* ft = llvm::FunctionType::get(retTy, inTys, false);
+                llvm::InlineAsm* ia = llvm::InlineAsm::get(
+                    ft, a->templateStr, constraints, /*hasSideEffects=*/true);
+                llvm::Value* call = owner_->b_->CreateCall(ia, inVals);
+                // 把内联汇编的输出写回对应变量（暂支持 IdentExpr 输出目标）。
+                for (size_t i = 0; i < a->outputs.size(); ++i) {
+                    llvm::Value* ov = (a->outputs.size() == 1)
+                                          ? call
+                                          : owner_->b_->CreateExtractValue(call, {(unsigned)i});
+                    llvm::Value* addr = nullptr;
+                    if (a->outputs[i].expr->kind == NodeKind::IdentExpr) {
+                        auto it = owner_->locals_.find(
+                            static_cast<IdentExpr*>(a->outputs[i].expr.get())->name);
+                        if (it != owner_->locals_.end()) addr = it->second;
+                    }
+                    if (addr) owner_->b_->CreateStore(ov, addr);
+                }
+                if (retTy->isVoidTy()) return llvm::UndefValue::get(retTy);
+                return call;
+            }
+            case NodeKind::MemberExpr: {
+                auto* m = static_cast<MemberExpr*>(e);
+                // MemoryLayout<T>.size / .stride / .alignment（规范 P4.5）：编译期
+                // 布局常量。依据 Sema 标记出的关联类型 T 查 DataLayout 生成常量。
+                if (m->isMemoryLayoutQuery && m->memoryLayoutType) {
+                    if (llvm::Type* lt = owner_->layout_->lower(m->memoryLayoutType)) {
+                        const llvm::DataLayout& dl = owner_->module_->getDataLayout();
+                        uint64_t sz = dl.getTypeAllocSize(lt);
+                        uint64_t al = dl.getABITypeAlign(lt).value();
+                        uint64_t v = (m->member == "alignment") ? al : sz; // size/stride 均含尾部填充
+                        return owner_->tagConstant((int64_t)v);
+                    }
+                }
+                // A labelled tuple element (`pair.code`) is indexed by the label's
+                // position, not looked up as a field. Sema records the element
+                // type on the expression, so the index comes from there.
+                            if (m->base && m->base->semaType &&
+                                m->base->semaType->kind == TypeKind::Tuple &&
+                                !isNumericIndex(m->member)) {
+                                if (llvm::Value* tv = genExpr(m->base.get())) {
+                                    unsigned idx = owner_->tupleLabelIndex(m->base.get(), m->member);
+                                    auto* tst = llvm::dyn_cast<llvm::StructType>(tv->getType());
+                                    if (tst && idx < tst->getNumElements())
+                                        return owner_->b_->CreateExtractValue(tv, {idx});
+                                }
+                            }
+                // Aggregate field access lowers to a GEP into the value's
+                // storage followed by a load of the field's type.
+                // A computed property is a function, not a field: call `get`.
+                if (const Type* pt = owner_->selfReceiverType(m->base.get());
+                    pt && pt->kind == TypeKind::Named && pt->record) {
+                    std::string key = pt->name + "." + m->member;
+                    auto cit = owner_->computedProps_.find(key);
+                    if (cit != owner_->computedProps_.end()) {
+                        llvm::Type* dummy = nullptr;
+                        llvm::Function* getter = owner_->accessorFn(
+                            pt->record, m->member,
+                            AccessorDecl::Kind::Getter, &dummy);
+                        if (getter) {
+                            // A computed property of a `mutating`-owning type is
+                            // declared with `self` by pointer; pass the caller's
+                            // address so the getter reads the live storage. Other
+                            // getters receive the value (a fresh copy is harmless).
+                            llvm::FunctionType* gfty = getter->getFunctionType();
+                            bool selfByPointer = gfty->getNumParams() &&
+                                gfty->getParamType(0)->isPointerTy();
+                            llvm::Value* recv;
+                            if (selfByPointer && !owner_->layout_->isReferenceType(pt))
+                                recv = owner_->genAddr(m->base.get());
+                            else
+                                recv = genExpr(m->base.get());
+                            if (!recv) return nullptr;
+                            return owner_->b_->CreateCall(getter,
+                                {owner_->coerce(recv, gfty->getParamType(0))});
+                        }
+                    }
+                }
+                {
+                    const Type* rt = owner_->selfReceiverType(m->base.get());
+                    if (rt && rt->kind == TypeKind::Named && rt->record &&
+                        (rt->record->kind == TypeDeclKind::Struct ||
+                         rt->record->kind == TypeDeclKind::Class ||
+                         rt->record->kind == TypeDeclKind::Actor)) {
+                        if (llvm::Value* fv = owner_->genMemberLoad(m)) return fv;
+                    }
+                }
+                // `Enum.case` used as a value denotes that case's tag. A
+                // negative tag means this is not an enum case, so fall through.
+                if (int64_t tag = owner_->enumCaseTag(m); tag >= 0) {
+                    const Type* et = owner_->enumTypeOf(m);
+                    if (et && owner_->layout_->lower(et)->isStructTy()) {
+                        // Payload-carrying enum: build `{ tag, null }` so the
+                        // value matches the enum's representation exactly.
+                        llvm::Value* v = llvm::UndefValue::get(owner_->layout_->lower(et));
+                        v = owner_->b_->CreateInsertValue(v, owner_->tagConstant(tag), {0});
+                        v = owner_->b_->CreateInsertValue(
+                            v, llvm::ConstantPointerNull::get(
+                                   llvm::PointerType::get(*owner_->ctx_, 0)), {1});
+                        return v;
+                    }
+                    return owner_->tagConstant(tag);
+                }
+                // Parameterless String properties (`s.length`, `s.count`,
+                // `s.isEmpty`) are reads rather than calls, so they are
+                // materialised here; genStringMethod only sees real calls.
+                if (m->base && m->base->semaType &&
+                    m->base->semaType->kind == TypeKind::String &&
+                    (m->member == "length" || m->member == "count" ||
+                     m->member == "isEmpty")) {
+                    if (llvm::Value* recv = genExpr(m->base.get())) {
+                        llvm::Type* sty = owner_->layout_->stringTy();
+                        llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                        recv = owner_->coerce(recv, sty);
+                        llvm::Value* n;
+                        if (m->member == "count") {
+                            // The runtime reports a scalar count as int32;
+                            // widen to Int so it compares against Int literals.
+                            n = owner_->b_->CreateSExt(
+                                owner_->b_->CreateCall(
+                                    owner_->declareExternalSig("suki_str_utf8_count", { sty },
+                                        llvm::Type::getInt32Ty(*owner_->ctx_)), { recv }),
+                                i64);
+                        } else {
+                            n = owner_->b_->CreateCall(
+                                owner_->declareExternalSig("suki_str_length", { sty }, i64),
+                                { recv });
+                        }
+                        if (m->member == "isEmpty")
+                            return owner_->b_->CreateICmpEQ(
+                                n, llvm::ConstantInt::get(i64, 0));
+                        return n;
+                    }
+                }
+                // Parameterless collection properties (`a.count`, `a.isEmpty`)
+                // are reads, not calls, so they are materialised here.
+                if (m->base && m->base->semaType &&
+                    (m->base->semaType->kind == TypeKind::Array ||
+                     m->base->semaType->kind == TypeKind::Dict)) {
+                    const Type* bt = m->base->semaType;
+                    if (m->member == "count" || m->member == "isEmpty") {
+                        llvm::Value* recv = genExpr(m->base.get());
+                        if (recv) {
+                            llvm::Type* cty = owner_->layout_->lower(bt);
+                            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                            recv = owner_->coerce(recv, cty);
+                            const char* lenFn = bt->kind == TypeKind::Array
+                                ? "suki_array_len" : "suki_dict_len";
+                            llvm::Value* box = owner_->b_->CreateAlloca(cty, nullptr,
+                                                                 "recv.tmp");
+                            owner_->b_->CreateStore(recv, box);
+                            llvm::Value* n = owner_->b_->CreateCall(
+                                owner_->declareExternalSig(lenFn,
+                                    { llvm::PointerType::getUnqual(cty) }, i64),
+                                { box });
+                            if (m->member == "count") return n;
+                            return owner_->b_->CreateICmpEQ(
+                                n, llvm::ConstantInt::get(i64, 0));
+                        }
+                    }
+                }
+                // Tuple element access `t.0` extracts the field at that index.
+                if (m->base && m->base->semaType &&
+                    m->base->semaType->kind == TypeKind::Tuple &&
+                    !m->member.empty()) {
+                    size_t idx = 0;
+                    bool numeric = true;
+                    for (char c : m->member) {
+                        if (c < '0' || c > '9') { numeric = false; break; }
+                        idx = idx * 10 + static_cast<size_t>(c - '0');
+                    }
+                    if (numeric) {
+                        if (llvm::Value* base = genExpr(m->base.get())) {
+                            if (auto* st = llvm::dyn_cast<llvm::StructType>(
+                                    base->getType())) {
+                                if (idx < st->getNumElements())
+                                    return owner_->b_->CreateExtractValue(
+                                        base, {static_cast<unsigned>(idx)},
+                                        "tuple." + m->member);
+                            }
+                        }
+                    }
+                }
+                return nullptr;
+            }
+            case NodeKind::AssignmentExpr: {
+                auto* a = static_cast<AssignmentExpr*>(e);
+                // Field assignment stores through the field's GEP, which keeps
+                // the aggregate's value semantics (write in place, no copy).
+                if (a->lhs && a->lhs->kind == NodeKind::MemberExpr) {
+                    auto* m = static_cast<MemberExpr*>(a->lhs.get());
+                    if (llvm::GEPOperator* fp = owner_->genFieldPtr(m)) {
+                        llvm::Value* v = genExpr(a->rhs.get());
+                        if (v) {
+                            v = owner_->coerce(v, fp->getResultElementType());
+                            if (a->isCompound) {
+                                PunctuatorID cop = a->compoundOp;
+                                llvm::Value* old =
+                                    owner_->b_->CreateLoad(fp->getResultElementType(), fp);
+                                llvm::Value* nv = owner_->coerce(
+                                    owner_->applyCompound(old, cop, v),
+                                    fp->getResultElementType());
+                                owner_->b_->CreateStore(nv, fp);
+                                return nv;
+                            }
+                            const Type* ft = m->semaType;
+                            // Only a property that actually declared observers
+                            // takes this path; everything else falls through to
+                            // the ARC-aware store below.
+                            if (const Type* rt = owner_->selfReceiverType(m->base.get())) {
+                                if (owner_->hasObservers(rt->record, m->member)) {
+                                    // Read the outgoing value so `didSet` can see
+                                    // it, then let the observers bracket the store.
+                                    llvm::Value* oldVal = owner_->b_->CreateLoad(
+                                        fp->getResultElementType(), fp);
+                                    owner_->fireObservers(rt->record, m->member,
+                                        owner_->genAddr(m->base.get()),
+                                        v, fp->getResultElementType(), oldVal);
+                                    owner_->b_->CreateStore(v, fp);
+                                    return v;
+                                }
+                            }
+                            if (ft && owner_->layout_->isReferenceType(ft)) {
+                                llvm::Value* old =
+                                    owner_->b_->CreateLoad(fp->getResultElementType(), fp);
+                                owner_->arcRetainIfRef(v, ft);
+                                owner_->b_->CreateStore(v, fp);
+                                owner_->arcReleaseIfRef(old, ft);
+                            } else {
+                                owner_->b_->CreateStore(v, fp);
+                            }
+                        }
+                        return v;
+                    }
+                    // A computed property has no storage to point at, so the
+                    // assignment must dispatch to its `set` accessor instead of
+                    // emitting a store. The receiver follows the same calling
+                    // convention as a `mutating` method: by pointer (the
+                    // accessor's declared first parameter) for a `mutating`-owning
+                    // value type, otherwise by value. Skipping this path silently
+                    // drops `p.prop = v` on the floor, which is how an unsafe
+                    // pointer's `pointee = x` used to no-op.
+                    if (const Type* bt = owner_->selfReceiverType(m->base.get())) {
+                        if (bt->kind == TypeKind::Named && bt->record) {
+                            std::string key = bt->name + "." + m->member;
+                            auto cit = owner_->computedProps_.find(key);
+                            if (cit != owner_->computedProps_.end() && cit->second) {
+                                llvm::Type* dummy = nullptr;
+                                llvm::Function* setFn = owner_->accessorFn(
+                                    bt->record, m->member,
+                                    AccessorDecl::Kind::Setter, &dummy);
+                                if (setFn) {
+                                    llvm::FunctionType* sfty =
+                                        setFn->getFunctionType();
+                                    bool selfByPointer =
+                                        sfty->getNumParams() &&
+                                        sfty->getParamType(0)->isPointerTy();
+                                    llvm::Value* recv;
+                                    if (selfByPointer &&
+                                        !owner_->layout_->isReferenceType(bt))
+                                        recv = owner_->genAddr(m->base.get());
+                                    else
+                                        recv = genExpr(m->base.get());
+                                    if (!recv) return nullptr;
+                                    llvm::Value* nv = genExpr(a->rhs.get());
+                                    if (!nv) return nullptr;
+                                    nv = owner_->coerce(nv, sfty->getParamType(1));
+                                    owner_->b_->CreateCall(setFn, {recv, nv});
+                                    return nv;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (a->lhs && a->lhs->kind == NodeKind::IdentExpr) {
+                    const std::string& n = static_cast<IdentExpr*>(a->lhs.get())->name;
+                    auto it = owner_->locals_.find(n);
+                    if (it != owner_->locals_.end()) {
+                        llvm::Value* slot = it->second;
+                        // inout 形参：slot 即调用方地址 T*，赋值直接写回该地址，
+                        // 复合赋值先解引用读旧值再写回（规范 3.1）。
+                        if (owner_->inoutLocals_.count(n)) {
+                            llvm::Type* elemTy = (a->lhs->semaType && a->lhs->semaType->element)
+                                ? owner_->layout_->lower(a->lhs->semaType->element) : nullptr;
+                            if (!elemTy) return nullptr;
+                            llvm::Value* v = genExpr(a->rhs.get());
+                            if (v) {
+                                if (a->isCompound) {
+                                    llvm::Value* old = owner_->b_->CreateLoad(elemTy, slot);
+                                    llvm::Value* nv = owner_->coerce(owner_->applyCompound(old, a->compoundOp,
+                                        owner_->coerce(v, elemTy)), elemTy);
+                                    owner_->b_->CreateStore(nv, slot);
+                                    return nv;
+                                }
+                                owner_->b_->CreateStore(owner_->coerce(v, elemTy), slot);
+                            }
+                            return v;
+                        }
+                        // As with a load, the slot may be a captured variable
+                        // reached through the closure context rather than an
+                        // alloca, so fall back to the semantic type.
+                        llvm::Type* sty = nullptr;
+                        if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(slot))
+                            sty = ai->getAllocatedType();
+                        else if (a->lhs->semaType)
+                            sty = owner_->layout_->lower(a->lhs->semaType);
+                        llvm::Value* v = genExpr(a->rhs.get());
+                        if (v && sty) {
+                            if (a->isCompound) {
+                                PunctuatorID cop = a->compoundOp;
+                                // Read-modify-write for `x += y` and friends.
+                                llvm::Value* old = owner_->b_->CreateLoad(sty, slot);
+                                llvm::Value* nv = owner_->coerce(
+                                    owner_->applyCompound(old, cop, owner_->coerce(v, sty)), sty);
+                                owner_->b_->CreateStore(nv, slot);
+                                return nv;
+                            }
+                            const Type* lt = a->lhs->semaType;
+                            if (lt && owner_->layout_->isReferenceType(lt)) {
+                                // Read the outgoing reference before overwriting
+                                // the slot, then release it after the store.
+                                llvm::Value* old = owner_->b_->CreateLoad(sty, slot);
+                                owner_->arcRetainIfRef(v, lt);
+                                owner_->b_->CreateStore(owner_->coerce(v, sty), slot);
+                                owner_->arcReleaseIfRef(old, lt);
+                            } else {
+                                owner_->b_->CreateStore(owner_->coerce(v, sty), slot);
+                            }
+                        }
+                        return v;
+                    }
+                    // A module-level variable is written through its global.
+                    if (auto git = owner_->globalsMap_.find(n); git != owner_->globalsMap_.end()) {
+                        llvm::Value* v = genExpr(a->rhs.get());
+                        if (!v) return nullptr;
+                        llvm::Type* gty = git->second->getValueType();
+                        if (a->isCompound) {
+                            llvm::Value* old = owner_->b_->CreateLoad(gty, git->second);
+                            v = owner_->coerce(owner_->applyCompound(old, a->compoundOp,
+                                                     owner_->coerce(v, gty)), gty);
+                        } else {
+                            v = owner_->coerce(v, gty);
+                        }
+                        owner_->b_->CreateStore(v, git->second);
+                        return v;
+                    }
+                    // `name = expr` inside a method writes the property in place
+                    // through the receiver, which is what makes `mutating`
+                    // methods observable to the caller.
+                    if (llvm::GEPOperator* fp = owner_->genSelfFieldPtr(n)) {
+                        llvm::Value* v = genExpr(a->rhs.get());
+                        if (v) {
+                            v = owner_->coerce(v, fp->getResultElementType());
+                            owner_->b_->CreateStore(v, fp);
+                        }
+                        return v;
+                    }
+                }
+                // 下标写入（规范 3.1）：`a[i] = v` 经运行时 set 写入（数组/字典），
+                // 或经自定义下标的 setter。
+                if (a->lhs && a->lhs->kind == NodeKind::SubscriptExpr) {
+                    auto* sx = static_cast<SubscriptExpr*>(a->lhs.get());
+                    const Type* bt = sx->base ? sx->base->semaType : nullptr;
+                    if (!bt) return genExpr(a->rhs.get());
+                    llvm::Value* recv = genExpr(sx->base.get());
+                    llvm::Value* idx = sx->indices.empty() ? nullptr
+                                                         : genExpr(sx->indices[0].get());
+                    llvm::Value* val = genExpr(a->rhs.get());
+                    if (!recv || !idx || !val) return genExpr(a->rhs.get());
+                    if (bt->kind == TypeKind::Array) {
+                        llvm::Type* aty = owner_->layout_->lower(bt);
+                        const Type* et = bt->element;
+                        llvm::Type* elemTy = et ? owner_->layout_->lower(et)
+                                                : llvm::Type::getInt64Ty(*owner_->ctx_);
+                        llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                        recv = owner_->coerce(recv, llvm::PointerType::getUnqual(aty));
+                        llvm::Value* vptr = owner_->b_->CreateAlloca(elemTy);
+                        owner_->b_->CreateStore(owner_->coerce(val, elemTy), vptr);
+                        owner_->b_->CreateCall(
+                            owner_->declareExternalSig("suki_array_set",
+                                { llvm::PointerType::getUnqual(aty), i64,
+                                  llvm::PointerType::getUnqual(elemTy) },
+                                llvm::Type::getVoidTy(*owner_->ctx_)),
+                            { recv, owner_->coerce(idx, i64), vptr });
+                        return val;
+                    }
+                    if (bt->kind == TypeKind::Named) {
+                        std::string key = bt->name + ".subscript.set";
+                        auto sit = owner_->methodFns_.find(key);
+                        if (sit != owner_->methodFns_.end() && sit->second) {
+                            llvm::Function* sf = sit->second;
+                            llvm::FunctionType* sfty = sf->getFunctionType();
+                            llvm::Value* srecv = nullptr;
+                            bool selfByPointer = sfty->getNumParams() &&
+                                sfty->getParamType(0)->isPointerTy();
+                            if (selfByPointer && !owner_->layout_->isReferenceType(bt))
+                                srecv = owner_->genAddr(sx->base.get());
+                            else
+                                srecv = genExpr(sx->base.get());
+                            if (!srecv) return genExpr(a->rhs.get());
+                            std::vector<llvm::Value*> a2{srecv,
+                                owner_->coerce(idx, sfty->getParamType(1)),
+                                owner_->coerce(val, sfty->getParamType(2))};
+                            return owner_->b_->CreateCall(sf, a2);
+                        }
+                    }
+                    return genExpr(a->rhs.get());
+                }
+                return genExpr(a->rhs.get());
+            }
+            // `move x` (规范 4.3 / 6.4)：所有权转移表达式。语义层已在 Sema 中把
+            // 源标记为 moved（禁止再次使用）；代码生成层面它只产生操作数的右值——
+            // 调用方（如 `return move data`）直接拿到值，源处于“已移走”状态由语义
+            // 约束保证，运行期无需额外动作（值类型按位移动，引用类型转移所有权）。
+            case NodeKind::MoveExpr: {
+                auto* m = static_cast<MoveExpr*>(e);
+                return genExpr(m->operand.get());
+            }
+            default: return nullptr;
+        }
+    }
+
+
+    };
+
+    // 并发 lowering 组件实例（async / Channel / TaskGroup / actor）。
+    ConcurrencyLowerer conc_{this};
+    // 表达式/声明编排组件实例。
+    ExprGen exprGen_{this};
+    // ARC 处理组件实例。
+    ARCPass arc_{this};
+    // 异常 lowering 组件实例。
+    ExceptionLowerer exc_{this};
+    // 类型注册组件实例。
+    TypeRegistry typeReg_{this};
+
     // Lower a semantic type through the shared layout. Returns null when Sema
     // did not annotate the node, letting callers fall back to syntactic
     // inference so older paths keep working.
-    llvm::Type* lowerSema(const Type* t) {
-        if (!t || !layout_) return nullptr;
-        return layout_->lower(t);
-    }
-    // Conservative gate: only scalars take the semaType route for now.
-    // Aggregates and references are lowered by their own dedicated tasks
-    // (struct/enum/class/closure), so they keep the legacy path until then.
-    bool semaIsScalar(const Type* t) {
-        return t && layout_ && !layout_->isAggregate(t) && !layout_->isReferenceType(t);
-    }
-
-    llvm::Type* tyByName(const std::string& n) {
-        auto& C = *ctx_;
-        if (n.empty() || n == "Void") return llvm::Type::getVoidTy(C);
-        if (n == "Bool") return llvm::Type::getInt1Ty(C);
-        if (n == "Int8" || n == "UInt8") return llvm::Type::getInt8Ty(C);
-        if (n == "Int16" || n == "UInt16") return llvm::Type::getInt16Ty(C);
-        if (n == "Int32" || n == "UInt32") return llvm::Type::getInt32Ty(C);
-        if (n == "Int64" || n == "UInt64" || n == "Int" || n == "UInt" ||
-            n == "ISize" || n == "USize")
-            return llvm::Type::getInt64Ty(C);
-        if (n == "Float" || n == "Float32") return llvm::Type::getFloatTy(C);
-        if (n == "Double" || n == "Float64") return llvm::Type::getDoubleTy(C);
-        // String/Char are i8* in the default address space (0). The second
-        // argument of PointerType::get is the *address space*, not a width.
-        if (n == "String" || n == "Char") return llvm::PointerType::get(C, 0);
-        return llvm::Type::getInt64Ty(C);
-    }
+    // 类型下沉/名字解析已迁移至 TypeRegistry，此处为转发桩。
+    llvm::Type* lowerSema(const Type* t) { return typeReg_.lowerSema(t); }
+    bool semaIsScalar(const Type* t) { return typeReg_.semaIsScalar(t); }
+    llvm::Type* tyByName(const std::string& n) { return typeReg_.tyByName(n); }
 
     static std::string typeReprName(Node* t) {
         if (!t) return "";
@@ -130,61 +2822,17 @@ private:
         return sym + ">";
     }
 
+    // 函数声明下沉已迁移至 TypeRegistry，此处为转发桩。
     llvm::Function* declareAs(FunctionDecl* fn, const std::string& symName) {
-        auto it = fns_.find(symName);
-        if (it != fns_.end()) return it->second;
-        bool isMain = (symName == "main") || hasAttr(fn, "main");
-        // `main` is the C entry point: it cannot carry the hidden error slot.
-        const bool throws = fn->isThrows && !isMain;
-        std::vector<llvm::Type*> params;
-        if (!isMain)
-            for (auto& p : fn->params)
-                params.push_back(lowerDeclType(p.semaType, p.type.get()));
-        if (throws) params.push_back(llvm::PointerType::get(*ctx_, 0));
-        // 不透明返回类型（规范 5.5）：优先使用 Sema 推断后改写的函数类型对象
-        // 的 ret（底层具体类型 C），使签名与函数体返回值一致。
-        // 不透明返回类型（规范 5.5）：仅当返回类型为 `some P` 时才优先使用 Sema
-        // 推断出的底层具体类型（fn->semaType->ret）；泛型等仍走 fn->returnType->semaType，
-        // 避免泛型实例化的克隆 fn->semaType 携带泛型 ret 导致签名不匹配。
-        const Type* rt =
-            (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
-             static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
-             fn->semaType && fn->semaType->kind == TypeKind::Function && fn->semaType->ret)
-                ? fn->semaType->ret
-                : (fn->returnType ? fn->returnType->semaType : nullptr);
-        llvm::Type* ret = isMain
-            ? llvm::Type::getInt32Ty(*ctx_)
-            : lowerDeclType(rt, fn->returnType.get());
-        fnThrows_[symName] = throws;
-        llvm::Function* f = llvm::Function::Create(
-            llvm::FunctionType::get(ret, params, false),
-            llvm::GlobalValue::ExternalLinkage, symName, module_.get());
-        // @_cdecl("name")：foreign 函数使用指定的 C 符号名（规范 6.3）。
-        // map 键仍为 fn->name，调用解析不受影响。
-        if (fn->isForeign && !fn->cdeclName.empty()) f->setName(fn->cdeclName);
-        fns_[symName] = f;
-        fnDecls_[fn->name] = fn;
-        pendingBodies_.emplace_back(fn, symName);
-        isMainFns_[symName] = isMain;
-        return f;
+        return typeReg_.declareAs(fn, symName);
     }
-
     llvm::Function* declare(FunctionDecl* fn) {
-        return declareAs(fn, fn->name);
+        return typeReg_.declare(fn);
     }
-
-    // Declare (or reuse) an external function with an explicit signature.
     llvm::Function* declareExternalSig(const std::string& name,
                                        const std::vector<llvm::Type*>& params,
                                        llvm::Type* ret = nullptr) {
-        auto it = fns_.find(name);
-        if (it != fns_.end()) return it->second;
-        llvm::Function* f = llvm::Function::Create(
-            llvm::FunctionType::get(ret ? ret : llvm::Type::getVoidTy(*ctx_),
-                                    params, false),
-            llvm::GlobalValue::ExternalLinkage, name, module_.get());
-        fns_[name] = f;
-        return f;
+        return typeReg_.declareExternalSig(name, params, ret);
     }
 
     llvm::Function* declareExternal(const std::string& name) {
@@ -225,6 +2873,11 @@ private:
 
     // Counter giving every closure body a unique symbol.
     int closureCounter_ = 0;
+    // Counter giving every worker trampoline (`suki_closure_tramp_N`) a unique,
+    // deterministic symbol. A member field (not a function-static) so it resets
+    // per compile and does not accumulate across multiple TU compiled in one
+    // process — a second TU would otherwise see `_3`, `_5`, … instead of `_1`.
+    int trampCounter_ = 0;
     // True while emitting `suki.global_init`: a closure built there outlives
     // the frame, so its capture context must be heap-allocated.
     bool inGlobalInit_ = false;
@@ -317,563 +2970,10 @@ private:
         currentErrorSlot_ = savedErrorSlot;
     }
 
-    void genStmt(Node* s) {
-        if (!s) return;
-        switch (s->kind) {
-            case NodeKind::VarDecl: genVarDecl(static_cast<VarDecl*>(s)); break;
-            case NodeKind::BlockStmt: {
-                // A nested block ends the lifetime of anything it declared.
-                scopeMarks_.push_back(scopeRefs_.size());
-                for (auto& st : static_cast<BlockStmt*>(s)->statements)
-                    genStmt(st.get());
-                scopeMarks_.push_back(scopeRefs_.size());
-                releaseScopeTo(scopeMarks_.back());
-                scopeMarks_.pop_back();
-                scopeMarks_.pop_back();
-                break;
-            }
-                break;
-            case NodeKind::UnsafeStmt: {
-                // `unsafe` 仅影响语义检查（规范 8.6），codegen 直接生成块内语句。
-                auto* us = static_cast<UnsafeStmt*>(s);
-                for (auto& st : us->body) genStmt(st.get());
-                break;
-            }
-            case NodeKind::ExprStmt: genExpr(static_cast<ExprStmt*>(s)->expr.get()); break;
-            case NodeKind::ThrowStmt: genThrow(static_cast<ThrowStmt*>(s)); return;
-            case NodeKind::DoStmt: genDoStmt(static_cast<DoStmt*>(s)); return;
-            case NodeKind::BreakStmt: {
-                // `break` leaves the innermost enclosing loop or switch. The
-                // loops being generated push their exit block, so the target is
-                // simply the top of that stack.
-                if (!breakTargets_.empty()) b_->CreateBr(breakTargets_.back());
-                return;
-            }
-            case NodeKind::ContinueStmt: {
-                // `continue` jumps to the innermost loop's step block (its
-                // increment / condition re-test), not to the top of the body.
-                if (!continueTargets_.empty()) b_->CreateBr(continueTargets_.back());
-                return;
-            }
-            case NodeKind::RepeatWhileStmt: {
-                // `repeat { … } while cond` — the body always runs at least once,
-                // so the condition is tested at the *bottom* of the loop.
-                auto* rw = static_cast<RepeatWhileStmt*>(s);
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*ctx_, "repeat.body", f);
-                llvm::BasicBlock* condBB = llvm::BasicBlock::Create(*ctx_, "repeat.cond", f);
-                llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(*ctx_, "repeat.exit", f);
-                b_->CreateBr(bodyBB);
-                b_->SetInsertPoint(bodyBB);
-                breakTargets_.push_back(exitBB);
-                continueTargets_.push_back(condBB);
-                for (auto& st : rw->body) genStmt(st.get());
-                breakTargets_.pop_back();
-                continueTargets_.pop_back();
-                if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(condBB);
-                b_->SetInsertPoint(condBB);
-                llvm::Value* c = rw->condition ? genExpr(rw->condition.get()) : nullptr;
-                if (!c) { b_->CreateBr(exitBB); b_->SetInsertPoint(exitBB); return; }
-                c = coerce(c, llvm::Type::getInt1Ty(*ctx_));
-                b_->CreateCondBr(c, bodyBB, exitBB);
-                b_->SetInsertPoint(exitBB);
-                return;
-            }
-            case NodeKind::ReturnStmt: {
-                auto* r = static_cast<ReturnStmt*>(s);
-                llvm::Value* v = r->value ? genExpr(r->value.get()) : nullptr;
-                if (v && !currentRet_->isVoidTy()) v = coerce(v, currentRet_);
-                // Scoped references die here; the returned value keeps whatever
-                // reference it already owns, so it is released by the caller.
-                releaseScopeTo(currentScopeMark_);
-        if (currentRet_ && currentRet_->isVoidTy()) { b_->CreateRetVoid(); return; }
-                if (!v) v = llvm::Constant::getNullValue(currentRet_);
-                b_->CreateRet(v);
-                return;
-            }
-            case NodeKind::IfStmt: {
-                auto* ifs = static_cast<IfStmt*>(s);
-                // `if let x = opt { … }`: the condition is a binding, and the
-                // unwrapped value is visible only inside the then-branch.
-                VarDecl* binding = ifs->condition &&
-                                   ifs->condition->kind == NodeKind::VarDecl
-                                       ? static_cast<VarDecl*>(ifs->condition.get())
-                                       : nullptr;
-                llvm::Value* payload = nullptr;
-                // The condition is evaluated *before* any block is created: if
-                // it cannot be lowered we simply skip the statement, and no
-                // orphan block is left behind in the function.
-                llvm::Value* c = binding ? genOptionalBinding(binding, payload)
-                                         : (ifs->condition ? genExpr(ifs->condition.get())
-                                                           : nullptr);
-                if (!c) return;
-                c = coerce(c, llvm::Type::getInt1Ty(*ctx_));
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                auto* tBB = llvm::BasicBlock::Create(*ctx_, "then", f);
-                auto* eBB = llvm::BasicBlock::Create(*ctx_, "else", f);
-                auto* mBB = llvm::BasicBlock::Create(*ctx_, "ifcont", f);
-                b_->CreateCondBr(c, tBB, eBB);
-                b_->SetInsertPoint(tBB);
-                if (binding) bindOptionalPayload(binding, payload);
-                for (auto& st : ifs->thenBody) genStmt(st.get());
-                if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(mBB);
-                b_->SetInsertPoint(eBB);
-                if (ifs->elseBranch) genStmt(ifs->elseBranch.get());
-                if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(mBB);
-                b_->SetInsertPoint(mBB);
-                return;
-            }
-            case NodeKind::GuardStmt: {
-                // `guard cond else { … }` — the else branch must transfer
-                // control, so the fall-through path is the one that continues.
-                auto* g = static_cast<GuardStmt*>(s);
-                VarDecl* binding = g->condition &&
-                                   g->condition->kind == NodeKind::VarDecl
-                                       ? static_cast<VarDecl*>(g->condition.get())
-                                       : nullptr;
-                llvm::Value* payload = nullptr;
-                // As with `if`, the condition is lowered before the blocks are
-                // created so a failure cannot leave orphan blocks behind.
-                llvm::Value* c = binding ? genOptionalBinding(binding, payload)
-                                         : (g->condition ? genExpr(g->condition.get())
-                                                         : nullptr);
-                if (!c) return;
-                c = coerce(c, llvm::Type::getInt1Ty(*ctx_));
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                auto* fBB = llvm::BasicBlock::Create(*ctx_, "guard.cont", f);
-                auto* eBB = llvm::BasicBlock::Create(*ctx_, "guard.else", f);
-                b_->CreateCondBr(c, fBB, eBB);
-                b_->SetInsertPoint(eBB);
-                for (auto& st : g->elseBody) genStmt(st.get());
-                if (!b_->GetInsertBlock()->getTerminator()) {
-                    // Sema requires the else branch to transfer control; if it
-                    // somehow does not, the block must still not fall through
-                    // into the guarded code.
-                    b_->CreateUnreachable();
-                }
-                b_->SetInsertPoint(fBB);
-                if (binding) bindOptionalPayload(binding, payload);
-                return;
-            }
-            case NodeKind::WhileStmt: {
-                auto* w = static_cast<WhileStmt*>(s);
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                auto* cBB = llvm::BasicBlock::Create(*ctx_, "while.cond", f);
-                auto* bBB = llvm::BasicBlock::Create(*ctx_, "while.body", f);
-                auto* xBB = llvm::BasicBlock::Create(*ctx_, "while.exit", f);
-                b_->CreateBr(cBB);
-                b_->SetInsertPoint(cBB);
-                llvm::Value* c = w->condition ? genExpr(w->condition.get()) : nullptr;
-                if (!c) { b_->CreateBr(xBB); b_->SetInsertPoint(xBB); return; }
-                c = coerce(c, llvm::Type::getInt1Ty(*ctx_));
-                b_->CreateCondBr(c, bBB, xBB);
-                b_->SetInsertPoint(bBB);
-                breakTargets_.push_back(xBB);
-                continueTargets_.push_back(cBB);
-                for (auto& st : w->body) genStmt(st.get());
-                breakTargets_.pop_back();
-                continueTargets_.pop_back();
-                if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(cBB);
-                b_->SetInsertPoint(xBB);
-                return;
-            }
-            case NodeKind::ForInStmt: {
-                // `for x in xs` / `for i in a..<b` / `for (k, v) in dict`
-                //
-                // The sequence is evaluated once and spilled to a local, then the
-                // loop walks an index. `break` / `continue` work exactly as in a
-                // `while` loop because the exit / step blocks are pushed on the
-                // loop-target stacks while the body is generated.
-                auto* fr = static_cast<ForInStmt*>(s);
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                // A range's bounds, or the sequence itself, are evaluated before
-                // the loop so that changing them inside cannot affect iteration.
-                llvm::Value* seqSlot = nullptr;
-                // The *value* type behind `seqSlot`. Loading with the slot's own
-                // type would yield the pointer instead of the aggregate, which
-                // then makes element access read through a pointer as if it were
-                // a struct.
-                llvm::Type* seqTy = nullptr;
-                llvm::Value* lo = nullptr;
-                llvm::Value* hi = nullptr;
-                bool halfOpen = true;
-                if (fr->sequence && fr->sequence->kind == NodeKind::RangeExpr) {
-                    auto* r = static_cast<RangeExpr*>(fr->sequence.get());
-                    halfOpen = r->halfOpen;
-                    lo = genExpr(r->lower.get());
-                    hi = genExpr(r->upper.get());
-                    if (lo) lo = coerce(lo, i64);
-                    if (hi) hi = coerce(hi, i64);
-                } else {
-                    llvm::Value* seq = fr->sequence ? genExpr(fr->sequence.get()) : nullptr;
-                    if (!seq) return;
-                    seqTy = seq->getType();
-                    seqSlot = b_->CreateAlloca(seqTy, nullptr, "for.seq");
-                    b_->CreateStore(seq, seqSlot);
-                }
-                // The loop pattern is a VarDecl (one name, or a destructuring
-                // tuple) or a bare TupleExpr (`for (k, v) in dict`).
-                VarDecl* pat = fr->pattern && fr->pattern->kind == NodeKind::VarDecl
-                                   ? static_cast<VarDecl*>(fr->pattern.get())
-                                   : nullptr;
-                std::vector<std::string> names;
-                if (pat) {
-                    if (!pat->tupleNames.empty()) names = pat->tupleNames;
-                    else if (!pat->name.empty()) names.push_back(pat->name);
-                } else if (fr->pattern && fr->pattern->kind == NodeKind::TupleExpr) {
-                    for (auto& el : static_cast<TupleExpr*>(fr->pattern.get())->elements) {
-                        if (!el) { names.emplace_back(); continue; }
-                        if (el->kind == NodeKind::IdentExpr)
-                            names.push_back(static_cast<IdentExpr*>(el.get())->name);
-                        else if (el->kind == NodeKind::VarDecl)
-                            names.push_back(static_cast<VarDecl*>(el.get())->name);
-                        else names.emplace_back();
-                    }
-                }
-                llvm::BasicBlock* headBB = llvm::BasicBlock::Create(*ctx_, "for.head", f);
-                llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*ctx_, "for.body", f);
-                llvm::BasicBlock* stepBB = llvm::BasicBlock::Create(*ctx_, "for.step", f);
-                llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(*ctx_, "for.exit", f);
-                // One counter drives every sequence kind: a range counts up from
-                // its lower bound, a collection from 0 to its length.
-                llvm::Value* idx = b_->CreateAlloca(i64, nullptr, "for.i");
-                b_->CreateStore(lo ? lo : llvm::ConstantInt::get(i64, 0), idx);
-                b_->CreateBr(headBB);
+    void genStmt(Node* s) { exprGen_.genStmt(s); }
 
-                // Element/key/value types come from the sequence's semantic type
-                // when available; without it an i64 slot keeps the IR valid.
-                llvm::Type* elemTy = i64;
-                llvm::Type* keyTy = i64;
-                llvm::Type* valTy = i64;
-                const Type* seqType = fr->sequence ? fr->sequence->semaType : nullptr;
-                if (seqType) {
-                    if (seqType->kind == TypeKind::Array && seqType->element)
-                        elemTy = layout_->lower(seqType->element);
-                    else if (seqType->kind == TypeKind::Set && seqType->element) {
-                        elemTy = layout_->lower(seqType->element);
-                        // A Set is a dictionary whose values are unit-sized, so
-                        // iteration reads its *keys* through `entry_at`.
-                        keyTy = elemTy;
-                    } else if (seqType->kind == TypeKind::Dict) {
-                        if (seqType->key) keyTy = layout_->lower(seqType->key);
-                        if (seqType->value) valTy = layout_->lower(seqType->value);
-                    } else if (seqType->kind == TypeKind::String)
-                        elemTy = llvm::Type::getInt32Ty(*ctx_);
-                }
-
-                b_->SetInsertPoint(headBB);
-                llvm::Value* i = b_->CreateLoad(i64, idx);
-                llvm::Value* more;
-                if (lo && hi) {
-                    // Range: the counter itself is the loop variable.
-                    more = halfOpen ? b_->CreateICmpSLT(i, hi, "for.more")
-                                    : b_->CreateICmpSLE(i, hi, "for.more");
-                } else {
-                    // Collection: the counter indexes the snapshot.
-                    llvm::Value* coll = b_->CreateLoad(seqTy, seqSlot, "for.coll");
-                    llvm::Value* count;
-                    if (isDictAggregate(coll, seqType)) {
-                        // The runtime entry point takes a `const SukiDict*` —
-                        // that is the slot itself. Passing the loaded aggregate
-                        // bit-cast to a pointer would reinterpret the table's
-                        // first bytes as an address.
-                        count = b_->CreateCall(
-                            declareExternalSig("suki_dict_entry_count",
-                                { llvm::PointerType::get(*ctx_, 0) }, i64),
-                            { seqSlot });
-                    } else if (seqType && seqType->kind == TypeKind::String) {
-                        count = b_->CreateCall(
-                            declareExternalSig("suki_str_length",
-                                { layout_->stringTy() }, i64), { coll });
-                    } else {
-                        count = b_->CreateExtractValue(coll, {1}, "for.count");
-                    }
-                    more = b_->CreateICmpSLT(i, count, "for.more");
-                }
-                b_->CreateCondBr(more, bodyBB, exitBB);
-
-                b_->SetInsertPoint(bodyBB);
-                if (lo) {
-                    if (!names.empty()) {
-                        locals_[names[0]] = b_->CreateAlloca(i64, nullptr, names[0]);
-                        b_->CreateStore(i, locals_[names[0]]);
-                    }
-                } else {
-                    llvm::Value* coll = b_->CreateLoad(seqTy, seqSlot, "for.coll");
-                    if (isDictAggregate(coll, seqType)) {
-                        // `for (k, v) in dict` / `for k in dict`: the runtime
-                        // copies the i-th occupied slot into caller buffers.
-                        llvm::Value* keySlot = b_->CreateAlloca(
-                            keyTy, nullptr, names.empty() ? "k" : names[0]);
-                        llvm::Value* valSlot = b_->CreateAlloca(
-                            valTy, nullptr, names.size() > 1 ? names[1] : "v");
-                        b_->CreateCall(
-                            declareExternalSig("suki_dict_entry_at",
-                                { llvm::PointerType::get(*ctx_, 0), i64,
-                                  llvm::PointerType::get(*ctx_, 0),
-                                  llvm::PointerType::get(*ctx_, 0) },
-                                llvm::Type::getInt32Ty(*ctx_)),
-                            { seqSlot, i, keySlot, valSlot });
-                        if (!names.empty()) locals_[names[0]] = keySlot;
-                        if (names.size() > 1) locals_[names[1]] = valSlot;
-                    } else if (seqType && seqType->kind == TypeKind::String) {
-                        // `for c in "abc"`: iterate Unicode scalars.
-                        llvm::Value* scalar = b_->CreateCall(
-                            declareExternalSig("suki_str_utf8_get",
-                                { layout_->stringTy(), llvm::Type::getInt32Ty(*ctx_) },
-                                llvm::Type::getInt32Ty(*ctx_)),
-                            { coll, b_->CreateSExt(i, llvm::Type::getInt32Ty(*ctx_)) });
-                        if (!names.empty()) {
-                            locals_[names[0]] = b_->CreateAlloca(
-                                llvm::Type::getInt32Ty(*ctx_), nullptr, names[0]);
-                            b_->CreateStore(scalar, locals_[names[0]]);
-                        }
-                    } else {
-                        // Array and Set share the `{ data, count, capacity }`
-                        // layout, so one GEP-based fetch covers both.
-                        llvm::Value* data =
-                            b_->CreateExtractValue(coll, {0}, "for.data");
-                        llvm::Value* slot = b_->CreateAlloca(
-                            elemTy, nullptr, names.empty() ? "for.elem" : names[0]);
-                        b_->CreateStore(
-                            b_->CreateLoad(elemTy, b_->CreateGEP(elemTy, data, {i})),
-                            slot);
-                        if (!names.empty()) {
-                            locals_[names[0]] = slot;
-                            trackScopedRef(names[0],
-                                pat && pat->semaType ? pat->semaType : nullptr);
-                        }
-                    }
-                }
-                breakTargets_.push_back(exitBB);
-                continueTargets_.push_back(stepBB);
-                for (auto& st : fr->body) genStmt(st.get());
-                breakTargets_.pop_back();
-                continueTargets_.pop_back();
-                if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(stepBB);
-
-                b_->SetInsertPoint(stepBB);
-                llvm::Value* next = b_->CreateAdd(b_->CreateLoad(i64, idx),
-                                                  llvm::ConstantInt::get(i64, 1));
-                b_->CreateStore(next, idx);
-                b_->CreateBr(headBB);
-                b_->SetInsertPoint(exitBB);
-                return;
-            }
-            case NodeKind::SwitchStmt: {
-                auto* sw = static_cast<SwitchStmt*>(s);
-                // A `select` has no subject — its cases are channel operations, so
-                // it takes a dedicated path rather than a value comparison.
-                if (sw->isSelect) { genSelect(sw); return; }
-                llvm::Value* subject = sw->subject ? genExpr(sw->subject.get()) : nullptr;
-                if (!subject) return;
-                // A payload-carrying enum lowers to `{ tag, payload }`; dispatch on
-                // the tag rather than the whole aggregate.
-                llvm::Value* switchVal = subject;
-                if (llvm::StructType* st = llvm::dyn_cast<llvm::StructType>(
-                        subject->getType())) {
-                    if (st->getNumElements() == 2 &&
-                        st->getElementType(0)->isIntegerTy(64) &&
-                        st->getElementType(1)->isPointerTy()) {
-                        switchVal = b_->CreateExtractValue(subject, {0}, "tag");
-                    }
-                }
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                llvm::BasicBlock* entry = b_->GetInsertBlock();
-                llvm::BasicBlock* merge = llvm::BasicBlock::Create(*ctx_, "sw.cont", f);
-
-                // `fallthrough` must run the *next* arm's body without testing it,
-                // a failing `where` guard must continue with the following cases,
-                // and `case let v` binds the subject — none of which a flat
-                // `switch` instruction can express. The switch is therefore
-                // generated as a chain: tests[i] evaluates case i, bodies[i] runs
-                // its body.
-                std::vector<CaseClause*> arms; // non-default cases, source order
-                CaseClause* defaultArm = nullptr;
-                for (auto& c : sw->cases) {
-                    if (!c || c->kind != NodeKind::CaseClause) continue;
-                    auto* cc = static_cast<CaseClause*>(c.get());
-                    if (cc->isDefault) defaultArm = cc;
-                    else arms.push_back(cc);
-                }
-                // Fast path: a switch whose arms are all plain integer literals
-                // or enum tags (no guard, no binding, no fallthrough) maps
-                // directly onto an LLVM `switch`, which the backend turns into a
-                // jump table. Anything richer falls back to the comparison chain.
-                std::vector<std::pair<int64_t, llvm::BasicBlock*>> armsInt;
-                auto caseTagValue = [this](CaseClause* cc) -> int64_t {
-                    if (!cc || cc->whereExpr || cc->isBindingPattern ||
-                        !cc->bindings.empty() || !cc->alternatives.empty() ||
-                        endsWithFallthrough(cc) || !cc->pattern)
-                        return -1;
-                    if (cc->pattern->kind == NodeKind::IntLitExpr)
-                        return parseIntLiteral(static_cast<IntLitExpr*>(cc->pattern.get())->value);
-                    if (cc->pattern->kind == NodeKind::MemberExpr)
-                        return enumCaseTag(static_cast<MemberExpr*>(cc->pattern.get()));
-                    return -1;
-                };
-                bool intSwitch = !arms.empty() && switchVal->getType()->isIntegerTy() &&
-                                 switchVal->getType()->getIntegerBitWidth() <= 64;
-                for (CaseClause* cc : arms) {
-                    if (caseTagValue(cc) < 0) { intSwitch = false; break; }
-                }
-                if (intSwitch) {
-                    llvm::BasicBlock* defTarget = merge;
-                    if (defaultArm) {
-                        defTarget = llvm::BasicBlock::Create(*ctx_, "sw.default", f);
-                        b_->SetInsertPoint(defTarget);
-                        bindCaseBindings(defaultArm, subject);
-                        for (auto& st : defaultArm->body) genStmt(st.get());
-                        if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(merge);
-                    }
-                    for (CaseClause* cc : arms) {
-                        llvm::BasicBlock* armBB =
-                            llvm::BasicBlock::Create(*ctx_, "sw.arm", f);
-                        b_->SetInsertPoint(armBB);
-                        for (auto& st : cc->body) genStmt(st.get());
-                        if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(merge);
-                        armsInt.push_back({caseTagValue(cc), armBB});
-                    }
-                    b_->SetInsertPoint(entry);
-                    llvm::SwitchInst* si = b_->CreateSwitch(
-                        switchVal, defTarget, static_cast<unsigned>(armsInt.size()));
-                    for (auto& kv : armsInt) {
-                        si->addCase(llvm::cast<llvm::ConstantInt>(
-                                        llvm::ConstantInt::get(switchVal->getType(),
-                                                              kv.first)),
-                                    kv.second);
-                    }
-                    b_->SetInsertPoint(merge);
-                    return;
-                }
-                std::vector<llvm::BasicBlock*> tests, bodies;
-                for (size_t i = 0; i < arms.size(); ++i) {
-                    tests.push_back(llvm::BasicBlock::Create(*ctx_, "sw.test", f));
-                    bodies.push_back(llvm::BasicBlock::Create(*ctx_, "sw.arm", f));
-                }
-                // Body block of the default arm; created lazily below.
-                llvm::BasicBlock* defBody = defaultArm
-                    ? llvm::BasicBlock::Create(*ctx_, "sw.default", f)
-                    : nullptr;
-                // A failed test continues with the next case, then the default,
-                // then leaves the switch.
-                auto continuation = [&](size_t i) -> llvm::BasicBlock* {
-                    if (i + 1 < tests.size()) return tests[i + 1];
-                    return defBody ? defBody : merge;
-                };
-
-                // Emit one arm: bind the pattern, honour `where`, run the body.
-                for (size_t i = 0; i < arms.size(); ++i) {
-                    CaseClause* cc = arms[i];
-                    b_->SetInsertPoint(bodies[i]);
-                    bindCaseBindings(cc, subject);
-                    if (cc->whereExpr) {
-                        llvm::BasicBlock* okBB = llvm::BasicBlock::Create(*ctx_, "sw.ok", f);
-                        llvm::Value* w = genExpr(cc->whereExpr.get());
-                        b_->CreateCondBr(w ? toBool(w) : trueVal(), okBB,
-                                         i + 1 < bodies.size() ? bodies[i + 1]
-                                                               : (defBody ? defBody : merge));
-                        b_->SetInsertPoint(okBB);
-                    }
-                    for (auto& st : cc->body) genStmt(st.get());
-                    if (!b_->GetInsertBlock()->getTerminator()) {
-                        // `fallthrough`（必须是本 arm 的最后一条语句）直接进入下一
-                        // 个 arm 的 body，跳过其匹配测试；否则进入 merge。
-                        llvm::BasicBlock* next = i + 1 < bodies.size() ? bodies[i + 1]
-                                                    : (defBody ? defBody : merge);
-                        b_->CreateBr(endsWithFallthrough(cc) ? next : merge);
-                    }
-                }
-                if (defaultArm) {
-                    b_->SetInsertPoint(defBody);
-                    bindCaseBindings(defaultArm, subject);
-                    if (defaultArm->whereExpr) {
-                        llvm::BasicBlock* okBB = llvm::BasicBlock::Create(*ctx_, "sw.ok", f);
-                        llvm::Value* w = genExpr(defaultArm->whereExpr.get());
-                        b_->CreateCondBr(w ? toBool(w) : trueVal(), okBB, merge);
-                        b_->SetInsertPoint(okBB);
-                    }
-                    for (auto& st : defaultArm->body) genStmt(st.get());
-                    if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(merge);
-                }
-                // The chain is entered from the block the switch appears in. The
-                // entry jump must be emitted *before* walking the test blocks,
-                // since emitting a test moves the insertion point.
-                b_->SetInsertPoint(entry);
-                if (!tests.empty()) b_->CreateBr(tests[0]);
-                else if (defBody) b_->CreateBr(defBody);
-                else b_->CreateBr(merge);
-                for (size_t i = 0; i < arms.size(); ++i) {
-                    b_->SetInsertPoint(tests[i]);
-                    llvm::Value* cond = genCaseCondition(arms[i], switchVal);
-                    b_->CreateCondBr(cond ? cond : trueVal(), bodies[i],
-                                     continuation(i));
-                }
-                b_->SetInsertPoint(merge);
-                return;
-            }
-            default: genExpr(s); break;
-        }
-    }
-
-    void genVarDecl(VarDecl* vd) {
-        // 元组解构 `let (a, b) = (1, 2)`：为每个名字建槽，逐分量 extract。
-        if (!vd->tupleNames.empty()) {
-            llvm::Value* init = vd->initializer ? genExpr(vd->initializer.get()) : nullptr;
-            llvm::Type* ity = init ? init->getType() : llvm::Type::getInt64Ty(*ctx_);
-            auto* ist = llvm::dyn_cast<llvm::StructType>(ity);
-            if (!ist) return;
-            for (size_t i = 0; i < vd->tupleNames.size(); ++i) {
-                unsigned idx = static_cast<unsigned>(i);
-                if (idx >= ist->getNumElements()) break;
-                llvm::Type* et = ist->getElementType(idx);
-                llvm::Value* slot = b_->CreateAlloca(et, nullptr, vd->tupleNames[i]);
-                b_->CreateStore(b_->CreateExtractValue(init, {idx}), slot);
-                locals_[vd->tupleNames[i]] = slot;
-            }
-            return;
-        }
-        llvm::Value* init = vd->initializer ? genExpr(vd->initializer.get()) : nullptr;
-        // Prefer the analyser-resolved type; fall back to syntactic inference.
-        llvm::Type* ty = nullptr;
-        const Type* st = vd->semaType;
-        // The analyser-resolved type is authoritative for every type: taking
-        // aggregates through a name-based fallback would allocate the wrong
-        // slot size (e.g. an Array declared as `[Int]` would get an i64 slot
-        // and overflow the stack).
-        if (st && layout_) ty = layout_->lower(st);
-        if (!ty) {
-            std::string tname = typeReprName(vd->type.get());
-            ty = tname.empty() ? (init ? init->getType()
-                                       : llvm::Type::getInt64Ty(*ctx_))
-                               : tyByName(tname);
-        }
-        if (init) init = coerce(init, ty);
-        // Binding an existing reference to a new variable shares ownership, so
-        // the variable takes its own reference. A freshly constructed object is
-        // the exception: its count already starts at 1, so retaining it here
-        // would leak.
-        bool needsRetain = false;
-        if (init && vd->semaType && layout_->isReferenceType(vd->semaType) &&
-            vd->initializer) {
-            Node* src = vd->initializer.get();
-            bool isConstruction = false;
-            if (src->kind == NodeKind::CallExpr) {
-                auto* ce = static_cast<CallExpr*>(src);
-                if (ce->callee && ce->callee->kind == NodeKind::IdentExpr)
-                    isConstruction = classTypes_.count(
-                        static_cast<IdentExpr*>(ce->callee.get())->name) > 0;
-            }
-            needsRetain = !isConstruction;
-        }
-        if (needsRetain) arcRetainIfRef(init, vd->semaType);
-        llvm::Value* slot = b_->CreateAlloca(ty, nullptr, vd->name);
-        if (init) b_->CreateStore(init, slot);
-        locals_[vd->name] = slot;
-        // A strong reference held by this local must be given back at scope exit.
-        trackScopedRef(vd->name, vd->semaType);
-    }
+    // 变量声明生成已迁移至 ExprGen，此处为转发桩。
+    void genVarDecl(VarDecl* vd) { exprGen_.genVarDecl(vd); }
 
     // Tag value of an `Enum.case` member reference, or -1 when the expression is
     // not an enum case. Raw-valued enums are represented purely by their tag.
@@ -937,9 +3037,9 @@ private:
     // resolved is authoritative: a syntactic name cannot express aggregate
     // layout, so `Shape` would otherwise be indistinguishable from an integer.
     // The syntactic name remains as a fallback for unannotated code.
+    // 声明类型下沉已迁移至 TypeRegistry，此处为转发桩。
     llvm::Type* lowerDeclType(const Type* sema, Node* typeRepr) {
-        if (sema) return layout_->lower(sema);
-        return tyByName(typeReprName(typeRepr));
+        return typeReg_.lowerDeclType(sema, typeRepr);
     }
 
     // LLVM struct type holding one case's payload fields, created on demand.
@@ -955,47 +3055,9 @@ private:
 
     // ── switch support ──────────────────────────────────────────────────────
 
-    // Explicit numeric/string conversion (`Int(x)`, `Double(n)`, `Char("A")`).
-    // Unlike the implicit `coerce`, a cast to a narrower integer truncates and a
-    // cast to `String` goes through the runtime formatter.
+    // 强制转换已迁移至 TypeRegistry，此处为转发桩。
     llvm::Value* coerceForCast(llvm::Value* v, llvm::Type* target, const Type* to) {
-        if (!v || !target) return v;
-        llvm::Type* from = v->getType();
-        if (from == target) return v;
-        if (target->isIntegerTy() && from->isIntegerTy()) {
-            unsigned fb = from->getIntegerBitWidth(), tb = target->getIntegerBitWidth();
-            // Char is a Unicode scalar (i32) and must not be sign-extended
-            // through a signed 8/16-bit detour; widen from the source directly.
-            return fb < tb ? b_->CreateZExt(v, target) : b_->CreateTrunc(v, target);
-        }
-        if (target->isFloatingPointTy() && from->isIntegerTy())
-            return b_->CreateSIToFP(v, target);
-        if (target->isIntegerTy() && from->isFloatingPointTy())
-            return b_->CreateFPToSI(v, target);
-        // `Int("42")` / `Double("1.5")`: parse the String through the runtime.
-        if ((target->isIntegerTy() || target->isFloatingPointTy()) && from->isStructTy()) {
-            llvm::Type* sty = layout_->stringTy();
-            if (from == sty) {
-                bool wantFloat = target->isFloatingPointTy();
-                llvm::Function* f = declareExternalSig(
-                    wantFloat ? "suki_str_to_double" : "suki_str_to_int",
-                    { sty },
-                    wantFloat ? llvm::Type::getDoubleTy(*ctx_)
-                              : llvm::Type::getInt64Ty(*ctx_));
-                llvm::Value* r = b_->CreateCall(f, { v });
-                return coerce(r, target);
-            }
-        }
-        // `String(x)` from a scalar: format through the runtime. A Char (i32)
-        // renders as the character itself, an integer as its digits.
-        if (target->isStructTy() && from->isIntegerTy()) {
-            bool fromChar = from->getIntegerBitWidth() == 32;
-            llvm::Function* f = declareExternalSig(
-                fromChar ? "suki_char_to_string" : "suki_int_to_string",
-                { llvm::Type::getInt64Ty(*ctx_) }, layout_->stringTy());
-            return b_->CreateCall(f, { coerce(v, llvm::Type::getInt64Ty(*ctx_)) });
-        }
-        return coerce(v, target);
+        return typeReg_.coerceForCast(v, target, to);
     }
 
     // The i1 constant `true` (IRBuilder has no CreateTrue in LLVM 18).
@@ -1384,29 +3446,11 @@ private:
     // at 1), so *sharing* an existing reference means retain and *overwriting*
     // a location means releasing what it held before. Both runtime entry points
     // use acquire/release ordering internally, never relaxed.
-    llvm::Function* arcRetain() {
-        llvm::Type* p = llvm::PointerType::get(*ctx_, 0);
-        return declareExternalSig("suki_arc_retain", { p },
-                                  llvm::Type::getInt64Ty(*ctx_));
-    }
-
-    llvm::Function* arcRelease() {
-        llvm::Type* p = llvm::PointerType::get(*ctx_, 0);
-        return declareExternalSig("suki_arc_release", { p },
-                                  llvm::Type::getInt64Ty(*ctx_));
-    }
-
-    // Retain/release only managed references; anything else is a no-op, so
-    // callers may pass any value.
-    void arcRetainIfRef(llvm::Value* v, const Type* t) {
-        if (!v || !t || !layout_->isReferenceType(t)) return;
-        b_->CreateCall(arcRetain(), { v });
-    }
-
-    void arcReleaseIfRef(llvm::Value* v, const Type* t) {
-        if (!v || !t || !layout_->isReferenceType(t)) return;
-        b_->CreateCall(arcRelease(), { v });
-    }
+    // ARC 处理已迁移至 ARCPass 组件，此处为转发桩。
+    llvm::Function* arcRetain() { return arc_.arcRetain(); }
+    llvm::Function* arcRelease() { return arc_.arcRelease(); }
+    void arcRetainIfRef(llvm::Value* v, const Type* t) { arc_.arcRetainIfRef(v, t); }
+    void arcReleaseIfRef(llvm::Value* v, const Type* t) { arc_.arcReleaseIfRef(v, t); }
 
     // A compound assignment (`x += y`) reads the current value, applies the
     // binary operator, and writes the result back. The AST stores the operator
@@ -1520,991 +3564,11 @@ private:
         return b_->CreateLoad(sty, slot);
     }
 
+    // 隐式类型强制已迁移至 TypeRegistry，此处为转发桩。
     llvm::Value* coerce(llvm::Value* v, llvm::Type* to) {
-        if (!v || !to) return v;
-        llvm::Type* from = v->getType();
-        if (from == to) return v;
-        if (to->isIntegerTy() && from->isIntegerTy()) {
-            unsigned fb = from->getIntegerBitWidth(), tb = to->getIntegerBitWidth();
-            if (fb < tb) return b_->CreateSExt(v, to);
-            if (fb > tb) return b_->CreateTrunc(v, to);
-            return v;
-        }
-        if (to->isFloatingPointTy() && from->isIntegerTy()) return b_->CreateSIToFP(v, to);
-        if (to->isIntegerTy() && from->isFloatingPointTy()) return b_->CreateFPToSI(v, to);
-        if (to->isFloatingPointTy() && from->isFloatingPointTy()) return b_->CreateFPExt(v, to);
-        // A value (scalar or aggregate) landing in a pointer-typed slot is
-        // boxed: Optional's payload is a pointer for aggregates, so `coerce(v,
-        // ptr)` has to copy `v` onto the heap and hand back its address.
-        if (to->isPointerTy() && !from->isPointerTy()) {
-            llvm::Value* slot = b_->CreateAlloca(from, nullptr, "box");
-            b_->CreateStore(v, slot);
-            return b_->CreatePointerCast(slot, to);
-        }
-        return v;
+        return typeReg_.coerce(v, to);
     }
-
-    llvm::Value* genExpr(Node* e) {
-        if (!e) return nullptr;
-        switch (e->kind) {
-            case NodeKind::IntLitExpr: {
-                return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_),
-                    parseIntLiteral(static_cast<IntLitExpr*>(e)->value));
-            }
-            case NodeKind::FloatLitExpr:
-                return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*ctx_),
-                    std::strtod(static_cast<FloatLitExpr*>(e)->value.c_str(), nullptr));
-            case NodeKind::BoolLitExpr:
-                return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*ctx_),
-                                              static_cast<BoolLitExpr*>(e)->value ? 1 : 0);
-            case NodeKind::StrLitExpr: {
-                // A String value is `{ i8* data, i64 length }`, not a bare
-                // pointer: the length is what makes embedded NUL bytes and
-                // slice/UTF-8 operations well defined.
-                auto* s = static_cast<StrLitExpr*>(e);
-                llvm::Type* sty = layout_->stringTy();
-                auto makeStr = [&](const std::string& text) -> llvm::Value* {
-                    llvm::Value* p = b_->CreateGlobalStringPtr(text);
-                    llvm::Value* v = llvm::UndefValue::get(sty);
-                    v = b_->CreateInsertValue(v, p, {0});
-                    v = b_->CreateInsertValue(
-                        v, llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_),
-                                                  static_cast<uint64_t>(text.size())),
-                        {1});
-                    return v;
-                };
-                if (s->expressions.empty()) {
-                    std::string all;
-                    for (auto& seg : s->segments) all += seg;
-                    // In a `Char`-typed context a one-scalar string literal
-                    // denotes a character (规范 1.5): the value is the Unicode
-                    // scalar (i32), not a String.
-                    if (e->semaType && e->semaType->kind == TypeKind::Char)
-                        return charScalarOf(makeStr(all));
-                    return makeStr(all);
-                }
-                // Interpolated literal: fold `segments[i] + expr[i] + ...` with
-                // runtime concatenation so any length is handled.
-                llvm::Function* cat = declareExternalSig(
-                    "suki_str_concat", {sty, sty}, sty);
-                llvm::Value* acc = makeStr(s->segments.empty() ? "" : s->segments[0]);
-                for (size_t i = 0; i < s->expressions.size(); ++i) {
-                    llvm::Value* ev = genExpr(s->expressions[i].get());
-                    if (ev) acc = b_->CreateCall(cat, {acc, interpolateToString(ev)});
-                    if (i + 1 < s->segments.size())
-                        acc = b_->CreateCall(cat, {acc, makeStr(s->segments[i + 1])});
-                }
-                return acc;
-            }
-            case NodeKind::IdentExpr: {
-                const std::string& n = static_cast<IdentExpr*>(e)->name;
-                auto it = locals_.find(n);
-                if (it != locals_.end()) {
-                    // A local slot is usually an alloca, but a captured
-                    // variable inside a closure body is a pointer produced by
-                    // reinterpreting the capture context, so its element type
-                    // has to be recovered from the semantic type instead of
-                    // assuming the value is an AllocaInst.
-                    llvm::Value* slot = it->second;
-                    // inout 形参：槽中存放的是调用方地址 T*，读取时需再解引用
-                    // 一次得到值（规范 3.1）。赋值时 genAddr 直接返回该地址，
-                    // 从而写回调用方的变量。
-                    if (inoutLocals_.count(n)) {
-                        // inout 形参：槽中存放调用方地址 T*，需多解引用一次取值。
-                        llvm::Type* pty = slot->getType();
-                        if (!pty->isPointerTy()) return nullptr;
-                        llvm::Type* elemTy = (e->semaType && e->semaType->element)
-                            ? layout_->lower(e->semaType->element) : nullptr;
-                        if (!elemTy) return nullptr;
-                        llvm::Value* addr = b_->CreateLoad(pty, slot);
-                        return b_->CreateLoad(elemTy, addr);
-                    }
-                    llvm::Type* slotTy = nullptr;
-                    if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(slot))
-                        slotTy = ai->getAllocatedType();
-                    else if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(slot))
-                        slotTy = gv->getValueType();
-                    else if (e->semaType)
-                        slotTy = layout_->lower(e->semaType);
-                    if (!slotTy) return nullptr;
-                    return b_->CreateLoad(slotTy, slot);
-                }
-                auto f = fns_.find(n);
-                if (f != fns_.end()) return f->second;
-                // A module-level variable is a global. It is looked up before
-                // the implicit-`self` fallback, so a global is not mistaken for
-                // a property of the enclosing type.
-                {
-                    auto git = globalsMap_.find(n);
-                    if (git != globalsMap_.end())
-                        return b_->CreateLoad(git->second->getValueType(),
-                                              git->second, n);
-                }
-                // Inside a method body a bare property name means `self.name`
-                // (Sema resolves it the same way).
-                if (llvm::Value* fld = genImplicitSelfField(n)) return fld;
-                return nullptr;
-            }
-            case NodeKind::ParenExpr:
-                return genExpr(static_cast<ParenExpr*>(e)->expr.get());
-            case NodeKind::ForceUnwrapExpr:
-                return genExpr(static_cast<UnaryExpr*>(e)->operand.get());
-            case NodeKind::OptionalChainExpr:
-                // `x?` promotes a value to Optional. The body keeps its own
-                // type; only the declared type of the binding changes, so the
-                // value is passed through (the flag is set where it is stored).
-                return genExpr(static_cast<OptionalChainExpr*>(e)->expr.get());
-            case NodeKind::UnaryExpr: {
-                auto* u = static_cast<UnaryExpr*>(e);
-                // `try?` turns a thrown error into nil instead of propagating
-                // it (规范 9.2): the error is captured, then folded into the
-                // Optional result.
-                if (u->isOptionalTry) {
-                    llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-                    llvm::Value* slot = b_->CreateAlloca(i8p, nullptr, "try.slot");
-                    b_->CreateStore(llvm::ConstantPointerNull::get(i8p), slot);
-                    llvm::Value* saved = optionalTrySlot_;
-                    optionalTrySlot_ = slot;
-                    llvm::Value* v = genExpr(u->operand.get());
-                    optionalTrySlot_ = saved;
-                    llvm::Value* err = b_->CreateLoad(i8p, slot, "try.err");
-                    llvm::Value* failed = b_->CreateIsNotNull(err, "try.failed");
-                    llvm::Type* optTy = e->semaType && e->semaType->kind == TypeKind::Optional
-                                            ? layout_->lower(e->semaType)
-                                            : (v ? layout_->optionalTy(v->getType()) : nullptr);
-                    if (!optTy) return nullptr;
-                    llvm::Type* payloadTy = optTy->getStructElementType(0);
-                    llvm::Value* some = llvm::UndefValue::get(optTy);
-                    some = b_->CreateInsertValue(
-                        some, v ? coerce(v, payloadTy)
-                                : llvm::Constant::getNullValue(payloadTy), {0});
-                    some = b_->CreateInsertValue(some, trueVal(), {1});
-                    llvm::Value* none = llvm::Constant::getNullValue(optTy);
-                    return b_->CreateSelect(failed, none, some);
-                }
-                // `try!` asserts that nothing is thrown: an error panics.
-                if (u->isForcedTry) {
-                    llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-                    llvm::Value* slot = b_->CreateAlloca(i8p, nullptr, "try.slot");
-                    b_->CreateStore(llvm::ConstantPointerNull::get(i8p), slot);
-                    llvm::Value* saved = optionalTrySlot_;
-                    optionalTrySlot_ = slot;
-                    llvm::Value* v = genExpr(u->operand.get());
-                    optionalTrySlot_ = saved;
-                    llvm::Value* err = b_->CreateLoad(i8p, slot, "try.err");
-                    llvm::Value* failed = b_->CreateIsNotNull(err, "try.failed");
-                    llvm::Function* f = b_->GetInsertBlock()->getParent();
-                    llvm::BasicBlock* bad = llvm::BasicBlock::Create(*ctx_, "try.bang.fail", f);
-                    llvm::BasicBlock* ok = llvm::BasicBlock::Create(*ctx_, "try.bang.cont", f);
-                    b_->CreateCondBr(failed, bad, ok);
-                    b_->SetInsertPoint(bad);
-                    b_->CreateCall(declareExternalSig("panic", { i8p }),
-                                   { b_->CreateGlobalStringPtr(
-                                       "try! unexpectedly raised an error") });
-                    b_->CreateUnreachable();
-                    b_->SetInsertPoint(ok);
-                    return v;
-                }
-                llvm::Value* v = genExpr(u->operand.get());
-                if (!v) return nullptr;
-                // `try` passes the operand value through unchanged. `await` expects a
-                // Future handle (i8*) already produced by the async call and unboxes
-                // the boxed result of the awaited type.
-                if (u->isTry) return v;
-                if (u->isAwait) {
-                    if (!v) return nullptr;
-                    llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-                    llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-                    llvm::Function* awaitFn = declareExternalSig(
-                        "suki_future_await", { i8p, i8p }, voidTy);
-                    llvm::Function* freeFn = declareExternalSig(
-                        "suki_future_free", { i8p }, voidTy);
-                    const Type* rt = u->semaType;
-                    if (!rt || rt->kind == TypeKind::Void ||
-                        rt->kind == TypeKind::Unknown) {
-                        // Awaiting a `Void` async call still waits for completion,
-                        // then releases the handle; no value is produced.
-                        llvm::Value* tmp = b_->CreateAlloca(
-                            llvm::Type::getInt64Ty(*ctx_), nullptr, "await.void");
-                        b_->CreateCall(awaitFn, { v, b_->CreateBitCast(tmp, i8p) });
-                        b_->CreateCall(freeFn, { v });
-                        return llvm::Constant::getNullValue(
-                            llvm::Type::getInt32Ty(*ctx_));
-                    }
-                    llvm::Type* rty = layout_->lower(rt);
-                    if (!rty) return nullptr;
-                    llvm::Value* out = b_->CreateAlloca(rty, nullptr, "awaited");
-                    b_->CreateCall(awaitFn, { v, b_->CreateBitCast(out, i8p) });
-                    b_->CreateCall(freeFn, { v });
-                    return b_->CreateLoad(rty, out);
-                }
-                switch (u->op) {
-                    case PunctuatorID::Minus:
-                        return v->getType()->isFloatingPointTy() ? b_->CreateFNeg(v)
-                                                                 : b_->CreateNeg(v);
-                    case PunctuatorID::Bang:
-                        return b_->CreateNot(coerce(v, llvm::Type::getInt1Ty(*ctx_)));
-                    case PunctuatorID::Tilde: return b_->CreateNot(v);
-                    // `&x` 取地址：inout 参数据此按引用传递（规范 3.1）。
-                    case PunctuatorID::Amp: return genAddr(u->operand.get());
-                    default: return v;
-                }
-            }
-            case NodeKind::BinaryExpr: {
-                auto* b = static_cast<BinaryExpr*>(e);
-                // `x == nil` / `x != nil` compares an Optional's flag rather
-                // than its payload: `nil` has no value of its own to compare.
-                if ((b->op == PunctuatorID::EqualEqual ||
-                     b->op == PunctuatorID::BangEqual) && b->lhs && b->rhs) {
-                    Node* nilSide = b->rhs->kind == NodeKind::NilLitExpr ? b->rhs.get()
-                                  : b->lhs->kind == NodeKind::NilLitExpr ? b->lhs.get()
-                                                                         : nullptr;
-                    if (nilSide) {
-                        Node* other = nilSide == b->rhs.get() ? b->lhs.get() : b->rhs.get();
-                        if (llvm::Value* v = genExpr(other)) {
-                            if (isOptionalShape(v->getType())) {
-                                llvm::Value* has = b_->CreateExtractValue(v, {1}, "hasValue");
-                                // `!= nil` is "has a value"; `== nil` is its negation.
-                                return b->op == PunctuatorID::BangEqual
-                                           ? has : b_->CreateNot(has, "isNil");
-                            }
-                            // A reference type is nil exactly when the pointer is null.
-                            if (v->getType()->isPointerTy()) {
-                                llvm::Value* nonNull = b_->CreateIsNotNull(v, "nonNull");
-                                return b->op == PunctuatorID::BangEqual
-                                           ? nonNull : b_->CreateNot(nonNull, "isNil");
-                            }
-                        }
-                    }
-                }
-                // `+` on Strings is concatenation, not arithmetic.
-                if (b->op == PunctuatorID::Plus && b->lhs && b->rhs &&
-                    b->lhs->semaType && b->rhs->semaType &&
-                    b->lhs->semaType->kind == TypeKind::String &&
-                    b->rhs->semaType->kind == TypeKind::String) {
-                    llvm::Value* l = genExpr(b->lhs.get());
-                    llvm::Value* r = genExpr(b->rhs.get());
-                    if (!l || !r) return nullptr;
-                    llvm::Type* sty = layout_->stringTy();
-                    return b_->CreateCall(
-                        declareExternalSig("suki_str_concat",
-                                           {sty, sty}, sty),
-                        {coerce(l, sty), coerce(r, sty)});
-                }
-                return genBinary(b);
-            }
-            case NodeKind::ClosureExpr:
-                return emitClosure(static_cast<ClosureExpr*>(e));
-            case NodeKind::CallExpr: {
-                // A built-in scalar type in callee position is a conversion:
-                // `Int(x)`, `Double(n)`, `Char("A")`. Sema has already typed the
-                // expression as the target type; here it becomes the actual cast.
-                if (auto* c = static_cast<CallExpr*>(e);
-                    c->callee && c->callee->kind == NodeKind::IdentExpr &&
-                    c->arguments.size() == 1 && e->semaType) {
-                    const std::string& n =
-                        static_cast<IdentExpr*>(c->callee.get())->name;
-                    static const char* kScalars[] = {
-                        "Int", "UInt", "Int8", "Int16", "Int32", "Int64", "UInt8",
-                        "UInt16", "UInt32", "UInt64", "Float", "Double", "Char",
-                        "Bool", "String"};
-                    bool isScalar = false;
-                    for (const char* s : kScalars)
-                        if (n == s) { isScalar = true; break; }
-                    if (isScalar && !classTypes_.count(n)) {
-                        llvm::Value* v = genExpr(c->arguments[0].get());
-                        if (!v) return nullptr;
-                        llvm::Type* target = layout_->lower(e->semaType);
-                        // Char keeps its i32 width; other scalars coerce to their
-                        // declared width (i64 for Int, i32 for Int8, ...).
-                        if (target->isIntegerTy() && target->getIntegerBitWidth() == 32 &&
-                            e->semaType->kind != TypeKind::Char) {
-                            // A narrower integer keeps its own width; the value
-                            // is sign/zero extended by coerce below.
-                        }
-                        return coerceForCast(v, target, e->semaType);
-                    }
-                }
-                // `Enum.case(payload...)` builds a tagged union: a tag plus a
-                // heap box holding the case's payload fields.
-                if (auto* c = static_cast<CallExpr*>(e);
-                    c->callee && c->callee->kind == NodeKind::MemberExpr) {
-                    auto* m = static_cast<MemberExpr*>(c->callee.get());
-                    int64_t tag = -1;
-                    if (const TypeRecord* rec = enumCaseOf(m, &tag)) {
-                        const Type* et = nullptr;
-                        if (m->base && m->base->kind == NodeKind::IdentExpr) {
-                            const std::string& bn =
-                                static_cast<IdentExpr*>(m->base.get())->name;
-                            auto eit = enumTypes_.find(bn);
-                            if (eit != enumTypes_.end()) et = eit->second;
-                        }
-                        llvm::Type* ety = et ? layout_->lower(et) : llvm::Type::getInt64Ty(*ctx_);
-                        llvm::Value* boxed = nullptr;
-                        if (llvm::StructType* pt = casePayloadType(rec, (size_t)tag)) {
-                            llvm::Value* buf = b_->CreateAlloca(pt, nullptr, "payload");
-                            for (size_t i = 0; i < c->arguments.size(); ++i) {
-                                llvm::Value* av = genExpr(c->arguments[i].get());
-                                if (!av) continue;
-                                unsigned fi = static_cast<unsigned>(i);
-                                if (fi >= pt->getNumElements()) break;
-                                b_->CreateStore(av, b_->CreateStructGEP(
-                                    pt, buf, fi));
-                            }
-                            boxed = b_->CreateBitCast(
-                                buf, llvm::PointerType::get(*ctx_, 0));
-                        }
-                        llvm::Value* v = llvm::UndefValue::get(ety);
-                        v = b_->CreateInsertValue(v, tagConstant(tag), {0});
-                        v = b_->CreateInsertValue(v,
-                            boxed ? boxed
-                                  : llvm::ConstantPointerNull::get(
-                                        llvm::PointerType::get(*ctx_, 0)), {1});
-                        return v;
-                    }
-                }
-                return genCall(static_cast<CallExpr*>(e));
-            }
-            case NodeKind::ArrayLitExpr: {
-                // Build via repeated runtime push so one code path serves both
-                // literals and `append`.
-                auto* a = static_cast<ArrayLitExpr*>(e);
-                llvm::Type* aty = layout_->lower(a->semaType);
-                if (!aty || !aty->isStructTy()) return nullptr;
-                const Type* elemT = a->semaType && a->semaType->kind == TypeKind::Array
-                    ? a->semaType->element : nullptr;
-                llvm::Type* elemTy = elemT ? layout_->lower(elemT)
-                                           : llvm::Type::getInt64Ty(*ctx_);
-                int64_t esz = sizeOf(elemTy);
-                llvm::Value* cap = llvm::ConstantInt::get(
-                    llvm::Type::getInt64Ty(*ctx_),
-                    a->elements.empty() ? 0 : (int64_t)a->elements.size());
-                llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                // The array aggregate lives in a temporary slot; runtime entry
-                // points take it by pointer (see runtime.h for why).
-                llvm::Value* slot = b_->CreateAlloca(aty, nullptr, "arr.tmp");
-                b_->CreateCall(
-                    declareExternalSig("suki_array_new",
-                        { i64, i64, llvm::PointerType::getUnqual(aty) }),
-                    { llvm::ConstantInt::get(i64, esz), cap, slot });
-                llvm::Function* push = declareExternalSig("suki_array_push",
-                    { llvm::PointerType::getUnqual(aty), i64,
-                      llvm::PointerType::getUnqual(elemTy) });
-                for (auto& el : a->elements) {
-                    llvm::Value* v = genExpr(el.get());
-                    if (!v) continue;
-                    llvm::Value* ev = b_->CreateAlloca(elemTy);
-                    b_->CreateStore(coerce(v, elemTy), ev);
-                    b_->CreateCall(push, { slot,
-                        llvm::ConstantInt::get(i64, esz), ev });
-                }
-                return b_->CreateLoad(aty, slot);
-            }
-            case NodeKind::DictLitExpr: {
-                // Lower a dictionary literal by allocating the table once and
-                // inserting each pair, mirroring the array-literal path.
-                auto* dl = static_cast<DictLitExpr*>(e);
-                llvm::Type* dty = layout_->lower(dl->semaType);
-                if (!dty || !dty->isStructTy()) return nullptr;
-                const Type* bt = dl->semaType;
-                llvm::Type* kTy = (bt->kind == TypeKind::Dict && bt->key)
-                    ? layout_->lower(bt->key) : llvm::Type::getInt64Ty(*ctx_);
-                llvm::Type* vTy = (bt->kind == TypeKind::Dict && bt->value)
-                    ? layout_->lower(bt->value) : llvm::Type::getInt64Ty(*ctx_);
-                int64_t ksz = (int64_t)(kTy->getPrimitiveSizeInBits() + 7) / 8;
-                int64_t vsz = (int64_t)(vTy->getPrimitiveSizeInBits() + 7) / 8;
-                if (ksz <= 0) ksz = 1;
-                llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                llvm::Value* slot = b_->CreateAlloca(dty, nullptr, "dict.tmp");
-                // Size the table to the literal's pair count; the runtime grows
-                // it automatically if the estimate is too small.
-                b_->CreateCall(
-                    declareExternalSig("suki_dict_new",
-                        { i64, i64, i64, llvm::PointerType::getUnqual(dty) }),
-                    { llvm::ConstantInt::get(i64, ksz),
-                      llvm::ConstantInt::get(i64, vsz),
-                      llvm::ConstantInt::get(i64, (int64_t)dl->keys.size()),
-                      slot });
-                for (size_t i = 0; i < dl->keys.size() && i < dl->values.size(); ++i) {
-                    llvm::Value* k = genExpr(dl->keys[i].get());
-                    llvm::Value* v = genExpr(dl->values[i].get());
-                    if (!k || !v) continue;
-                    llvm::Value* ka = b_->CreateAlloca(kTy);
-                    b_->CreateStore(coerce(k, kTy), ka);
-                    llvm::Value* va = b_->CreateAlloca(vTy);
-                    b_->CreateStore(coerce(v, vTy), va);
-                    b_->CreateCall(
-                        declareExternalSig("suki_dict_set",
-                            { llvm::PointerType::getUnqual(dty), i64, i64,
-                              llvm::PointerType::getUnqual(kTy),
-                              llvm::PointerType::getUnqual(vTy) }),
-                        { slot, llvm::ConstantInt::get(i64, ksz),
-                          llvm::ConstantInt::get(i64, vsz), ka, va });
-                }
-                return b_->CreateLoad(dty, slot);
-            }
-            case NodeKind::SetLitExpr: {
-                // A set is the runtime's hash table with no value payload, so
-                // each element is inserted for its uniqueness alone.
-                auto* sl = static_cast<SetLitExpr*>(e);
-                const Type* bt = sl->semaType;
-                if (!bt || bt->kind != TypeKind::Set) return nullptr;
-                llvm::Type* sty = layout_->lower(bt);
-                llvm::Type* kTy = bt->element ? layout_->lower(bt->element)
-                                              : llvm::Type::getInt64Ty(*ctx_);
-                llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                llvm::Value* box = b_->CreateAlloca(sty, nullptr, "set.tmp");
-                b_->CreateCall(
-                    declareExternalSig("suki_dict_new",
-                        { i64, i64, i64, llvm::PointerType::getUnqual(sty) }),
-                    { llvm::ConstantInt::get(i64, sizeOf(kTy)),
-                      llvm::ConstantInt::get(i64, 0),
-                      llvm::ConstantInt::get(i64, (int64_t)sl->elements.size()),
-                      box });
-                for (auto& el : sl->elements) {
-                    llvm::Value* v = genExpr(el.get());
-                    if (!v) continue;
-                    llvm::Value* ka = b_->CreateAlloca(kTy);
-                    b_->CreateStore(coerce(v, kTy), ka);
-                    b_->CreateCall(
-                        declareExternalSig("suki_dict_set",
-                            { llvm::PointerType::getUnqual(sty), i64, i64,
-                              llvm::PointerType::getUnqual(kTy),
-                              llvm::PointerType::getUnqual(kTy) }),
-                        { box, llvm::ConstantInt::get(i64, sizeOf(kTy)),
-                          llvm::ConstantInt::get(i64, 0), ka, ka });
-                }
-                return b_->CreateLoad(sty, box);
-            }
-            case NodeKind::TernaryExpr: {
-                // `c ? a : b` — a real branch, because only one side may run.
-                // The result travels through a temporary slot instead of a PHI:
-                // for a *nested* conditional the PHI would be defined in a block
-                // that does not dominate the outer merge, while a slot always
-                // holds a value on every path.
-                auto* t = static_cast<TernaryExpr*>(e);
-                llvm::Value* c = genExpr(t->condition.get());
-                if (!c) return nullptr;
-                c = coerce(c, llvm::Type::getInt1Ty(*ctx_));
-                llvm::Type* rt = nullptr;
-                if (const Type* st = t->semaType) rt = layout_->lower(st);
-                if (!rt) rt = llvm::Type::getInt64Ty(*ctx_);
-                llvm::Function* f = b_->GetInsertBlock()->getParent();
-                const unsigned cid = ++condCounter_;
-                const std::string tag = "." + std::to_string(cid);
-                llvm::BasicBlock* tBB =
-                    llvm::BasicBlock::Create(*ctx_, "cond.true" + tag, f);
-                llvm::BasicBlock* eBB =
-                    llvm::BasicBlock::Create(*ctx_, "cond.false" + tag, f);
-                llvm::BasicBlock* mBB =
-                    llvm::BasicBlock::Create(*ctx_, "cond.end" + tag, f);
-                llvm::Value* slot = b_->CreateAlloca(rt, nullptr, "cond.tmp");
-                b_->CreateCondBr(c, tBB, eBB);
-
-                b_->SetInsertPoint(tBB);
-                if (llvm::Value* tv = genExpr(t->thenValue.get()))
-                    b_->CreateStore(coerce(tv, rt), slot);
-                b_->CreateBr(mBB);
-
-                b_->SetInsertPoint(eBB);
-                if (llvm::Value* ev = genExpr(t->elseValue.get()))
-                    b_->CreateStore(coerce(ev, rt), slot);
-                b_->CreateBr(mBB);
-
-                b_->SetInsertPoint(mBB);
-                return b_->CreateLoad(rt, slot, "cond");
-            }
-            case NodeKind::TupleExpr: {
-                // Build a tuple value by inserting each element in turn.
-                auto* t = static_cast<TupleExpr*>(e);
-                if (!t->semaType || t->semaType->kind != TypeKind::Tuple) return nullptr;
-                llvm::Type* ty = layout_->lower(t->semaType);
-                llvm::Value* v = llvm::UndefValue::get(ty);
-                for (size_t i = 0; i < t->elements.size(); ++i) {
-                    if (i >= t->semaType->elements.size()) break;
-                    llvm::Value* el = genExpr(t->elements[i].get());
-                    if (!el) continue;
-                    v = b_->CreateInsertValue(v, el, {static_cast<unsigned>(i)});
-                }
-                return v;
-            }
-            case NodeKind::SubscriptExpr: {
-                // `xs[i]` — the array is a runtime structure, so element access
-                // goes through the runtime rather than a GEP.
-                auto* sx = static_cast<SubscriptExpr*>(e);
-                const Type* bt = sx->base ? sx->base->semaType : nullptr;
-                if (sx->indices.empty()) return nullptr;
-                llvm::Value* recv = genExpr(sx->base.get());
-                if (!recv) return nullptr;
-                llvm::Value* idx = genExpr(sx->indices[0].get());
-                if (!idx) return nullptr;
-                if (bt && bt->kind == TypeKind::Array) {
-                    llvm::Type* aty = layout_->lower(bt);
-                    const Type* et = bt->element;
-                    llvm::Type* elemTy = et ? layout_->lower(et)
-                                            : llvm::Type::getInt64Ty(*ctx_);
-                    llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                    recv = coerce(recv, aty);
-                    llvm::Value* slot = b_->CreateAlloca(aty, nullptr, "arr.tmp");
-                    b_->CreateStore(recv, slot);
-                    llvm::Value* raw = b_->CreateCall(
-                        declareExternalSig("suki_array_get",
-                            { llvm::PointerType::getUnqual(aty), i64 },
-                            llvm::PointerType::getUnqual(elemTy)),
-                        { slot, coerce(idx, i64) });
-                    if (!raw) return nullptr;
-                    return b_->CreateLoad(elemTy, raw, "elem");
-                }
-                if (bt && (bt->kind == TypeKind::Dict || bt->kind == TypeKind::Set)) {
-                    // Dictionaries and sets share the runtime hash table.
-                    llvm::Type* dty = layout_->lower(bt);
-                    llvm::Type* kTy = bt->kind == TypeKind::Dict
-                        ? layout_->lower(bt->key) : layout_->lower(bt->element);
-                    llvm::Type* vTy = bt->kind == TypeKind::Dict
-                        ? layout_->lower(bt->value) : kTy;
-                    if (!kTy || !vTy) return nullptr;
-                    llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                    int64_t ksz = sizeOf(kTy);
-                    int64_t vsz = sizeOf(vTy);
-                    llvm::Value* box = b_->CreateAlloca(dty, nullptr, "dict.tmp");
-                    b_->CreateStore(coerce(recv, dty), box);
-                    llvm::Value* ka = b_->CreateAlloca(kTy);
-                    b_->CreateStore(coerce(idx, kTy), ka);
-                    llvm::Value* out = b_->CreateAlloca(vTy, nullptr, "dict.out");
-                    b_->CreateStore(llvm::Constant::getNullValue(vTy), out);
-                    b_->CreateCall(
-                        declareExternalSig("suki_dict_get",
-                            { llvm::PointerType::getUnqual(dty), i64, i64,
-                              llvm::PointerType::getUnqual(kTy),
-                              llvm::PointerType::getUnqual(vTy) },
-                            llvm::Type::getInt32Ty(*ctx_)),
-                        { box, llvm::ConstantInt::get(i64, ksz),
-                          llvm::ConstantInt::get(i64, vsz), ka, out });
-                    return b_->CreateLoad(vTy, out);
-                }
-                // 自定义下标（规范 3.1）：在具名类型上查找 subscript 成员的 getter。
-                if (bt && bt->kind == TypeKind::Named) {
-                    std::string key = bt->name + ".subscript.get";
-                    auto sit = methodFns_.find(key);
-                    if (sit != methodFns_.end() && sit->second) {
-                        llvm::Function* gf = sit->second;
-                        llvm::FunctionType* gfty = gf->getFunctionType();
-                        llvm::Value* recv = nullptr;
-                        bool selfByPointer = gfty->getNumParams() &&
-                            gfty->getParamType(0)->isPointerTy();
-                        if (selfByPointer && !layout_->isReferenceType(bt))
-                            recv = genAddr(sx->base.get());
-                        else
-                            recv = genExpr(sx->base.get());
-                        if (!recv) return nullptr;
-                        std::vector<llvm::Value*> a{recv};
-                        for (auto& ix : sx->indices) {
-                            llvm::Value* iv = genExpr(ix.get());
-                            if (iv) a.push_back(iv);
-                        }
-                        for (size_t i = 0; i < a.size() && i < gfty->getNumParams(); ++i)
-                            a[i] = coerce(a[i], gfty->getParamType(i));
-                        return b_->CreateCall(gf, a);
-                    }
-                }
-                return nullptr;
-            }
-            case NodeKind::AsmExpr: {
-                auto* a = static_cast<AsmExpr*>(e);
-                // 输入操作数求值（rvalue）。
-                std::vector<llvm::Value*> inVals;
-                std::vector<llvm::Type*> inTys;
-                for (auto& inp : a->inputs) {
-                    llvm::Value* v = genExpr(inp.expr.get());
-                    if (!v) return nullptr;
-                    inVals.push_back(v);
-                    inTys.push_back(v->getType());
-                }
-                // 约束串：输出在前（含 '='），输入在后，逗号分隔。
-                std::string constraints;
-                bool first = true;
-                std::vector<llvm::Type*> outTys;
-                for (auto& o : a->outputs) {
-                    llvm::Type* ot = o.expr->semaType ? layout_->lower(o.expr->semaType)
-                                                      : nullptr;
-                    if (!ot) return nullptr;
-                    outTys.push_back(ot);
-                    if (!first) constraints += ",";
-                    constraints += o.constraint;
-                    first = false;
-                }
-                for (auto& inp : a->inputs) {
-                    if (!first) constraints += ",";
-                    constraints += inp.constraint;
-                    first = false;
-                }
-                llvm::Type* retTy;
-                if (outTys.empty()) retTy = llvm::Type::getVoidTy(*ctx_);
-                else if (outTys.size() == 1) retTy = outTys[0];
-                else retTy = llvm::StructType::get(*ctx_, outTys);
-                llvm::FunctionType* ft = llvm::FunctionType::get(retTy, inTys, false);
-                llvm::InlineAsm* ia = llvm::InlineAsm::get(
-                    ft, a->templateStr, constraints, /*hasSideEffects=*/true);
-                llvm::Value* call = b_->CreateCall(ia, inVals);
-                // 把内联汇编的输出写回对应变量（暂支持 IdentExpr 输出目标）。
-                for (size_t i = 0; i < a->outputs.size(); ++i) {
-                    llvm::Value* ov = (a->outputs.size() == 1)
-                                          ? call
-                                          : b_->CreateExtractValue(call, {(unsigned)i});
-                    llvm::Value* addr = nullptr;
-                    if (a->outputs[i].expr->kind == NodeKind::IdentExpr) {
-                        auto it = locals_.find(
-                            static_cast<IdentExpr*>(a->outputs[i].expr.get())->name);
-                        if (it != locals_.end()) addr = it->second;
-                    }
-                    if (addr) b_->CreateStore(ov, addr);
-                }
-                if (retTy->isVoidTy()) return llvm::UndefValue::get(retTy);
-                return call;
-            }
-            case NodeKind::MemberExpr: {
-                auto* m = static_cast<MemberExpr*>(e);
-                // MemoryLayout<T>.size / .stride / .alignment（规范 P4.5）：编译期
-                // 布局常量。依据 Sema 标记出的关联类型 T 查 DataLayout 生成常量。
-                if (m->isMemoryLayoutQuery && m->memoryLayoutType) {
-                    if (llvm::Type* lt = layout_->lower(m->memoryLayoutType)) {
-                        const llvm::DataLayout& dl = module_->getDataLayout();
-                        uint64_t sz = dl.getTypeAllocSize(lt);
-                        uint64_t al = dl.getABITypeAlign(lt).value();
-                        uint64_t v = (m->member == "alignment") ? al : sz; // size/stride 均含尾部填充
-                        return tagConstant((int64_t)v);
-                    }
-                }
-                // A labelled tuple element (`pair.code`) is indexed by the label's
-                // position, not looked up as a field. Sema records the element
-                // type on the expression, so the index comes from there.
-                            if (m->base && m->base->semaType &&
-                                m->base->semaType->kind == TypeKind::Tuple &&
-                                !isNumericIndex(m->member)) {
-                                if (llvm::Value* tv = genExpr(m->base.get())) {
-                                    unsigned idx = tupleLabelIndex(m->base.get(), m->member);
-                                    auto* tst = llvm::dyn_cast<llvm::StructType>(tv->getType());
-                                    if (tst && idx < tst->getNumElements())
-                                        return b_->CreateExtractValue(tv, {idx});
-                                }
-                            }
-                // Aggregate field access lowers to a GEP into the value's
-                // storage followed by a load of the field's type.
-                // A computed property is a function, not a field: call `get`.
-                if (const Type* pt = selfReceiverType(m->base.get());
-                    pt && pt->kind == TypeKind::Named && pt->record) {
-                    std::string key = pt->name + "." + m->member;
-                    auto cit = computedProps_.find(key);
-                    if (cit != computedProps_.end()) {
-                        llvm::Type* dummy = nullptr;
-                        llvm::Function* getter = accessorFn(
-                            pt->record, m->member,
-                            AccessorDecl::Kind::Getter, &dummy);
-                        if (getter) {
-                            llvm::Value* recv = genExpr(m->base.get());
-                            if (!recv) return nullptr;
-                            return b_->CreateCall(getter,
-                                {coerce(recv, getter->getFunctionType()
-                                                ->getParamType(0))});
-                        }
-                    }
-                }
-                {
-                    const Type* rt = selfReceiverType(m->base.get());
-                    if (rt && rt->kind == TypeKind::Named && rt->record &&
-                        (rt->record->kind == TypeDeclKind::Struct ||
-                         rt->record->kind == TypeDeclKind::Class ||
-                         rt->record->kind == TypeDeclKind::Actor)) {
-                        if (llvm::Value* fv = genMemberLoad(m)) return fv;
-                    }
-                }
-                // `Enum.case` used as a value denotes that case's tag. A
-                // negative tag means this is not an enum case, so fall through.
-                if (int64_t tag = enumCaseTag(m); tag >= 0) {
-                    const Type* et = enumTypeOf(m);
-                    if (et && layout_->lower(et)->isStructTy()) {
-                        // Payload-carrying enum: build `{ tag, null }` so the
-                        // value matches the enum's representation exactly.
-                        llvm::Value* v = llvm::UndefValue::get(layout_->lower(et));
-                        v = b_->CreateInsertValue(v, tagConstant(tag), {0});
-                        v = b_->CreateInsertValue(
-                            v, llvm::ConstantPointerNull::get(
-                                   llvm::PointerType::get(*ctx_, 0)), {1});
-                        return v;
-                    }
-                    return tagConstant(tag);
-                }
-                // Parameterless String properties (`s.length`, `s.count`,
-                // `s.isEmpty`) are reads rather than calls, so they are
-                // materialised here; genStringMethod only sees real calls.
-                if (m->base && m->base->semaType &&
-                    m->base->semaType->kind == TypeKind::String &&
-                    (m->member == "length" || m->member == "count" ||
-                     m->member == "isEmpty")) {
-                    if (llvm::Value* recv = genExpr(m->base.get())) {
-                        llvm::Type* sty = layout_->stringTy();
-                        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                        recv = coerce(recv, sty);
-                        llvm::Value* n;
-                        if (m->member == "count") {
-                            // The runtime reports a scalar count as int32;
-                            // widen to Int so it compares against Int literals.
-                            n = b_->CreateSExt(
-                                b_->CreateCall(
-                                    declareExternalSig("suki_str_utf8_count", { sty },
-                                        llvm::Type::getInt32Ty(*ctx_)), { recv }),
-                                i64);
-                        } else {
-                            n = b_->CreateCall(
-                                declareExternalSig("suki_str_length", { sty }, i64),
-                                { recv });
-                        }
-                        if (m->member == "isEmpty")
-                            return b_->CreateICmpEQ(
-                                n, llvm::ConstantInt::get(i64, 0));
-                        return n;
-                    }
-                }
-                // Parameterless collection properties (`a.count`, `a.isEmpty`)
-                // are reads, not calls, so they are materialised here.
-                if (m->base && m->base->semaType &&
-                    (m->base->semaType->kind == TypeKind::Array ||
-                     m->base->semaType->kind == TypeKind::Dict)) {
-                    const Type* bt = m->base->semaType;
-                    if (m->member == "count" || m->member == "isEmpty") {
-                        llvm::Value* recv = genExpr(m->base.get());
-                        if (recv) {
-                            llvm::Type* cty = layout_->lower(bt);
-                            llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                            recv = coerce(recv, cty);
-                            const char* lenFn = bt->kind == TypeKind::Array
-                                ? "suki_array_len" : "suki_dict_len";
-                            llvm::Value* box = b_->CreateAlloca(cty, nullptr,
-                                                                 "recv.tmp");
-                            b_->CreateStore(recv, box);
-                            llvm::Value* n = b_->CreateCall(
-                                declareExternalSig(lenFn,
-                                    { llvm::PointerType::getUnqual(cty) }, i64),
-                                { box });
-                            if (m->member == "count") return n;
-                            return b_->CreateICmpEQ(
-                                n, llvm::ConstantInt::get(i64, 0));
-                        }
-                    }
-                }
-                // Tuple element access `t.0` extracts the field at that index.
-                if (m->base && m->base->semaType &&
-                    m->base->semaType->kind == TypeKind::Tuple &&
-                    !m->member.empty()) {
-                    size_t idx = 0;
-                    bool numeric = true;
-                    for (char c : m->member) {
-                        if (c < '0' || c > '9') { numeric = false; break; }
-                        idx = idx * 10 + static_cast<size_t>(c - '0');
-                    }
-                    if (numeric) {
-                        if (llvm::Value* base = genExpr(m->base.get())) {
-                            if (auto* st = llvm::dyn_cast<llvm::StructType>(
-                                    base->getType())) {
-                                if (idx < st->getNumElements())
-                                    return b_->CreateExtractValue(
-                                        base, {static_cast<unsigned>(idx)},
-                                        "tuple." + m->member);
-                            }
-                        }
-                    }
-                }
-                return nullptr;
-            }
-            case NodeKind::AssignmentExpr: {
-                auto* a = static_cast<AssignmentExpr*>(e);
-                // Field assignment stores through the field's GEP, which keeps
-                // the aggregate's value semantics (write in place, no copy).
-                if (a->lhs && a->lhs->kind == NodeKind::MemberExpr) {
-                    auto* m = static_cast<MemberExpr*>(a->lhs.get());
-                    if (llvm::GEPOperator* fp = genFieldPtr(m)) {
-                        llvm::Value* v = genExpr(a->rhs.get());
-                        if (v) {
-                            v = coerce(v, fp->getResultElementType());
-                            if (a->isCompound) {
-                                PunctuatorID cop = a->compoundOp;
-                                llvm::Value* old =
-                                    b_->CreateLoad(fp->getResultElementType(), fp);
-                                llvm::Value* nv = coerce(
-                                    applyCompound(old, cop, v),
-                                    fp->getResultElementType());
-                                b_->CreateStore(nv, fp);
-                                return nv;
-                            }
-                            const Type* ft = m->semaType;
-                            // Only a property that actually declared observers
-                            // takes this path; everything else falls through to
-                            // the ARC-aware store below.
-                            if (const Type* rt = selfReceiverType(m->base.get())) {
-                                if (hasObservers(rt->record, m->member)) {
-                                    // Read the outgoing value so `didSet` can see
-                                    // it, then let the observers bracket the store.
-                                    llvm::Value* oldVal = b_->CreateLoad(
-                                        fp->getResultElementType(), fp);
-                                    fireObservers(rt->record, m->member,
-                                        genAddr(m->base.get()),
-                                        v, fp->getResultElementType(), oldVal);
-                                    b_->CreateStore(v, fp);
-                                    return v;
-                                }
-                            }
-                            if (ft && layout_->isReferenceType(ft)) {
-                                llvm::Value* old =
-                                    b_->CreateLoad(fp->getResultElementType(), fp);
-                                arcRetainIfRef(v, ft);
-                                b_->CreateStore(v, fp);
-                                arcReleaseIfRef(old, ft);
-                            } else {
-                                b_->CreateStore(v, fp);
-                            }
-                        }
-                        return v;
-                    }
-                }
-                if (a->lhs && a->lhs->kind == NodeKind::IdentExpr) {
-                    const std::string& n = static_cast<IdentExpr*>(a->lhs.get())->name;
-                    auto it = locals_.find(n);
-                    if (it != locals_.end()) {
-                        llvm::Value* slot = it->second;
-                        // inout 形参：slot 即调用方地址 T*，赋值直接写回该地址，
-                        // 复合赋值先解引用读旧值再写回（规范 3.1）。
-                        if (inoutLocals_.count(n)) {
-                            llvm::Type* elemTy = (a->lhs->semaType && a->lhs->semaType->element)
-                                ? layout_->lower(a->lhs->semaType->element) : nullptr;
-                            if (!elemTy) return nullptr;
-                            llvm::Value* v = genExpr(a->rhs.get());
-                            if (v) {
-                                if (a->isCompound) {
-                                    llvm::Value* old = b_->CreateLoad(elemTy, slot);
-                                    llvm::Value* nv = coerce(applyCompound(old, a->compoundOp,
-                                        coerce(v, elemTy)), elemTy);
-                                    b_->CreateStore(nv, slot);
-                                    return nv;
-                                }
-                                b_->CreateStore(coerce(v, elemTy), slot);
-                            }
-                            return v;
-                        }
-                        // As with a load, the slot may be a captured variable
-                        // reached through the closure context rather than an
-                        // alloca, so fall back to the semantic type.
-                        llvm::Type* sty = nullptr;
-                        if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(slot))
-                            sty = ai->getAllocatedType();
-                        else if (a->lhs->semaType)
-                            sty = layout_->lower(a->lhs->semaType);
-                        llvm::Value* v = genExpr(a->rhs.get());
-                        if (v && sty) {
-                            if (a->isCompound) {
-                                PunctuatorID cop = a->compoundOp;
-                                // Read-modify-write for `x += y` and friends.
-                                llvm::Value* old = b_->CreateLoad(sty, slot);
-                                llvm::Value* nv = coerce(
-                                    applyCompound(old, cop, coerce(v, sty)), sty);
-                                b_->CreateStore(nv, slot);
-                                return nv;
-                            }
-                            const Type* lt = a->lhs->semaType;
-                            if (lt && layout_->isReferenceType(lt)) {
-                                // Read the outgoing reference before overwriting
-                                // the slot, then release it after the store.
-                                llvm::Value* old = b_->CreateLoad(sty, slot);
-                                arcRetainIfRef(v, lt);
-                                b_->CreateStore(coerce(v, sty), slot);
-                                arcReleaseIfRef(old, lt);
-                            } else {
-                                b_->CreateStore(coerce(v, sty), slot);
-                            }
-                        }
-                        return v;
-                    }
-                    // A module-level variable is written through its global.
-                    if (auto git = globalsMap_.find(n); git != globalsMap_.end()) {
-                        llvm::Value* v = genExpr(a->rhs.get());
-                        if (!v) return nullptr;
-                        llvm::Type* gty = git->second->getValueType();
-                        if (a->isCompound) {
-                            llvm::Value* old = b_->CreateLoad(gty, git->second);
-                            v = coerce(applyCompound(old, a->compoundOp,
-                                                     coerce(v, gty)), gty);
-                        } else {
-                            v = coerce(v, gty);
-                        }
-                        b_->CreateStore(v, git->second);
-                        return v;
-                    }
-                    // `name = expr` inside a method writes the property in place
-                    // through the receiver, which is what makes `mutating`
-                    // methods observable to the caller.
-                    if (llvm::GEPOperator* fp = genSelfFieldPtr(n)) {
-                        llvm::Value* v = genExpr(a->rhs.get());
-                        if (v) {
-                            v = coerce(v, fp->getResultElementType());
-                            b_->CreateStore(v, fp);
-                        }
-                        return v;
-                    }
-                }
-                // 下标写入（规范 3.1）：`a[i] = v` 经运行时 set 写入（数组/字典），
-                // 或经自定义下标的 setter。
-                if (a->lhs && a->lhs->kind == NodeKind::SubscriptExpr) {
-                    auto* sx = static_cast<SubscriptExpr*>(a->lhs.get());
-                    const Type* bt = sx->base ? sx->base->semaType : nullptr;
-                    if (!bt) return genExpr(a->rhs.get());
-                    llvm::Value* recv = genExpr(sx->base.get());
-                    llvm::Value* idx = sx->indices.empty() ? nullptr
-                                                         : genExpr(sx->indices[0].get());
-                    llvm::Value* val = genExpr(a->rhs.get());
-                    if (!recv || !idx || !val) return genExpr(a->rhs.get());
-                    if (bt->kind == TypeKind::Array) {
-                        llvm::Type* aty = layout_->lower(bt);
-                        const Type* et = bt->element;
-                        llvm::Type* elemTy = et ? layout_->lower(et)
-                                                : llvm::Type::getInt64Ty(*ctx_);
-                        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-                        recv = coerce(recv, llvm::PointerType::getUnqual(aty));
-                        llvm::Value* vptr = b_->CreateAlloca(elemTy);
-                        b_->CreateStore(coerce(val, elemTy), vptr);
-                        b_->CreateCall(
-                            declareExternalSig("suki_array_set",
-                                { llvm::PointerType::getUnqual(aty), i64,
-                                  llvm::PointerType::getUnqual(elemTy) },
-                                llvm::Type::getVoidTy(*ctx_)),
-                            { recv, coerce(idx, i64), vptr });
-                        return val;
-                    }
-                    if (bt->kind == TypeKind::Named) {
-                        std::string key = bt->name + ".subscript.set";
-                        auto sit = methodFns_.find(key);
-                        if (sit != methodFns_.end() && sit->second) {
-                            llvm::Function* sf = sit->second;
-                            llvm::FunctionType* sfty = sf->getFunctionType();
-                            llvm::Value* srecv = nullptr;
-                            bool selfByPointer = sfty->getNumParams() &&
-                                sfty->getParamType(0)->isPointerTy();
-                            if (selfByPointer && !layout_->isReferenceType(bt))
-                                srecv = genAddr(sx->base.get());
-                            else
-                                srecv = genExpr(sx->base.get());
-                            if (!srecv) return genExpr(a->rhs.get());
-                            std::vector<llvm::Value*> a2{srecv,
-                                coerce(idx, sfty->getParamType(1)),
-                                coerce(val, sfty->getParamType(2))};
-                            return b_->CreateCall(sf, a2);
-                        }
-                    }
-                    return genExpr(a->rhs.get());
-                }
-                return genExpr(a->rhs.get());
-            }
-            default: return nullptr;
-        }
-    }
+    llvm::Value* genExpr(Node* e) { return exprGen_.genExpr(e); }
 
     llvm::Value* genBinary(BinaryExpr* e) {
         if (e->op == PunctuatorID::AmpAmp || e->op == PunctuatorID::PipePipe) {
@@ -3081,44 +4145,11 @@ private:
                st->getElementType(1)->isPointerTy();
     }
 
-    // The error slot a throwing call should write to.
-    llvm::Value* errorSlotForCall() {
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        if (optionalTrySlot_) return optionalTrySlot_;
-        if (currentErrorSlot_) return currentErrorSlot_;
-        // Outside a throwing context the error cannot propagate. Sema rejects
-        // that, so this only has to keep the IR valid.
-        llvm::Value* tmp = b_->CreateAlloca(i8p, nullptr, "err.tmp");
-        b_->CreateStore(llvm::ConstantPointerNull::get(i8p), tmp);
-        return tmp;
-    }
+    // 错误槽分配已迁移至 ExceptionLowerer，此处为转发桩。
+    llvm::Value* errorSlotForCall() { return exc_.errorSlotForCall(); }
 
-    // After a throwing call: branch to the enclosing handler, or return to the
-    // caller when the error propagates.
-    void finishThrowingCall(llvm::Value* slot) {
-        if (!slot) return;
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        // `try?` consumes the error instead of propagating it.
-        if (optionalTrySlot_) return;
-        llvm::Function* f = b_->GetInsertBlock()->getParent();
-        llvm::Value* err = b_->CreateLoad(i8p, slot, "err");
-        llvm::Value* has = b_->CreateIsNotNull(err, "hasError");
-        llvm::BasicBlock* land = llvm::BasicBlock::Create(*ctx_, "try.fail", f);
-        llvm::BasicBlock* cont = llvm::BasicBlock::Create(*ctx_, "try.cont", f);
-        b_->CreateCondBr(has, land, cont);
-        b_->SetInsertPoint(land);
-        if (!catchTargets_.empty()) {
-            b_->CreateBr(catchTargets_.back());
-        } else {
-            // Propagate: leave the error in this function's own slot and return.
-            if (currentErrorSlot_) b_->CreateStore(err, currentErrorSlot_);
-            if (currentRet_ && !currentRet_->isVoidTy())
-                b_->CreateRet(llvm::Constant::getNullValue(currentRet_));
-            else
-                b_->CreateRetVoid();
-        }
-        b_->SetInsertPoint(cont);
-    }
+    // 抛出调用后处理已迁移至 ExceptionLowerer，此处为转发桩。
+    void finishThrowingCall(llvm::Value* slot) { exc_.finishThrowingCall(slot); }
 
     // Emit a call, appending the error slot when the callee throws and
     // branching on the outcome. `isNilArg` lets `nil` placeholders and plain
@@ -3142,121 +4173,11 @@ private:
         return r;
     }
 
-    // `throw e`: build the error cell, record it, and leave the function (or
-    // jump to the enclosing `catch`).
-    llvm::Value* genThrow(ThrowStmt* t) {
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::Value* v = t->value ? genExpr(t->value.get()) : nullptr;
+    // throw lowering 已迁移至 ExceptionLowerer，此处为转发桩。
+    llvm::Value* genThrow(ThrowStmt* t) { return exc_.genThrow(t); }
 
-        llvm::Function* alloc = declareExternalSig("suki_alloc", { i64 }, i8p);
-        llvm::Value* cell = b_->CreateCall(alloc, { llvm::ConstantInt::get(i64, 24) });
-        llvm::Value* typed = b_->CreatePointerCast(cell, errorTy()->getPointerTo());
-        const std::string typeName =
-            (t->value && t->value->semaType && t->value->semaType->record)
-                ? t->value->semaType->record->name
-                : std::string("Error");
-        b_->CreateStore(b_->CreateGlobalStringPtr(typeName),
-                        b_->CreateStructGEP(errorTy(), typed, 0));
-        llvm::Value* tag = llvm::ConstantInt::get(i64, 0);
-        llvm::Value* payload = llvm::ConstantPointerNull::get(i8p);
-        if (v && isTaggedUnion(v->getType())) {
-            tag = b_->CreateExtractValue(v, {0});
-            payload = b_->CreateExtractValue(v, {1});
-        } else if (v && v->getType()->isIntegerTy(64)) {
-            tag = v;
-        }
-        b_->CreateStore(tag, b_->CreateStructGEP(errorTy(), typed, 1));
-        b_->CreateStore(payload, b_->CreateStructGEP(errorTy(), typed, 2));
-
-        llvm::Value* err = b_->CreatePointerCast(typed, i8p);
-        if (!catchTargets_.empty()) {
-            b_->CreateStore(err, currentErrorSlot_);
-            b_->CreateBr(catchTargets_.back());
-        } else if (currentErrorSlot_) {
-            b_->CreateStore(err, currentErrorSlot_);
-            if (currentRet_ && !currentRet_->isVoidTy())
-                b_->CreateRet(llvm::Constant::getNullValue(currentRet_));
-            else
-                b_->CreateRetVoid();
-        } else {
-            // Sema rejects a throw outside a throwing context; panicking keeps
-            // the behaviour defined if one slips through.
-            b_->CreateCall(declareExternalSig("panic", { i8p }),
-                           { b_->CreateGlobalStringPtr(
-                               "error thrown from a non-throwing context") });
-            if (currentRet_ && !currentRet_->isVoidTy())
-                b_->CreateRet(llvm::Constant::getNullValue(currentRet_));
-            else
-                b_->CreateRetVoid();
-        }
-        return nullptr;
-    }
-
-    // `do { … } catch { … }`: the body runs with a fresh error slot; any error
-    // branches to the dispatcher, which walks the catch clauses in order.
-    void genDoStmt(DoStmt* d) {
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Function* f = b_->GetInsertBlock()->getParent();
-        llvm::Value* slot = b_->CreateAlloca(i8p, nullptr, "err.slot");
-        b_->CreateStore(llvm::ConstantPointerNull::get(i8p), slot);
-        llvm::BasicBlock* dispatch = llvm::BasicBlock::Create(*ctx_, "catch.dispatch", f);
-        llvm::BasicBlock* done = llvm::BasicBlock::Create(*ctx_, "do.cont", f);
-
-        llvm::Value* savedSlot = currentErrorSlot_;
-        currentErrorSlot_ = slot;
-        catchTargets_.push_back(dispatch);
-        for (auto& st : d->body) genStmt(st.get());
-        catchTargets_.pop_back();
-        currentErrorSlot_ = savedSlot;
-        if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(done);
-
-        b_->SetInsertPoint(dispatch);
-        llvm::Value* err = b_->CreateLoad(i8p, slot, "err");
-        for (auto& c : d->catches) {
-            auto* cc = static_cast<CatchClause*>(c.get());
-            llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*ctx_, "catch.body", f);
-            llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(*ctx_, "catch.next", f);
-            bool unconditional = true;
-            // `catch let e as T` matches only that error type; the comparison
-            // is on the recorded type name.
-            if (cc->pattern && cc->pattern->kind == NodeKind::VarDecl) {
-                auto* vd = static_cast<VarDecl*>(cc->pattern.get());
-                std::string want = typeReprName(vd->type.get());
-                if (!want.empty()) {
-                    llvm::Value* typed = b_->CreatePointerCast(err, errorTy()->getPointerTo());
-                    llvm::Value* tn = b_->CreateLoad(
-                        i8p, b_->CreateStructGEP(errorTy(), typed, 0), "err.type");
-                    llvm::Function* cmp = declareExternalSig(
-                        "strcmp", { i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
-                    llvm::Value* eq = b_->CreateICmpEQ(
-                        b_->CreateCall(cmp, { tn, b_->CreateGlobalStringPtr(want) }),
-                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
-                    b_->CreateCondBr(eq, bodyBB, nextBB);
-                    unconditional = false;
-                }
-            }
-            if (unconditional) b_->CreateBr(bodyBB);
-
-            b_->SetInsertPoint(bodyBB);
-            if (cc->pattern && cc->pattern->kind == NodeKind::VarDecl) {
-                auto* vd = static_cast<VarDecl*>(cc->pattern.get());
-                if (!vd->name.empty()) {
-                    llvm::Value* bs = b_->CreateAlloca(i8p, nullptr, vd->name);
-                    b_->CreateStore(err, bs);
-                    locals_[vd->name] = bs;
-                }
-            }
-            if (cc->whereExpr) genExpr(cc->whereExpr.get());
-            for (auto& st : cc->body) genStmt(st.get());
-            if (!b_->GetInsertBlock()->getTerminator()) b_->CreateBr(done);
-            b_->SetInsertPoint(nextBB);
-        }
-        // An error no clause claimed keeps propagating.
-        if (currentErrorSlot_) b_->CreateStore(err, currentErrorSlot_);
-        b_->CreateBr(done);
-        b_->SetInsertPoint(done);
-    }
+    // do/catch lowering 已迁移至 ExceptionLowerer，此处为转发桩。
+    void genDoStmt(DoStmt* d) { exc_.genDoStmt(d); }
 
     // ── closures ───────────────────────────────────────────────────────────
     // A closure value is the `{ captures, fnptr }` pair produced by
@@ -3473,183 +4394,30 @@ private:
 
     // Synchronous runtime builtins with fixed C prototypes, intercepted by name so
     // the exact signature (pointer first argument, etc.) is emitted.
+    // 同步运行时内建 lowering 已迁移至 ConcurrencyLowerer，此处为转发桩。
     llvm::Value* genSyncBuiltin(const std::string& name, CallExpr* e) {
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::Type* i64p = llvm::PointerType::getUnqual(i64);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        std::string cname;
-        std::vector<llvm::Type*> ptys;
-        llvm::Type* rty = voidTy;
-        if (name == "atomicAdd")         { cname = "suki_atomic_add_i64"; ptys = {i64p, i64}; rty = i64; }
-        else if (name == "mutexLock")    { cname = "suki_spin_lock";      ptys = {i64p};      rty = voidTy; }
-        else if (name == "mutexUnlock")  { cname = "suki_spin_unlock";    ptys = {i64p};      rty = voidTy; }
-        else return nullptr;
-        llvm::Function* fn = declareExternalSig(cname, ptys, rty);
-        std::vector<llvm::Value*> args;
-        for (auto& a : e->arguments) {
-            llvm::Value* v = genExpr(a.get());
-            if (!v) return nullptr;
-            args.push_back(v);
-        }
-        for (size_t i = 0; i < args.size() && i < ptys.size(); ++i)
-            args[i] = coerce(args[i], ptys[i]);
-        return b_->CreateCall(fn, args);
+        return conc_.genSyncBuiltin(name, e);
     }
 
-    // Runtime entry points used by async lowering, declared with exact prototypes.
-    llvm::Function* asyncAllocFn() {
-        return declareExternalSig("suki_alloc", { llvm::Type::getInt64Ty(*ctx_) },
-                                  llvm::PointerType::get(*ctx_, 0));
-    }
-    llvm::Function* asyncFreeFn() {
-        return declareExternalSig("suki_free", { llvm::PointerType::get(*ctx_, 0) },
-                                  llvm::Type::getVoidTy(*ctx_));
-    }
-    llvm::Function* asyncFutureCreateFn() {
-        return declareExternalSig("suki_future_create",
-                                  { llvm::Type::getInt64Ty(*ctx_) },
-                                  llvm::PointerType::get(*ctx_, 0));
-    }
+    // 并发运行时入口 lowering 已迁移至 ConcurrencyLowerer，此处为转发桩。
+    llvm::Function* asyncAllocFn() { return conc_.asyncAllocFn(); }
+    llvm::Function* asyncFreeFn() { return conc_.asyncFreeFn(); }
+    llvm::Function* asyncFutureCreateFn() { return conc_.asyncFutureCreateFn(); }
 
     // Emit `<sym>_spawn` for an async function. The worker `sym_tramp` runs the
     // synchronous body on a fresh thread and publishes its result through the
     // Future; the spawn builds the context block and starts the worker.
+    // async spawn lowering 已迁移至 ConcurrencyLowerer，此处为转发桩。
     void genAsyncSpawn(FunctionDecl* fn, const std::string& sym) {
-        const std::string spawnSym = sym + "_spawn";
-        if (fns_.count(spawnSym)) return;
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-
-        std::vector<llvm::Type*> ptys;
-        for (auto& p : fn->params)
-            ptys.push_back(p.semaType ? layout_->lower(p.semaType) : i64);
-
-        const Type* rt = fn->returnType ? fn->returnType->semaType : nullptr;
-        const bool isVoid = !rt || rt->kind == TypeKind::Void ||
-                            rt->kind == TypeKind::Unknown;
-        llvm::Type* rty = isVoid ? nullptr : layout_->lower(rt);
-        const int64_t rsize = isVoid ? 0 : (int64_t)sizeOf(rty);
-
-        // One heap block carries the arguments followed by the Future handle, laid
-        // out as a struct so the worker reads them back by the same indices.
-        std::vector<llvm::Type*> ctys = ptys;
-        ctys.push_back(i8p);
-        llvm::StructType* ctxTy = llvm::StructType::get(*ctx_, ctys, false);
-        const unsigned futIdx = (unsigned)ptys.size();
-
-        // The synchronous body the worker calls.
-        llvm::Function* bodyFn = fns_[fn->name];
-        if (!bodyFn) bodyFn = declareAs(fn, fn->name);
-
-        llvm::Function* storeFn = declareExternalSig("suki_future_store",
-                                                    { i8p, i8p }, voidTy);
-        llvm::Function* finishFn = declareExternalSig("suki_future_finish",
-                                                     { i8p }, voidTy);
-
-        // ── worker: i8* <sym>_tramp(i8* ctx) ──
-        llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
-        llvm::Function* tramp = llvm::Function::Create(
-            trampTy, llvm::GlobalValue::ExternalLinkage, sym + "_tramp",
-            module_.get());
-        {
-            llvm::BasicBlock* tb = llvm::BasicBlock::Create(*ctx_, "entry", tramp);
-            b_->SetInsertPoint(tb);
-            llvm::Value* rawCtx = tramp->getArg(0);
-            llvm::Value* cp = b_->CreateBitCast(rawCtx,
-                llvm::PointerType::getUnqual(ctxTy), "ctx");
-            std::vector<llvm::Value*> callArgs;
-            for (size_t i = 0; i < ptys.size(); ++i) {
-                llvm::Value* fp = b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
-                                                      "arg.addr");
-                callArgs.push_back(b_->CreateLoad(ptys[i], fp));
-            }
-            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
-            llvm::Value* fut = b_->CreateLoad(i8p, futAddr, "fut");
-            if (!isVoid) {
-                llvm::Value* v = b_->CreateCall(bodyFn, callArgs);
-                llvm::Value* slot = b_->CreateAlloca(rty, nullptr, "result");
-                b_->CreateStore(v, slot);
-                b_->CreateCall(storeFn, { fut, b_->CreateBitCast(slot, i8p) });
-            } else {
-                b_->CreateCall(bodyFn, callArgs);
-            }
-            b_->CreateCall(finishFn, { fut });
-            b_->CreateCall(asyncFreeFn(), { rawCtx });
-            b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
-        }
-
-        // ── i8* <sym>_spawn(params...) ──
-        llvm::FunctionType* sft = llvm::FunctionType::get(i8p, ptys, false);
-        llvm::Function* spawnFn = llvm::Function::Create(
-            sft, llvm::GlobalValue::ExternalLinkage, spawnSym, module_.get());
-        {
-            llvm::BasicBlock* sb = llvm::BasicBlock::Create(*ctx_, "entry", spawnFn);
-            b_->SetInsertPoint(sb);
-            llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
-                                              { llvm::ConstantInt::get(i64, rsize) });
-            llvm::Value* rawCtx = b_->CreateCall(asyncAllocFn(),
-                { llvm::ConstantInt::get(i64, (int64_t)sizeOf(ctxTy)) });
-            llvm::Value* cp = b_->CreateBitCast(rawCtx,
-                llvm::PointerType::getUnqual(ctxTy), "ctx");
-            for (size_t i = 0; i < ptys.size(); ++i) {
-                llvm::Value* fp = b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
-                                                      "arg.addr");
-                b_->CreateStore(spawnFn->getArg((unsigned)i), fp);
-            }
-            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
-            b_->CreateStore(fut, futAddr);
-
-            llvm::Function* startFn = declareExternalSig("suki_thread_start",
-                { llvm::PointerType::getUnqual(trampTy), i8p },
-                llvm::Type::getInt32Ty(*ctx_));
-            llvm::Value* started = b_->CreateCall(startFn, { tramp, rawCtx },
-                                                  "started");
-            llvm::Value* failed = b_->CreateICmpNE(started,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
-            llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*ctx_, "inline",
-                                                                  spawnFn);
-            llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*ctx_, "spawned",
-                                                                spawnFn);
-            b_->CreateCondBr(failed, inlineBB, doneBB);
-            b_->SetInsertPoint(inlineBB);
-            b_->CreateCall(tramp, { rawCtx });
-            b_->CreateBr(doneBB);
-            b_->SetInsertPoint(doneBB);
-            b_->CreateRet(fut);
-        }
-        fns_[spawnSym] = spawnFn;
+        conc_.genAsyncSpawn(fn, sym);
     }
 
     // ─── Channel<T> ─────────────────────────────────────────────────────────
     // `Channel<Int>(capacity: n)` allocates the runtime FIFO with the element size
     // of `Int`, so one runtime implementation serves every element type.
+    // Channel lowering 已迁移至嵌套组件 ConcurrencyLowerer，此处为转发桩。
     llvm::Value* genChannelInit(const Type* instTy, CallExpr* e) {
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        // A Named type keeps its generic arguments in `elements`.
-        const Type* elemTy = (!instTy->elements.empty())
-                                 ? instTy->elements[0] : nullptr;
-        llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
-        const int64_t esz = (int64_t)sizeOf(elemLLVM);
-
-        llvm::Value* cap = llvm::ConstantInt::get(i64, 1);
-        if (!e->arguments.empty()) {
-            llvm::Value* cv = genExpr(e->arguments[0].get());
-            if (cv) cap = coerce(cv, i64);
-        }
-        llvm::Function* createFn = declareExternalSig("suki_channel_create",
-                                                      { i64, i64 }, i8p);
-        llvm::Value* handle = b_->CreateCall(createFn,
-            { cap, llvm::ConstantInt::get(i64, esz) });
-
-        llvm::Type* sty = layout_->lower(instTy);
-        if (!sty || !sty->isStructTy()) return nullptr;
-        llvm::Value* slot = b_->CreateAlloca(sty, nullptr, "channel.tmp");
-        b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
-        llvm::Value* hp = b_->CreateStructGEP(sty, slot, 0, "handle.addr");
-        b_->CreateStore(handle, hp);
-        return b_->CreateLoad(sty, slot);
+        return conc_.genChannelInit(instTy, e);
     }
 
     // Channel methods are runtime-backed, so their bodies call the runtime
@@ -3700,175 +4468,72 @@ private:
     // channel operation; the first that can proceed runs its body. If none can,
     // a `default` arm runs; without one the select yields and tries again, which
     // is what makes it wait for the first ready case.
-    void genSelect(SwitchStmt* s) {
-        if (!s) return;
-        llvm::Function* cur = b_->GetInsertBlock()->getParent();
-        llvm::BasicBlock* retry = llvm::BasicBlock::Create(*ctx_, "select.retry",
-                                                           cur);
-        llvm::BasicBlock* done = llvm::BasicBlock::Create(*ctx_, "select.done",
-                                                          cur);
-        b_->CreateBr(retry);
-        b_->SetInsertPoint(retry);
+    // select lowering 已迁移至 ConcurrencyLowerer，此处为转发桩。
+    void genSelect(SwitchStmt* s) { conc_.genSelect(s); }
 
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
+    // `for await x in seq` — iterate an async sequence to completion.
+    //
+    // Channel<T>: block-receive each element; the runtime returns -1 once the
+    // channel is closed and drained, which ends the loop.
+    //
+    // TaskGroup<T>: drain the children's results in submission order; each child
+    // future is awaited and its value copied out by the runtime.
+    //
+    // `break` targets the exit block and `continue` the step block (which re-tests
+    // the head), exactly like a `while` loop.
+    // for await lowering 已迁移至 ConcurrencyLowerer，此处为转发桩。
+    void genForAwait(ForInStmt* fr) { conc_.genForAwait(fr); }
 
-        for (auto& c : s->cases) {
-            if (!c || c->kind != NodeKind::CaseClause) continue;
-            auto* cc = static_cast<CaseClause*>(c.get());
-            if (cc->isDefault || !cc->pattern) continue;
-            if (cc->pattern->kind != NodeKind::BinaryExpr) continue;
-            auto* be = static_cast<BinaryExpr*>(cc->pattern.get());
-            if (be->op != PunctuatorID::LeftArrow) continue;
-
-            const bool isReceive = cc->isBindingPattern ||
-                                   (!cc->bindings.empty());
-            // Element type and the channel's runtime handle.
-            const Type* chTy = be->rhs ? be->rhs->semaType : nullptr;
-            const Type* elemTy = (chTy && !chTy->elements.empty())
-                                     ? chTy->elements[0] : nullptr;
-            llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
-            llvm::Value* chVal = genExpr(be->rhs.get());
-            if (!chVal) continue;
-            llvm::Type* chStruct = chVal->getType();
-            llvm::Value* chSlot = b_->CreateAlloca(chStruct, nullptr, "sel.chan");
-            b_->CreateStore(chVal, chSlot);
-            llvm::Value* hp = b_->CreateStructGEP(chStruct, chSlot, 0, "sel.h");
-            llvm::Value* handle = b_->CreateLoad(i8p, hp, "sel.handle");
-
-            llvm::Value* ok = nullptr;
-            llvm::Value* outSlot = nullptr;
-            if (isReceive) {
-                outSlot = b_->CreateAlloca(elemLLVM, nullptr, "sel.recv");
-                llvm::Function* tf = declareExternalSig("suki_channel_try_receive",
-                    { i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
-                ok = b_->CreateCall(tf, { handle,
-                                          b_->CreateBitCast(outSlot, i8p) });
-            } else {
-                llvm::Value* v = genExpr(be->lhs.get());
-                if (!v) continue;
-                llvm::Value* vSlot = b_->CreateAlloca(elemLLVM, nullptr, "sel.send");
-                b_->CreateStore(coerce(v, elemLLVM), vSlot);
-                llvm::Function* tf = declareExternalSig("suki_channel_try_send",
-                    { i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
-                ok = b_->CreateCall(tf, { handle,
-                                          b_->CreateBitCast(vSlot, i8p) });
-            }
-            llvm::Value* ready = b_->CreateICmpEQ(ok,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 1));
-            llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*ctx_, "sel.case",
-                                                                cur);
-            llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(*ctx_, "sel.next",
-                                                                cur);
-            b_->CreateCondBr(ready, bodyBB, nextBB);
-            b_->SetInsertPoint(bodyBB);
-            // Bind the received value, if any, then run this case's body.
-            if (isReceive && outSlot && !cc->bindings.empty()) {
-                llvm::Value* val = b_->CreateLoad(elemLLVM, outSlot, "sel.value");
-                llvm::Value* slot = b_->CreateAlloca(elemLLVM, nullptr,
-                                                     cc->bindings[0]);
-                b_->CreateStore(val, slot);
-                locals_[cc->bindings[0]] = slot;
-            }
-            for (auto& st : cc->body) genStmt(st.get());
-            b_->CreateBr(done);
-            b_->SetInsertPoint(nextBB);
-        }
-
-        // Nothing was ready: run `default`, else yield briefly and try again.
-        bool hasDefault = false;
-        for (auto& c : s->cases) {
-            if (!c || c->kind != NodeKind::CaseClause) continue;
-            if (static_cast<CaseClause*>(c.get())->isDefault) { hasDefault = true; break; }
-        }
-        if (hasDefault) {
-            for (auto& c : s->cases) {
-                if (!c || c->kind != NodeKind::CaseClause) continue;
-                auto* cc = static_cast<CaseClause*>(c.get());
-                if (!cc->isDefault) continue;
-                for (auto& st : cc->body) genStmt(st.get());
-                break;
-            }
-            b_->CreateBr(done);
-        } else {
-            // Yield so a producer on another thread can make progress.
-            llvm::Function* sleepFn = declareExternalSig("suki_sleep", { i64 },
-                                                         voidTy);
-            b_->CreateCall(sleepFn, { llvm::ConstantInt::get(i64, 1) });
-            b_->CreateBr(retry);
-        }
-        b_->SetInsertPoint(done);
-    }
-
-    // A Future that is already complete. Used by runtime-backed async members
-    // (Channel.send / receive / close): the operation itself blocks, so the
-    // Future only has to carry its result for `await` to collect.
+    // async/Channel/TaskGroup 运行时辅助已迁移至 ConcurrencyLowerer，此处为转发桩。
     llvm::Value* asyncCompletedFuture(llvm::Type* valueTy, llvm::Value* valuePtr) {
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        const int64_t sz = valueTy ? (int64_t)sizeOf(valueTy) : 0;
-        llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
-                                          { llvm::ConstantInt::get(i64, sz) });
-        if (valueTy && valuePtr)
-            b_->CreateCall(declareExternalSig("suki_future_store", { i8p, i8p },
-                                              voidTy),
-                           { fut, b_->CreateBitCast(valuePtr, i8p) });
-        b_->CreateCall(declareExternalSig("suki_future_finish", { i8p }, voidTy),
-                       { fut });
-        return fut;
+        return conc_.asyncCompletedFuture(valueTy, valuePtr);
     }
 
-    // Emit an async Channel member: perform the blocking runtime operation, then
-    // return an already-complete Future so `await ch.send(x)` type-checks and
-    // yields the operation's result.
+    // Channel 异步成员 lowering 已迁移至 ConcurrencyLowerer，此处为转发桩。
     void genChannelMethod(FunctionDecl* mf, const Type* instTy) {
-        const std::string mkey = std::string(instTy->record->name) + "." +
-                                 mf->name;
+        conc_.genChannelMethod(mf, instTy);
+    }
+
+    // Runtime-backed members of an instantiated `TaskGroup<T>`: `addTask` spawns a
+    // child whose result is a T (stored in its Future), `waitForAll` joins them.
+    void genTaskGroupMethod(FunctionDecl* mf, const Type* instTy) {
+        const std::string mkey = std::string(instTy->name) + "." + mf->name;
         if (methodFns_.count(mkey)) return;
         llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
         llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
         const Type* elemTy = (!instTy->elements.empty())
                                  ? instTy->elements[0] : nullptr;
-        llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : i64;
+        llvm::Type* elemLLVM = elemTy ? layout_->lower(elemTy) : nullptr;
         llvm::Type* selfTy = layout_->lower(instTy);
         if (!selfTy) return;
 
-        std::vector<llvm::Type*> ptys{ selfTy };
-        if (mf->name == "send") ptys.push_back(elemLLVM);
-        llvm::FunctionType* fty = llvm::FunctionType::get(i8p, ptys, false);
-        llvm::Function* f = llvm::Function::Create(fty,
-            llvm::GlobalValue::ExternalLinkage, mkey, module_.get());
-        b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
-
-        llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
-        b_->CreateStore(f->getArg(0), selfSlot);
-        llvm::Value* hp = b_->CreateStructGEP(selfTy, selfSlot, 0, "handle.addr");
-        llvm::Value* handle = b_->CreateLoad(i8p, hp, "handle");
-
-        if (mf->name == "send") {
-            llvm::Value* vSlot = b_->CreateAlloca(elemLLVM, nullptr, "value");
-            b_->CreateStore(coerce(f->getArg(1), elemLLVM), vSlot);
-            b_->CreateCall(declareExternalSig("suki_channel_send", { i8p, i8p },
-                                              voidTy),
-                           { handle, b_->CreateBitCast(vSlot, i8p) });
-            b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
-        } else if (mf->name == "receive") {
-            llvm::Value* out = b_->CreateAlloca(elemLLVM, nullptr, "out");
-            b_->CreateCall(declareExternalSig("suki_channel_receive",
-                                              { i8p, i8p },
-                                              llvm::Type::getInt32Ty(*ctx_)),
-                           { handle, b_->CreateBitCast(out, i8p) });
-            b_->CreateRet(asyncCompletedFuture(elemLLVM, out));
-        } else if (mf->name == "close") {
-            b_->CreateCall(declareExternalSig("suki_channel_close", { i8p },
-                                              voidTy), { handle });
-            b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
-        } else {
-            b_->CreateRet(asyncCompletedFuture(nullptr, nullptr));
+        if (mf->name == "waitForAll") {
+            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { selfTy },
+                                                              false);
+            llvm::Function* f = llvm::Function::Create(fty,
+                llvm::GlobalValue::InternalLinkage, mkey, module_.get());
+            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+            llvm::Value* g = loadHandle(f->getArg(0), selfTy);
+            b_->CreateCall(declareExternalSig("suki_taskgroup_wait_all", { i8p },
+                                              voidTy), { g });
+            b_->CreateRetVoid();
+            methodFns_[mkey] = f;
+            return;
         }
+        if (mf->name != "addTask") return;
+
+        llvm::StructType* clTy = llvm::cast<llvm::StructType>(
+            layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
+        llvm::FunctionType* fty = llvm::FunctionType::get(voidTy,
+                                                          { selfTy, clTy }, false);
+        llvm::Function* f = llvm::Function::Create(fty,
+            llvm::GlobalValue::InternalLinkage, mkey, module_.get());
+        b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
+        llvm::Value* g = loadHandle(f->getArg(0), selfTy);
+        llvm::Value* fut = startClosureTask(f->getArg(1), f, elemLLVM);
+        b_->CreateCall(declareExternalSig("suki_taskgroup_add", { i8p, i8p },
+                                          voidTy), { g, fut });
+        b_->CreateRetVoid();
         methodFns_[mkey] = f;
     }
 
@@ -3877,309 +4542,31 @@ private:
     // registered by Sema rather than declared in source, so the struct type is
     // built directly here — keeping the constructors and the runtime-backed method
     // bodies in agreement.
-    llvm::StructType* handleStructTy(const std::string& name) {
-        if (llvm::StructType* t = llvm::StructType::getTypeByName(
-                module_->getContext(), "suki." + name))
-            return t;
-        return llvm::StructType::create(*ctx_,
-            { llvm::PointerType::get(*ctx_, 0) }, "suki." + name);
-    }
-
+    // handle / Task / TaskGroup 辅助已迁移至 ConcurrencyLowerer，此处为转发桩。
+    llvm::StructType* handleStructTy(const std::string& name) { return conc_.handleStructTy(name); }
     llvm::Value* makeHandleValue(llvm::StructType* sty, llvm::Value* handle) {
-        llvm::Value* slot = b_->CreateAlloca(sty, nullptr, "handle.tmp");
-        b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
-        llvm::Value* hp = b_->CreateStructGEP(sty, slot, 0, "handle.addr");
-        b_->CreateStore(handle, hp);
-        return b_->CreateLoad(sty, slot);
+        return conc_.makeHandleValue(sty, handle);
     }
-
     llvm::Value* loadHandle(llvm::Value* selfVal, llvm::Type* selfTy) {
-        llvm::Value* slot = b_->CreateAlloca(selfTy, nullptr, "self.tmp");
-        b_->CreateStore(selfVal, slot);
-        llvm::Value* hp = b_->CreateStructGEP(selfTy, slot, 0, "handle.addr");
-        return b_->CreateLoad(llvm::PointerType::get(*ctx_, 0), hp, "handle");
+        return conc_.loadHandle(selfVal, selfTy);
     }
 
-    // Start a closure body on its own thread, returning the Future that completes
-    // when it finishes. Used by `Task { ... }` and `group.addTask { ... }`.
-    llvm::Value* startClosureTask(llvm::Value* cv, llvm::Function* cur) {
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        llvm::Value* ctxv = b_->CreateExtractValue(cv, {0}, "task.ctx");
-        llvm::Value* fnv = b_->CreateExtractValue(cv, {1}, "task.fn");
-        llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
-            { llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0) });
-        llvm::FunctionType* cfty = llvm::FunctionType::get(voidTy, { i8p }, false);
-        llvm::Value* fp = b_->CreatePointerCast(fnv, cfty->getPointerTo());
-        llvm::Function* startFn = declareExternalSig("suki_closure_thread_start",
-            { cfty->getPointerTo(), i8p, i8p }, llvm::Type::getInt32Ty(*ctx_));
-        llvm::Value* st = b_->CreateCall(startFn, { fp, ctxv, fut });
-        llvm::Value* failed = b_->CreateICmpNE(st,
-            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
-        llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*ctx_, "task.inline",
-                                                              cur);
-        llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*ctx_, "task.done", cur);
-        b_->CreateCondBr(failed, inlineBB, doneBB);
-        b_->SetInsertPoint(inlineBB);
-        b_->CreateCall(cfty, fp, { ctxv });
-        b_->CreateCall(declareExternalSig("suki_future_finish", { i8p }, voidTy),
-                       { fut });
-        b_->CreateBr(doneBB);
-        b_->SetInsertPoint(doneBB);
-        return fut;
+    // closure 线程启动已迁移至 ConcurrencyLowerer，此处为转发桩。
+    llvm::Value* startClosureTask(llvm::Value* cv, llvm::Function* cur,
+                                  llvm::Type* resultTy) {
+        return conc_.startClosureTask(cv, cur, resultTy);
     }
 
-    // Task { ... } — run the body on a new thread and wrap its Future.
-    llvm::Value* genTaskInit(CallExpr* e) {
-        Node* clNode = e->arguments.empty() ? nullptr : e->arguments[0].get();
-        if (!clNode || clNode->kind != NodeKind::ClosureExpr) return nullptr;
-        llvm::Function* cur = b_->GetInsertBlock()->getParent();
-        llvm::Value* cv = emitClosure(static_cast<ClosureExpr*>(clNode));
-        if (!cv) return nullptr;
-        llvm::Value* fut = startClosureTask(cv, cur);
-        return makeHandleValue(handleStructTy("Task"), fut);
+    // Task/TaskGroup 运行时辅助已迁移至 ConcurrencyLowerer，此处为转发桩。
+    llvm::Value* genTaskInit(CallExpr* e) { return conc_.genTaskInit(e); }
+    llvm::Value* genTaskGroupInit(const Type* elemTy) { return conc_.genTaskGroupInit(elemTy); }
+    void genConcurrencyBuiltinMethod(const std::string& base, const std::string& mem) {
+        conc_.genConcurrencyBuiltinMethod(base, mem);
     }
+    void genSleepSpawn() { conc_.genSleepSpawn(); }
 
-    // TaskGroup() — allocate the runtime group.
-    llvm::Value* genTaskGroupInit() {
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Function* cf = declareExternalSig("suki_taskgroup_create", {}, i8p);
-        return makeHandleValue(handleStructTy("TaskGroup"), b_->CreateCall(cf, {}));
-    }
-
-    // Emit the runtime-backed bodies of Task.wait and TaskGroup.addTask /
-    // waitForAll, and register them so member dispatch resolves.
-    void ensureConcurrencyBodies() {
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::StructType* taskSty = handleStructTy("Task");
-        llvm::StructType* grpSty = handleStructTy("TaskGroup");
-
-        // Task.wait() — block until the task's Future completes.
-        if (!methodFns_.count("Task.wait")) {
-            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { taskSty },
-                                                               false);
-            llvm::Function* f = llvm::Function::Create(fty,
-                llvm::GlobalValue::ExternalLinkage, "Task.wait", module_.get());
-            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
-            llvm::Value* fut = loadHandle(f->getArg(0), taskSty);
-            llvm::Value* tmp = b_->CreateAlloca(i64, nullptr, "wait.tmp");
-            b_->CreateCall(declareExternalSig("suki_future_await", { i8p, i8p },
-                                              voidTy),
-                           { fut, b_->CreateBitCast(tmp, i8p) });
-            b_->CreateRetVoid();
-            methodFns_["Task.wait"] = f;
-        }
-
-        // TaskGroup.waitForAll() — block until every child completes.
-        if (!methodFns_.count("TaskGroup.waitForAll")) {
-            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy, { grpSty },
-                                                               false);
-            llvm::Function* f = llvm::Function::Create(fty,
-                llvm::GlobalValue::ExternalLinkage, "TaskGroup.waitForAll",
-                module_.get());
-            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
-            llvm::Value* g = loadHandle(f->getArg(0), grpSty);
-            b_->CreateCall(declareExternalSig("suki_taskgroup_wait_all", { i8p },
-                                              voidTy), { g });
-            b_->CreateRetVoid();
-            methodFns_["TaskGroup.waitForAll"] = f;
-        }
-
-        // TaskGroup.addTask { ... } — spawn a child and record its Future.
-        if (!methodFns_.count("TaskGroup.addTask")) {
-            llvm::StructType* clTy = llvm::cast<llvm::StructType>(
-                layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
-            llvm::FunctionType* fty = llvm::FunctionType::get(voidTy,
-                                                              { grpSty, clTy },
-                                                              false);
-            llvm::Function* f = llvm::Function::Create(fty,
-                llvm::GlobalValue::ExternalLinkage, "TaskGroup.addTask",
-                module_.get());
-            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
-            llvm::Value* g = loadHandle(f->getArg(0), grpSty);
-            llvm::Value* fut = startClosureTask(f->getArg(1), f);
-            b_->CreateCall(declareExternalSig("suki_taskgroup_add", { i8p, i8p },
-                                              voidTy), { g, fut });
-            b_->CreateRetVoid();
-            methodFns_["TaskGroup.addTask"] = f;
-        }
-    }
-
-    // Always-provided spawn for the `sleep` async builtin. Its body is the runtime
-    // `suki_sleep`, so the worker sleeps on its own thread and then completes.
-    void genSleepSpawn() {
-        if (fns_.count("sleep_spawn")) return;
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-
-        llvm::Function* sleepFn = declareExternalSig("suki_sleep", { i64 }, voidTy);
-        llvm::StructType* ctxTy = llvm::StructType::get(*ctx_, { i64, i8p }, false);
-        llvm::Function* finishFn = declareExternalSig("suki_future_finish",
-                                                     { i8p }, voidTy);
-
-        llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
-        llvm::Function* tramp = llvm::Function::Create(
-            trampTy, llvm::GlobalValue::ExternalLinkage, "sleep_tramp",
-            module_.get());
-        {
-            llvm::BasicBlock* tb = llvm::BasicBlock::Create(*ctx_, "entry", tramp);
-            b_->SetInsertPoint(tb);
-            llvm::Value* rawCtx = tramp->getArg(0);
-            llvm::Value* cp = b_->CreateBitCast(rawCtx,
-                llvm::PointerType::getUnqual(ctxTy), "ctx");
-            llvm::Value* msAddr = b_->CreateStructGEP(ctxTy, cp, 0, "ms.addr");
-            llvm::Value* ms = b_->CreateLoad(i64, msAddr, "ms");
-            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
-            llvm::Value* fut = b_->CreateLoad(i8p, futAddr, "fut");
-            b_->CreateCall(sleepFn, { ms });
-            b_->CreateCall(finishFn, { fut });
-            b_->CreateCall(asyncFreeFn(), { rawCtx });
-            b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
-        }
-
-        llvm::FunctionType* sft = llvm::FunctionType::get(i8p, { i64 }, false);
-        llvm::Function* f = llvm::Function::Create(
-            sft, llvm::GlobalValue::ExternalLinkage, "sleep_spawn", module_.get());
-        {
-            llvm::BasicBlock* sb = llvm::BasicBlock::Create(*ctx_, "entry", f);
-            b_->SetInsertPoint(sb);
-            llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
-                                              { llvm::ConstantInt::get(i64, 0) });
-            llvm::Value* rawCtx = b_->CreateCall(asyncAllocFn(),
-                { llvm::ConstantInt::get(i64, (int64_t)sizeOf(ctxTy)) });
-            llvm::Value* cp = b_->CreateBitCast(rawCtx,
-                llvm::PointerType::getUnqual(ctxTy), "ctx");
-            llvm::Value* msAddr = b_->CreateStructGEP(ctxTy, cp, 0, "ms.addr");
-            b_->CreateStore(f->getArg(0), msAddr);
-            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
-            b_->CreateStore(fut, futAddr);
-
-            llvm::Function* startFn = declareExternalSig("suki_thread_start",
-                { llvm::PointerType::getUnqual(trampTy), i8p },
-                llvm::Type::getInt32Ty(*ctx_));
-            llvm::Value* started = b_->CreateCall(startFn, { tramp, rawCtx },
-                                                  "started");
-            llvm::Value* failed = b_->CreateICmpNE(started,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
-            llvm::BasicBlock* inlineBB = llvm::BasicBlock::Create(*ctx_, "inline", f);
-            llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(*ctx_, "spawned", f);
-            b_->CreateCondBr(failed, inlineBB, doneBB);
-            b_->SetInsertPoint(inlineBB);
-            b_->CreateCall(tramp, { rawCtx });
-            b_->CreateBr(doneBB);
-            b_->SetInsertPoint(doneBB);
-            b_->CreateRet(fut);
-        }
-        fns_["sleep_spawn"] = f;
-    }
-
-    // `withTaskGroup { group in ... }` — the body runs the closure with a fresh
-    // group on its own thread, then waits for every child before completing,
-    // which is what makes the concurrency structured.
-    void genWithTaskGroupSpawn() {
-        if (fns_.count("withTaskGroup_spawn")) return;
-        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
-        llvm::Type* voidTy = llvm::Type::getVoidTy(*ctx_);
-        llvm::Type* i64 = llvm::Type::getInt64Ty(*ctx_);
-        llvm::StructType* grpSty = handleStructTy("TaskGroup");
-        llvm::StructType* clTy = llvm::cast<llvm::StructType>(
-            layout_->closureTy(llvm::FunctionType::get(voidTy, { i8p }, false)));
-
-        // void @withTaskGroup({ i8* ctx, i8* fn } body)
-        llvm::FunctionType* bodyTy = llvm::FunctionType::get(voidTy, { clTy },
-                                                             false);
-        llvm::Function* body = llvm::Function::Create(bodyTy,
-            llvm::GlobalValue::ExternalLinkage, "withTaskGroup", module_.get());
-        {
-            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", body));
-            llvm::Value* cv = body->getArg(0);
-            llvm::Value* g = b_->CreateCall(
-                declareExternalSig("suki_taskgroup_create", {}, i8p), {});
-            llvm::Value* gv = makeHandleValue(grpSty, g);
-            llvm::Value* ctxv = b_->CreateExtractValue(cv, {0}, "body.ctx");
-            llvm::Value* fnv = b_->CreateExtractValue(cv, {1}, "body.fn");
-            llvm::FunctionType* cfty = llvm::FunctionType::get(voidTy,
-                                                               { i8p, grpSty },
-                                                               false);
-            llvm::Value* fp = b_->CreatePointerCast(fnv, cfty->getPointerTo());
-            b_->CreateCall(cfty, fp, { ctxv, gv });
-            b_->CreateCall(declareExternalSig("suki_taskgroup_wait_all", { i8p },
-                                              voidTy), { g });
-            b_->CreateCall(declareExternalSig("suki_taskgroup_free", { i8p },
-                                              voidTy), { g });
-            b_->CreateRetVoid();
-        }
-        fns_["withTaskGroup"] = body;
-
-        // Worker context: { body closure, Future }.
-        llvm::StructType* ctxTy = llvm::StructType::get(*ctx_, { clTy, i8p },
-                                                        false);
-        llvm::FunctionType* trampTy = llvm::FunctionType::get(i8p, { i8p }, false);
-        llvm::Function* tramp = llvm::Function::Create(trampTy,
-            llvm::GlobalValue::ExternalLinkage, "withTaskGroup_tramp",
-            module_.get());
-        {
-            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", tramp));
-            llvm::Value* raw = tramp->getArg(0);
-            llvm::Value* cp = b_->CreateBitCast(raw,
-                llvm::PointerType::getUnqual(ctxTy), "ctx");
-            llvm::Value* cvAddr = b_->CreateStructGEP(ctxTy, cp, 0, "cl.addr");
-            llvm::Value* cv = b_->CreateLoad(clTy, cvAddr);
-            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
-            llvm::Value* fut = b_->CreateLoad(i8p, futAddr, "fut");
-            b_->CreateCall(body, { cv });
-            b_->CreateCall(declareExternalSig("suki_future_finish", { i8p },
-                                              voidTy), { fut });
-            b_->CreateCall(asyncFreeFn(), { raw });
-            b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
-        }
-
-        llvm::FunctionType* sft = llvm::FunctionType::get(i8p, { clTy }, false);
-        llvm::Function* sp = llvm::Function::Create(sft,
-            llvm::GlobalValue::ExternalLinkage, "withTaskGroup_spawn",
-            module_.get());
-        {
-            b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", sp));
-            llvm::Value* fut = b_->CreateCall(asyncFutureCreateFn(),
-                { llvm::ConstantInt::get(i64, 0) });
-            llvm::Value* raw = b_->CreateCall(asyncAllocFn(),
-                { llvm::ConstantInt::get(i64, (int64_t)sizeOf(ctxTy)) });
-            llvm::Value* cp = b_->CreateBitCast(raw,
-                llvm::PointerType::getUnqual(ctxTy), "ctx");
-            llvm::Value* cvAddr = b_->CreateStructGEP(ctxTy, cp, 0, "cl.addr");
-            b_->CreateStore(sp->getArg(0), cvAddr);
-            llvm::Value* futAddr = b_->CreateStructGEP(ctxTy, cp, 1, "fut.addr");
-            b_->CreateStore(fut, futAddr);
-            llvm::Function* startFn = declareExternalSig("suki_thread_start",
-                { llvm::PointerType::getUnqual(trampTy), i8p },
-                llvm::Type::getInt32Ty(*ctx_));
-            llvm::Value* st = b_->CreateCall(startFn, { tramp, raw }, "started");
-            llvm::Value* failed = b_->CreateICmpNE(st,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), 0));
-            llvm::BasicBlock* ib = llvm::BasicBlock::Create(*ctx_, "inline", sp);
-            llvm::BasicBlock* db = llvm::BasicBlock::Create(*ctx_, "spawned", sp);
-            b_->CreateCondBr(failed, ib, db);
-            b_->SetInsertPoint(ib);
-            b_->CreateCall(tramp, { raw });
-            b_->CreateBr(db);
-            b_->SetInsertPoint(db);
-            b_->CreateRet(fut);
-        }
-        fns_["withTaskGroup_spawn"] = sp;
-    }
-
-    void ensureAsyncSpawns(const NodeList& decls) {
-        genSleepSpawn();
-        genWithTaskGroupSpawn();
-        for (auto& d : decls) {
-            if (!d || d->kind != NodeKind::FunctionDecl) continue;
-            auto* fn = static_cast<FunctionDecl*>(d.get());
-            if (fn->isAsync) genAsyncSpawn(fn, fn->name);
-        }
-    }
+    // withTaskGroup 运行时辅助已迁移至 ConcurrencyLowerer，此处为转发桩。
+    void genWithTaskGroupSpawn() { conc_.genWithTaskGroupSpawn(); }
 
     llvm::Value* genCall(CallExpr* e) {
         if (!e->callee) return nullptr;
@@ -4243,7 +4630,19 @@ private:
             auto* m = static_cast<MemberExpr*>(e->callee.get());
             const Type* bt = m->base ? m->base->semaType : nullptr;
             if (bt && bt->kind == TypeKind::Named && bt->record) {
-                auto it = methodFns_.find(bt->name + "." + m->member);
+                const std::string mkey = bt->name + "." + m->member;
+                auto it = methodFns_.find(mkey);
+                // Runtime-backed concurrency members of the base Task / TaskGroup
+                // are emitted on first use, so programmes that never touch them
+                // ship no such machinery. The generator moves the IR builder into
+                // the new function, so restore the caller's insertion point.
+                if (it == methodFns_.end() &&
+                    (bt->name == "Task" || bt->name == "TaskGroup")) {
+                    llvm::BasicBlock* savedIP = b_->GetInsertBlock();
+                    genConcurrencyBuiltinMethod(bt->name, m->member);
+                    if (savedIP) b_->SetInsertPoint(savedIP);
+                    it = methodFns_.find(mkey);
+                }
                 if (it != methodFns_.end()) {
                     llvm::Function* mf = it->second;
                     llvm::FunctionType* fty = mf->getFunctionType();
@@ -4365,6 +4764,15 @@ private:
                     if (ct) return genChannelInit(ct, e);
                     return nullptr;
                 }
+                // `TaskGroup<T>()` allocates a group that stores children results of
+                // type T; the element size drives the runtime bookkeeping.
+                if (ct && ct->kind == TypeKind::Named &&
+                    ct->name.rfind("TaskGroup<", 0) == 0) {
+                    auto tgit = structTypes_.find(ct->name);
+                    if (tgit != structTypes_.end() && !tgit->second->elements.empty())
+                        return genTaskGroupInit(tgit->second->elements[0]);
+                    return genTaskGroupInit(nullptr);
+                }
                 auto gsit = structTypes_.find(cname);
                 if (gsit != structTypes_.end()) return genStructInit(gsit->second, e);
                 auto gcit = classTypes_.find(cname);
@@ -4382,7 +4790,13 @@ private:
         // `Task { ... }` runs its body on a new thread; `TaskGroup()` allocates the
         // group that will own its children.
         if (n == "Task" && !e->arguments.empty()) return genTaskInit(e);
-        if (n == "TaskGroup" && e->arguments.empty()) return genTaskGroupInit();
+        if (n == "TaskGroup" && e->arguments.empty()) return genTaskGroupInit(nullptr);
+        if (n.rfind("TaskGroup<", 0) == 0) {
+            auto tgit = structTypes_.find(n);
+            if (tgit != structTypes_.end() && !tgit->second->elements.empty())
+                return genTaskGroupInit(tgit->second->elements[0]);
+            return genTaskGroupInit(nullptr);
+        }
         // A call naming a struct type is a constructor invocation.
         auto sit = structTypes_.find(n);
         if (sit != structTypes_.end()) return genStructInit(sit->second, e);
@@ -4400,10 +4814,11 @@ private:
         std::vector<bool> isNilArg;
         std::vector<std::string> argTypeNames;
         bool calleeIsAsync = false;
+        FunctionDecl* fdecl = nullptr;
         auto fdit = fnDecls_.find(n);
         if (fdit != fnDecls_.end()) {
             // 默认参数 / 变长参数展开（规范 3.1）。
-            FunctionDecl* fdecl = fdit->second;
+            fdecl = fdit->second;
             calleeIsAsync = fdecl->isAsync;
             std::vector<bool> provided(fdecl->params.size(), false);
             for (size_t i = 0; i < e->arguments.size(); ++i) {
@@ -4508,6 +4923,18 @@ private:
             if (n == "sleep") spawnSym = "sleep_spawn";
             else if (n == "withTaskGroup") spawnSym = "withTaskGroup_spawn";
             else spawnSym = n + "_spawn";
+            // Generate the worker spawn lazily — it only exists when the async
+            // call is actually made, so an unused concurrency feature costs
+            // nothing in .text and pulls in no runtime symbols. The generators
+            // move the IR builder into the new function, so restore the caller's
+            // insertion point afterwards.
+            if (fns_.find(spawnSym) == fns_.end()) {
+                llvm::BasicBlock* savedIP = b_->GetInsertBlock();
+                if (n == "sleep") genSleepSpawn();
+                else if (n == "withTaskGroup") genWithTaskGroupSpawn();
+                else if (calleeIsAsync && fdecl) genAsyncSpawn(fdecl, n);
+                if (savedIP) b_->SetInsertPoint(savedIP);
+            }
             auto sit = fns_.find(spawnSym);
             if (sit == fns_.end() || !sit->second) return nullptr;
             std::vector<llvm::Value*> callArgs;
@@ -4523,7 +4950,25 @@ private:
     }
 
 public:
-    bool generate(const NodeList& decls, std::string& errOut) {
+        bool generate(const NodeList& decls, std::string& errOut) {
+        registerTypes(decls);
+        generateBodies(decls);
+        std::string verifyErr;
+        llvm::raw_string_ostream os(verifyErr);
+        if (llvm::verifyModule(*module_, &os)) {
+            // Include the module so the offending function is visible even
+            // though the module is rejected.
+            errOut = "IR verification failed: " + os.str() + "\n" + irText();
+            return false;
+        }
+        return true;
+    }
+
+    private:
+    // Phase 1: register every type, function, method, generic instance and
+    // global *before* any body is generated. Generic type/function instances
+    // are emitted eagerly here because their bodies need bound type params.
+    void registerTypes(const NodeList& decls) {
         // The data layout must be established first: TypeLayout relies on it to
         // compute ABI padding for struct/class field offsets.
         std::string err;
@@ -4662,6 +5107,19 @@ public:
             }
         }
 
+        // All functions (foreign + ordinary) must be declared *before* any body is
+        // generated. In particular, a generic struct's method bodies are emitted
+        // eagerly below (the generic-type instantiation loop), and those bodies may
+        // call foreign functions — so the foreign symbols must already exist in
+        // `fns_` or `genCall` would fabricate a wrong variadic placeholder.
+        std::vector<FunctionDecl*> genericFns;
+        for (auto& d : decls) {
+            if (!d || d->kind != NodeKind::FunctionDecl) continue;
+            auto* fn = static_cast<FunctionDecl*>(d.get());
+            if (!fn->genericParams.empty()) genericFns.push_back(fn);
+            else declare(fn);
+        }
+
         // Generic type instantiations (规范 5.2): each `Box<Int>` is a distinct
         // record with concrete members. Register it under its mangled key so
         // constructor calls and method dispatch resolve per instance, and emit its
@@ -4685,6 +5143,12 @@ public:
                     // being declared from the signature and lowered from a body.
                     if (gi.typeName == "Channel") {
                         genChannelMethod(mf, instTy);
+                        continue;
+                    }
+                    // TaskGroup<T>'s members are runtime-backed too; the element
+                    // type T drives how the child result is stored / collected.
+                    if (gi.typeName == "TaskGroup" && !instTy->elements.empty()) {
+                        genTaskGroupMethod(mf, instTy);
                         continue;
                     }
                     const std::string mkey = gi.key + "." + mf->name;
@@ -4717,16 +5181,6 @@ public:
             globalOrder_.emplace_back(gv, gt);
         }
 
-        // A generic function is never emitted on its own — only its
-        // instantiations are, each an ordinary function named `f<T>`.
-        std::vector<FunctionDecl*> genericFns;
-        for (auto& d : decls) {
-            if (!d || d->kind != NodeKind::FunctionDecl) continue;
-            auto* fn = static_cast<FunctionDecl*>(d.get());
-            if (!fn->genericParams.empty()) genericFns.push_back(fn);
-            else declare(fn);
-        }
-
         // Monomorphise: for each recorded instance, re-check the generic body
         // with its type parameters bound — which annotates the shared AST with
         // that instance's concrete types — and emit it immediately, so the next
@@ -4751,17 +5205,20 @@ public:
             // Bodies of the instances were emitted above; anything still pending
             // is a non-generic function.
         }
-        // 自定义下标的 getter/setter 必须在生成普通函数体之前声明，否则
+    }
+    // Phase 2: generate the deferred function/initialiser/method/accessor/
+    // deinit bodies now that every symbol exists in the module.
+    void generateBodies(const NodeList& decls) {        // 自定义下标的 getter/setter 必须在生成普通函数体之前声明，否则
         // 函数体内对 `obj[idx]` 的调用在查表时还找不到对应方法（规范 3.1）。
         genSubscriptBodies(decls);
         // Async spawns must exist *before* bodies are generated: a body (e.g.
         // @main) that awaits an async call resolves `<fn>_spawn` at that moment, and
         // a missing entry silently emits no call at all, leaving the Future slot
         // uninitialised.
-        ensureAsyncSpawns(decls);
-        // Task.wait / TaskGroup.addTask / waitForAll are runtime-backed, so their
-        // bodies are emitted here rather than lowered from SukiCode.
-        ensureConcurrencyBodies();
+        // Concurrency machinery (Task.wait / TaskGroup.addTask / waitForAll, the
+        // sleep / withTaskGroup spawns and their worker trampolines) is no longer
+        // emitted up-front: each piece is generated lazily the first time it is
+        // actually used, so a plain programme ships none of it.
         for (auto& pb : pendingBodies_) {
             // 外部函数（foreign）只声明符号、不发射函数体，否则会与
             // runtime.c 里的真实定义产生 multiple definition 冲突。
@@ -4801,17 +5258,8 @@ public:
             if (it != methodFns_.end()) genMethodBody(mf, owner, it->second);
         }
 
-        std::string verifyErr;
-        llvm::raw_string_ostream os(verifyErr);
-        if (llvm::verifyModule(*module_, &os)) {
-            // Include the module so the offending function is visible even
-            // though the module is rejected.
-            errOut = "IR verification failed: " + os.str() + "\n" + irText();
-            return false;
-        }
-        return true;
     }
-
+    public:
     std::string irText() {
         std::string out;
         llvm::raw_string_ostream os(out);
@@ -5115,11 +5563,20 @@ public:
         b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
 
         llvm::Type* selfTy = layout_->lower(currentOwner_);
-        if (ownerMutating_.count(currentOwner_->name))
-            selfTy = llvm::PointerType::getUnqual(selfTy);
-        llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
-        b_->CreateStore(f->getArg(0), selfSlot);
-        locals_["self"] = selfSlot;
+        if (ownerMutating_.count(currentOwner_->name)) {
+            // A mutating owner (the type declares at least one `mutating`
+            // member) hands `self` to its accessors by pointer — exactly like a
+            // `mutating` method. Bind `self` directly to the incoming pointer so
+            // field GEPs dereference it once. Wrapping the pointer in an extra
+            // alloca would make `genRefBasePtr` (which only strips a level of
+            // indirection for reference types) emit a spurious second hop, and
+            // every `self.<field>` access would then read the wrong address.
+            locals_["self"] = f->getArg(0);
+        } else {
+            llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
+            b_->CreateStore(f->getArg(0), selfSlot);
+            locals_["self"] = selfSlot;
+        }
 
         // A setter/observer names its incoming value; default to `newValue` /
         // `oldValue` when the declaration omitted the parameter.

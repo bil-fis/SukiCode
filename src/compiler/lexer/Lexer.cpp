@@ -231,7 +231,13 @@ std::vector<Token> preprocess(std::vector<Token> toks, DiagnosticEngine& diags) 
                     else diags.reportWarning("#warning " + msg);
                 }
             } else {
-                diags.reportError("unknown preprocessor directive '#" + dname + "'");
+                // 未知指令名（#makeExpr / #macroName / #selector 等）：这不是预处理
+                // 指令，而是宏调用 / 宏原语引用的 `#ident`。原样放回流，交给 Parser
+                // 解析为 Hash + Ident，再由 Sema 的宏展开 pass 处理（规范 5.6）。
+                if (emitNow()) {
+                    out.push_back(toks[hpos]);     // '#'
+                    out.push_back(toks[hpos + 1]); // 标识符
+                }
             }
         } else {
             if (emitNow()) out.push_back(toks[i]);

@@ -1,228 +1,137 @@
-# SukiCode 编译器未实现功能 — 实现计划（审计修正版）
+# SukiCode 编译器「原生功能未实现」清单与实施计划
 
-> 对照 `SukiCode_Specification.md`（**第 11 次修订**）整理。状态来自对 `src/compiler`、`src/runtime`、`src/stdlib`、`tools` 的**全量代码审计**（使用代码探索 agent 通读真实源码 + `moduleTest` 测试覆盖反推），而非 v1.0.0 旧计划的臆测。
->
-> **审计关键结论**：v1.0.0 旧计划严重低估了前端进度。以下特性经核实**已实现**，已移出本计划：
-> `#if` 条件编译、`public/internal/fileprivate/private` 访问控制、嵌套类型 `Outer.Inner`、
-
-`required`/`convenience` init 链、`where T: Equatable` 约束、`associatedtype` 绑定强制、`some` 不透明返回（协议约束暂略）、`unsafe {}` 上下文强制、`Owned<class>` 禁止实例化、内联汇编 `asm`、`MemoryLayout<T>`、`@_cdecl` 自定义符号名；以及旧计划已标注的 throws/ARC+weak/willSet/didSet/final/override/Set/fallthrough/repeat-while/guard/区间/命名元组/typealias/协议扩展默认实现/deinit/下标/inout/默认参数+变长/@escaping/[weak self]。
->
-> 本计划**只覆盖仍未实现**的部分，按依赖关系分阶段。每条给出：现状（含代码证据）、待实现、落地文件。
-
-## 关键阻塞（必须先消解）
-
-- **BLK-A：`src/stdlib/` 为空**（仅 `CMakeLists.txt` 占位 `"Placeholder for now."`）。C runtime（`src/runtime/runtime.c`）是**真实的**（ARC/weak/array/dict/string/mutex/atomic 齐全），阻塞点在 `.suki` 标准库骨架。被整体阻塞：String 视图、Result、Error/CustomStringConvertible、Atomic/Mutex 上层类型、MMap/DynamicLibrary/sys、Task/Future/TaskGroup、Channel、actor 执行器、COW。
-- **BLK-B：后端仍依赖外部 clang**。`main.cpp:791-877` 用 `std::system("clang -c ...")` 把 `.ll` 降为目标文件并链接（同时链接 `runtime.c`），无自包含 LLVM（`AsmPrinter`/`Target`/`MC`）、无 LLD。这同时阻塞 `-S`/`--emit-llvm`/`-c` 多文件/`--sysroot`/`-O*`/`--incremental` 与 DWARF 的落地。
+> 对照规范 `SukiCode_Specification.md`（v1.0.0）。审计依据：`src/compiler` 的 Lexer / Parser / Sema / codegen 实现、`moduleTest/` 测试覆盖，以及 `run_all_tests.sh` 的 `KNOWN_PENDING`。
+> `moduleTest/pending/` 当前为空，因此「未实现」由源码与测试推断得出。
 
 ---
 
-## 阶段 0：关键阻塞消解
+## 一、完全未实现
 
-### BLK-A 重建 `src/stdlib` 骨架 — ✅ 已完成（2026-10-04）
-- **现状（完成）**：已新增 `src/stdlib/{core,concurrency,system,objc}/*.suki` 四个模块源文件与 CMake 清单。`main.cpp` 增加 `loadImportedStdlib`（**import 驱动**的最小模块加载器：仅当用户写 `import X` 时，把 `SUKI_STDLIB_DIR/<X>/<X>.suki` 解析并预编译进同一翻译单元，既不破坏现有测试套件、又实现了「能 import 并链接」）；`CMakeLists` 注入 `SUKI_STDLIB_DIR` / `SUKI_STDLIB_FILES`（glob 得到的标准库文件清单）。
-- **关键修复**：`IRGeneratorImpl.cpp` 的 `generateBodyAs` 循环增加 `if (pb.first->isForeign) continue;`——`foreign` 函数此前会被错误地发射空 body，与 `runtime.c` 的真实定义产生 multiple definition 冲突；现只声明符号、不发射函数体。
-- **落地文件**：`src/stdlib/core/core.suki`、`src/stdlib/concurrency/concurrency.suki`、`src/stdlib/system/system.suki`、`src/stdlib/objc/objc.suki`、`src/stdlib/CMakeLists.txt`、`src/compiler/main.cpp`、`src/compiler/codegen/IRGeneratorImpl.cpp`、`src/compiler/CMakeLists.txt`。
-- **验证**：`import core` 程序 `stringLength/stringConcat/stringToInt` 正确输出 `5hello world123`（rc=0，无 IR 校验错误）；`core`/`concurrency`/`system`/`objc` 四个模块均可 `build` rc=0；`moduleTest/codegen/struct.suki` 回归通过。
-- **遗留**：stdlib 内容目前仅为「协议声明 + 按值 String/Int 的安全 foreign 包装 + 命名便捷函数」骨架；指针类（Array/Dict/mutex/atomic/libc）API 留给各自 todo（C6/S3/E5）。另发现编译器既有 bug：整数字面量在比较里宽度不匹配（`icmp ne i32 %4, i64 0`），当前用「前缀/后缀判断返回 Int32 而非 Bool」规避，该 bug 应在后续统一修复。
+### 1. 宏系统（§5.6）——本期实现目标
+- **M1（已完成 ✅）**：`@freestanding(expression)` 端到端可用——宏声明解析、`#makeExpr` 模板、`\(arg)` unquote（AST→源码递归序列化 + 运算符实参括号保护）、重解析 + 就地替换、嵌套宏调用、`sukic --expand-macros` 诊断。详见 `moduleTest/codegen/macros.suki`。
+- **M2（已完成 ✅）**：`@freestanding(declaration)` 顶层/嵌套声明位宏、`@attached(member)` 成员注入、`#unique` 卫生性唯一标识符、`MacroExpansionTooComplex` 复杂度上限、展开错误携带子诊断文本。详见第 6.5 节与 `moduleTest/codegen/macros_m2.suki`。
+- 仍缺失（M3）：沙盒（`SukiSyntax` 受限 API 解释执行，当前 M1/M2 用「源码文本替换 + 重解析」合规实现）、`@attached(accessor|peer)`、`import SukiSyntax` 元编程 API、卫生性重命名闭环（M1/M2 表达式/成员宏通常无新绑定，unquote 文本天然保留调用方作用域，`#unique` 提供唯一名）。
+- 现状：M1/M2 之前仅有 `MacroDecl` AST 节点与 `main.cpp` 的 pretty-print；现已补齐 Parser / Sema 展开 pass，codegen 复用现有逻辑。
 
-### BLK-B 自包含 LLVM 后端 + LLD
-- **现状**：`main.cpp` `commandBuild`/`commandRun` 调外部 `clang`（`SUKI_CLANG_DRIVER "clang"`）。
-- **待实现**：在驱动中引入 LLVM C++ API（`llvm::Target` + `AsmPrinter` 直接产 `.o`；链接改用 `lld::elf/coff/wasm::link`）；新增 `-fuse-ld=lld`（默认开）、`--integrated-as`（默认开）。替换所有 `std::system("clang ...")`。
-- **落地文件**：`src/compiler/main.cpp`、新增 `src/compiler/codegen/LLVMEmit.*`、`CMakeLists.txt`（链接 `lld`）。
+### 2. C / ObjC 互操作的关键项（§13）
+- `@convention(c|stdcall)`（§13.6）：未实现。
+- `unsafeBitCast`（§13.2.2）：未实现。
+- `#selector`（§13.2.4）：未实现。
+- 已实现：`extern "C"` 声明、`@_cdecl` 导出、`objc_*` 运行时函数已规划但 ObjC 消息语法为预留可选（§15.5 明确未实现）。
 
----
+### 3. 规范要求的原生类型缺失（§6 / §7 / §8 / §12）
+- `UnsafePointer` / `UnsafeMutablePointer` / `UnsafeBufferPointer` 系列（§6.5 / §8.1）：规范要求泛型裸指针类型，但 stdlib 中未定义，仅有非泛型、固定 `Int` 地址的 `RawPtr`（`src/stdlib/memory.suki`）。
+- `ThreadPool` / `DispatchQueue`（§7.1 / §7.6 / §12.3）：作为命名类未实现（仅 `Future`/`Atomic`/`Mutex` 已注册为内建；`Task`/`TaskGroup`/`Channel`/`select`/`for await` 已可用）。
+- `ChannelPool`（§6.2 / §7.5）：规范提及但编译器无定义，仅 `Channel`。
+- `Result<T, E>`（§9.4）：无类型、无 codegen，仅 `Error` 协议。
 
-## 阶段 1：类型系统收尾
+### 4. 控制流（§1.7）
+- `loop` 无限循环关键字：`Token.h` 关键字表中**无 `loop`**（仅 `while`/`for`/`repeat`），完全未实现。
+- 标签 break（`outer: loop { … break outer }`）：`BreakStmt` 有 `label` 字段，但 codegen 仅跳最内层，标签语法与跳转未实现。
 
-### T1 多文件模块 / `import` 跨文件符号解析（§1.1 / §10.2）
-- **现状**：`Parser.cpp:153/181` 解析 `ImportDecl`；`main.cpp:92` 仅 dump；`main.cpp:848/855` `build`/`run` 强制单文件；**零跨文件符号解析**。
-- **待实现**：驱动一次接收同模块多文件，合并 AST 后跑 Sema；`ImportDecl` 解析为依赖模块符号表引用，跨模块查 `public` 符号（配合 T1 访问控制）。
-- **落地文件**：`main.cpp`、`Sema.cpp`、`AST.h`。
+### 5. 属性（§8.7 / §7.2）
+- `@no_mangle`、`@panic_handler`、`@global_allocator`、`@executor`、`@MainActor`：均无解析 / 语义 / codegen。仅 `@main` 与 `@enum(C)` 被处理。
 
-### T2 `@enum(C)` C 兼容布局（§2.3）
-- **现状**：`isCEnum` 仅在 `AST.h:114`/`Sema.cpp:608`/`Parser.cpp:495` **存储**，代码无任何读取/强制分支；原始枚举偶然降为 i64 使 `enum_c.suki` 通过，但无「禁关联值/union 重叠」语义。
-- **待实现**：`Sema` 标记后禁止关联值（仅原始值或空载荷）；`TypeLayout` 增加 C-enum 分支（无 tag、仅 union、offset 0）；codegen 按 C 布局生成。
-- **落地文件**：`Sema.cpp`、`TypeLayout.cpp`。
-
-### T3 `Any` / `AnyObject` 装箱 + `as?`/`as!`/`is` 的 codegen（§2.8）
-- **现状**：类型降 `i8*`（无 typeId/vtable）；`Sema` 对 `as?`/`is` 有检查（`Sema.cpp:2349-2357`），但 **`IRGeneratorImpl` 全文件零 `AsExpr`/`IsExpr` 分支** → `as?`/`as!` 无法降 IR。
-- **待实现**：生成存在容器 `{payload 字节, typeId, vtable 指针}`；`as?`/`as!`/`is` 在 codegen 生成 typeId 检查 + 位转换（`genExistentialBox`/`genExistentialUnbox`）。
-- **落地文件**：`Sema.cpp`、`IRGeneratorImpl.cpp`。
-
-### T4 `String` 视图（§1.5）
-- **现状**：插值已实现；`.unicodeScalars`/`.characters`/`.utf8`/`.utf16` 视图 **0 匹配**。runtime 仅有 `suki_str_utf8_count`/`utf8_get`。
-- **待实现**：在恢复的 `src/stdlib` 中实现 `String` 内部 COW 存储（配合 BLK-A 与 S1）与四个 `Collection` 视图。
-- **落地文件**：`src/stdlib/core/String.suki`（依赖 BLK-A）。
+### 6. 其它独立项
+- `@autoclosure`（§3.5）：仅 `ClosureExpr::isAutoclosure` AST 占位字段，无实现。
+- 泛型 `typealias`（§2.10）：`collectTypeAlias`（`Sema.cpp:1192`）忽略 `genericParams`，仅非泛型别名可用。
 
 ---
 
-## 阶段 2：宏系统
+## 二、部分实现（有骨架但行为不完整）
 
-### M1 重建 `MacroExpander` 全套（§5.6）
-- **现状**：**彻底缺失**——`MacroExpander` 已删除且未重建；`AST.h:231` 仅残留 `MacroDecl` 节点；`Parser.cpp` 对 `MacroDecl`/`parseMacro` **零命中**（连 `@macro` 解析路径都不存在）；`main.cpp:161-162` 仅 dump。
-- **待实现**：
-  - 重建 `src/compiler/macro/MacroExpander.h/.cpp`；
-  - `Parser`：`@freestanding(expression/declaration)`、`@attached(member/accessor/peer)`、`macro` 声明；在 Sema 前插入 MacroPass（AST→AST）；
-  - **`SukiSyntax` API**：`SyntaxNode`/`SyntaxExpr`/`SyntaxDecl` 元编程 API（仅宏库作用域可见）；
-  - **`#makeExpr` / `#makeDecl`**：字符串字面量 + `\(node)` unquote（仅接受 `SyntaxNode`，先源码文本替换后整段解析），配合卫生性；
-  - **卫生性**：展开体新符号加 `__suki_macro_<scopeID>_` 前缀；`#unique("base")` 生成模块内唯一名；
-  - **沙盒**：宏体禁止文件 I/O/网络/进程/系统调用，仅遍历/构造/重写 `Syntax` 节点与字符串拼接；
-  - 调试：`sukic -expand-macros`、`sukipm build --verbose-macro`。
-- **落地文件**：`src/compiler/macro/MacroExpander.*`、`Parser.cpp`、`Sema.cpp`（macro pass 钩子）、新增 `src/compiler/macro/SyntaxAPI.*`。
+- **actor 隔离（§7.4）**：仅「单次自旋锁 + async 边界」（`IRGeneratorImpl.cpp` 的 actor 成员调用），串行执行器队列与重入（reentrancy）语义未建模。
+- **条件编译 `#if`（§10.3）**：`Lexer` 支持 `#if/#else/#endif` 与 `-D` 宏，但条件求值仅 `defined()`/布尔，**无 `os()`/`arch()` 函数**（测试 `cond_compile.suki` 仅用 `#if false`）。
+- **`let` 确定性赋值分析（§1.3）**：延迟初始化规则（所有路径恰好赋值一次、禁止未赋值读取）**未实现**（全仓无 definite-assignment 遍）。
+- **`import` 跨模块 / 访问控制（§10.1）**：当前单模块模型，`import` 基本占位；`public`/`internal`/`fileprivate` 与 `internal` 等同可见，仅 `private` 真正强制。
+- **C 互操作**：`extern`/`@_cdecl` 已实现，但 `@convention`/`unsafeBitCast`/`#selector` 未实现。
 
 ---
 
-## 阶段 3：内存与系统编程
-
-### S1 `Owned<T>` 与 COW 的 `.unique()` 独占性（§6.4）
-- **现状**：`Owned<class>` 已禁（`Sema.cpp:992-1033`，`:1026-1031` 报错）；`RefKind::Owned` ABI 带 `i1 moved` flag（`TypeLayout.cpp:196-198`）；但 **COW `.unique()` 独占性零命中**，codegen 仍无真正「禁拷贝/释放所有权」逻辑。
-- **待实现**：当 `T` 为 COW 类型（Array/String/Dictionary），构造与**每次移动**调用 `.unique()` 分离独占缓冲区；`Owned<[UInt8]>` 移动后不与旧副本共享存储；codegen 增加 `genMoveValue` ABI（不 retain、接收后释放所有权）。
-- **落地文件**：`Sema.cpp`、`IRGeneratorImpl.cpp`、`src/stdlib`（COW 存储，依赖 BLK-A/T4）。
-
-### S2 `unowned` 引用运行时（§6.1）
-- **现状**：语法识别（`Parser.cpp:302-305/673-676/1949-1953`）；`RefKind::Unowned`（`Type.h:52`）；`TypeLayout.cpp:194` 与 weak 同处理为指针；但 **runtime 无 `suki_unowned_*`**（仅 weak）。
-- **待实现**：runtime 新增 `suki_unowned_*`（非可选引用，访问时断言对象存活）；codegen 为 `[unowned self]` 捕获与 `unowned var` 生成 unowned 读取。
-- **落地文件**：`runtime.c`、`IRGeneratorImpl.cpp`。
-
-### S3 `MMapRegion` / `DynamicLibrary` / `sys` 模块（§8.3/8.4/8.5）
-- **现状**：runtime/stdlib **0 匹配**（已删除）。
-- **待实现**（恢复 `src/stdlib`）：`MMapRegion`（`mmap`/`munmap`）、`DynamicLibrary`（`dlopen`/`dlsym`/`dlclose` + `lookup`）、`sys`（`fork`/`exec`/`waitpid`/`open`/`read`/`write`/`ioctl`/`socket`/`bind`/`listen`/`accept`/`signal`/`sigaction`/`clock_gettime`/`nanosleep` 薄封装，失败抛 `SystemError`）。
-- **落地文件**：`src/stdlib/system/**`、`runtime`（薄封装，依赖 BLK-A）。
-
-### S4 裸机 `bare-metal` 支持（§8.7）
-- **现状**：仅 `TargetInfo.cpp:51` 一句注释；无 `_start`/`@no_mangle`/`@panic_handler`/`@global_allocator` 解析或生成。
-- **待实现**：`--target=*-none-*`/`bare-metal` 模式禁用 stdlib、仅 `core`；`Parser` 解析 `@no_mangle`/`@_cdecl`/`extern "C" fn _start()`/`@panic_handler`/`@global_allocator`；codegen 生成 `_start` 入口与 panic_handler 符号，不调用 ARC/runtime 初始化。
-- **落地文件**：`main.cpp`、`Parser.cpp`、`IRGeneratorImpl.cpp`。
+## 三、已知 pending 示例（组合级缺口）
+- `run_all_tests.sh` 的 `KNOWN_PENDING` 登记 `examples/concurrency.suki`，标注仍缺「actor 隔离 / select / for await / 区间 `0..<100`」组合。但 `select.suki`、`for_await.suki`、`actor_isolation.suki`、`channel.suki`、`task_group.suki`、`with_task_group.suki` 等**独立 codegen 测试均通过**——特性单项可用，完整 showcase 组合尚未通过。
 
 ---
 
-## 阶段 4：并发与异步
-
-### C1 `async`/`await` 状态机（LLVM coroutine）（§7.2）
-- **现状**：`Parser.cpp:333/342/882/1399` 仅置 flag；**Sema 无 await 强制**（grep `isAwait/await` 仅 `Sema.cpp:2285` 注释）；codegen `:1691-1693` `if(u->isTry||u->isAwait) return v;` **透传**；无 `@llvm.coro.*`、无状态机。
-- **待实现**：Sema 标记 async 函数、识别 `await` 点（非 async 上下文用 await 报错）；codegen 用 `@llvm.coro.id/resume/suspend/end` 将 async 函数体 split 为 resume/suspend，每个 `await` 生成挂起点，async 返回包装为 `Future<T>`/`TaskHandle`；runtime 增加协程调度/挂起恢复。
-- **落地文件**：`Sema.cpp`、`IRGeneratorImpl.cpp`、`runtime.c`（依赖 BLK-A/C3）。
-
-### C2 `actor` 隔离与串行执行器（§7.4）
-- **现状**：actor 当普通 class（`TypeDeclKind::Actor`、`TypeLayout.cpp:70/241` 同指针+rc；codegen `:2170/3474` 等同 class）；**无隔离/执行器**。
-- **待实现**：Sema 标记 actor 方法默认 async、`nonisolated` 豁免；codegen 给 actor 实例挂串行执行器（消息队列），方法调用转 `await` 入队串行执行；可重入：`await` 后重查条件（生成重入安全桩）。
-- **落地文件**：`Sema.cpp`、`IRGeneratorImpl.cpp`、`runtime.c`（actor 执行器，依赖 C1）。
-
-### C3 `Task` / `TaskGroup` / `Future`（§7.1/§7.3）
-- **现状**：仅词法关键字（`Task`/`Spawn`）+ `Task { }` 尾闭包解析（`Parser.cpp:738/1426/1554`）；**无线程池、无 Future/TaskGroup runtime**；stdlib 空。
-- **待实现**：全局协作线程池（工作窃取）；`Future<T>.await(timeout:)` 超时抛 `TimeoutError`、响应父任务取消抛 `CancellationError`；`Task`（可取消/`isCancelled`/`withTaskCancellationHandler`/`Task.sleep`）、`TaskGroup`（`withTaskGroup` 并行子任务、子任务继承取消）。
-- **落地文件**：`src/stdlib/concurrency/**`、`runtime.c`（线程池，依赖 BLK-A/C1）。
-
-### C4 `Channel<T>` + `select` 语句（§7.5）
-- **现状**：`select` 解析为无 subject 的 `SwitchStmt`（`Parser.cpp:1040-1057`）；`Channel` 仅关键字，无 `Channel<T>` 类型、无收发 codegen；`moduleTest` 零 select/channel 测试。
-- **待实现**：
-  - `AST.h` 新增 `SelectStmt`（区分 **发送** `valueExpr <- channel`、接收 `let binding <- channel`、**省略绑定** `case <- channel`、`default`）；
-  - `Parser` 按**第 11 次修订方向**重写：`case 42 <- ch2`（发 42 到 ch2）、`case let msg <- ch1`（从 ch1 收并绑 msg）、`case <- ch`（仅等待就绪）；
-  - Sema 校验 select 在 async 上下文；
-  - codegen 多路等待 + 公平随机选一个就绪分支 + 非阻塞 `default` 路径；
-  - stdlib：`Channel<T>` 有界（容量 + 背压 `.block/.dropNewest/.dropOldest/.throw`）/无界模式。
-- **落地文件**：`AST.h`、`Parser.cpp`、`Sema.cpp`、`IRGeneratorImpl.cpp`、`src/stdlib/concurrency/**`（依赖 C1/C3）。
-
-### C5 `@MainActor` / `@executor(X)` 自定义执行器（§7.2）
-- **现状**：**0 匹配**。
-- **待实现**：Sema 对函数/类型上的 `@MainActor`/`@executor(X)` 属性 → 调用点强制在对应执行器运行（复用 C2 actor 执行器机制）；跨执行器调用插入 hop（状态保存/恢复）。
-- **落地文件**：`Sema.cpp`、`IRGeneratorImpl.cpp`（依赖 C2）。
-
-### C6 `Atomic` / `Mutex` / `RWLock` / `Semaphore` / `Condition` / `DispatchQueue`（§7.6）
-- **现状**：runtime 有底层 `SukiMutex`/`suki_mutex_*`（`runtime.h:131-137`）、`suki_atomic_*`（`runtime.h:139-141`，`runtime.c:611-637`）；但**无 Suki 级 `Atomic<T>`/`Mutex`/`RWLock`/`DispatchQueue` 类型**（stdlib 空）。
-- **待实现**：stdlib 基于 pthread + LLVM atomic intrinsics 封装上述类型。
-- **落地文件**：`src/stdlib/concurrency/**`（依赖 BLK-A）。
+## 四、已确认实现（供对照，不全列）
+泛型（含 `where`/associatedtype/`some P`）、协议（继承/默认实现/关联类型）、extension、subscript、willSet/didSet、computed property、`Optional` 与可选链（`?.`/`!`/`??`）、非泛型 typealias、tuple（含标签）、async/await（线程+Future 模型）、Task/TaskGroup/withTaskGroup/for await、select、Channel、Future/Atomic/Mutex 内建、`extern`/`@_cdecl`、内联 `asm`、`unsafe` 块约束、`move`/`Owned<T>`（class 拒绝已修）、guard/repeat-while/fallthrough/switch+where+区间、`Range`+for-in、字符串插值/raw/多行、继承 override/final/required/convenience/super.init、闭包捕获 `[weak/unowned]`/`@escaping`/尾随/箭头、`enum` raw/关联值/`@enum(C)`、throws/do-catch/try?/try!/Error、`@main`/`@enum`。
 
 ---
 
-## 阶段 5：错误处理与互操作
-
-### E1 `Result<T, E>`（§9.4）
-- **现状**：**0 匹配**；stdlib 空。
-- **待实现**：`Result<T, E: Error>` 枚举（`.success`/`.failure`）+ 常用方法。
-- **落地文件**：`src/stdlib/core/Result.suki`（依赖 BLK-A）。
-
-### E2 `Error` / `CustomStringConvertible` / `localizedDescription`（§9.3）
-- **现状**：仅 `TypeKind::Error` 占位（`Type.h:32`）；0 实现；stdlib 空。
-- **待实现**：`Error` 空协议 + 默认 `localizedDescription`（`String(describing: self)`）；`CustomStringConvertible` 协议。
-- **落地文件**：`src/stdlib/**`（依赖 BLK-A/T4）。
-
-### E3 `extern "stdcall"` 调用约定（§13.1/§13.3）
-- **现状**：`@_cdecl("name")` 已实现（`Parser.cpp:212-224/341`、`AST.h:163`、`IRGeneratorImpl.cpp:151-153`）；**`stdcall` 调用约定 0 匹配**。
-- **待实现**：`extern` 声明增加调用约定字段（C/stdcall → LLVM `callcc`/函数 attribute）；解析 `extern "stdcall" func ...`。
-- **落地文件**：`Sema.cpp`、`Parser.cpp`、`IRGeneratorImpl.cpp`。
-
-### E4 `#selector`（§13.2.4）
-- **现状**：**0 匹配**。
-- **待实现**：`Parser`/`Sema`：`#selector(method)` → 展开为 `sel_registerName("method")` 调用（依赖 E5 ObjC 运行时预声明）。
-- **落地文件**：`Parser.cpp`、`Sema.cpp`（依赖 E5）。
-
-### E5 Objective-C 互操作（§13.2）
-- **现状**：**0 匹配**（无运行时预声明/消息发送）。**注意**：规范第 11 次明确——ObjC 消息语法属预留可选特性，**当前未定义、未实现**；现阶段唯一途径是 §13.2 的 `objc_msgSend` 手动互操作。
-- **待实现**：Sema 自动注入 `objc_msgSend`/`sel_registerName`/`objc_getClass`/`objc_retain`/`objc_release` 等 extern 预声明；codegen 生成 `objc_msgSend` 调用 IR；ObjC 对象复用现有 ARC（weak/unowned）。
-- **落地文件**：`Sema.cpp`、`IRGeneratorImpl.cpp`（依赖 E3）。
-
-### E6 `@convention(c)` / `@convention(stdcall)` 函数类型值（§13.6）★第 11 次新增
-- **现状**：**全仓零命中**（无 `convention`/`stdcall`/`CallingConv` 处理）。
-- **待实现**：`Sema` 解析 `@convention(c)`/`@convention(stdcall)` 作为**函数类型值的属性**（区别于 E3 的 `extern` 声明约定），生成带相应 LLVM calling convention 的函数指针类型；与 `@_cdecl`/extern 组成完整 C ABI 映射。
-- **落地文件**：`Sema.cpp`、`Parser.cpp`、`IRGeneratorImpl.cpp`、`Type.h`（依赖 E3）。
-
-### E7 字符串显式桥接 `withCString` / `.cString`（§13.2.2）★第 11 次新增
-- **现状**：**全仓零命中**（runtime 无相应导出）。
-- **待实现**：规范规定只有字符串**字面量**隐式桥接为 NUL 结尾 UTF-8 `UnsafePointer<Int8>`；运行期 `String` 变量需显式 `withCString { ... }` 或 `.cString` 桥接。在 runtime/stdlib 实现临时 C 字符串导出（生命周期由闭包/调用点管理）。
-- **落地文件**：`runtime.c`、`src/stdlib/core/String.suki`（依赖 BLK-A/T4）。
-
-### E8 `Duration` 类型（§7.3）★第 11 次新增
-- **现状**：**全仓零命中**（仅无关词 "for the duration of"）。
-- **待实现**：`Duration` 类型，工厂 `.seconds(_:)`/`.milliseconds(_:)`/`.microseconds(_:)`；`Task.sleep`、`future.await(timeout:)`、定时器统一接收 `Duration`；明确禁止 `5.seconds` 写法。
-- **落地文件**：`src/stdlib/core/Duration.suki`（依赖 BLK-A）。
-
-### E9 `Awaitable` 协议 + `await future` 脱糖（§7.3）★第 11 次新增
-- **现状**：**全仓零命中**。
-- **待实现**：定义 `protocol Awaitable { associatedtype Value; func waitForValue() async throws -> Value }`；`Future<T>` 遵循 `Awaitable`；`await future` 脱糖为 `try await future.waitForValue()`；`waitForValue()` 在调用处挂起当前 async 任务并注册 continuation，后台线程完成后续唤醒；挂起点检查 `Task` 取消，已取消抛 `CancellationError` 并向后台计算发取消请求。
-- **落地文件**：`src/stdlib/concurrency/**`、`Sema.cpp`（脱糖，依赖 C1/C3）。
+## 五、建议实施优先级
+1. `loop` 关键字（§1.7，纯语法+codegen，影响裸机 `_start`）
+2. `#if os()/arch()`（§10.3，条件编译补全）
+3. `Result<T,E>`（§9.4，错误处理闭环）
+4. `UnsafePointer` 系列（§6.5，替代当前 `RawPtr`）
+5. `@no_mangle` / `@panic_handler` / `@global_allocator`（§8.7，裸机必需）
+6. **宏系统（§5.6，工作量最大，详见第六节）**
+7. 泛型 `typealias`、`@autoclosure`、标签 break、确定性赋值分析
+8. `@convention`/`unsafeBitCast`/`#selector`、ThreadPool/DispatchQueue/ChannelPool
 
 ---
 
-## 阶段 6：后端与工具链
+## 六、宏系统（§5.6）实施设计
 
-### B2 CLI 选项补全（§14.1.1–14.1.3）
-- **现状**：仅 `--target=`/`-o`/`--dump-ast` + 命令 `lex/parse/check/emit-ir/build/run`；缺 `--list-targets`/`-S`/`--emit-llvm`/`-c` 多文件/`--sysroot`/`-O*`/`--incremental`；`-c` 多文件被 `main.cpp:848/855` 拒绝。
-- **待实现**：`--list-targets`（遍历 `llvm::TargetRegistry`）；`-S`（AsmPrinter 汇编文本）；`--emit-llvm`（`.ll`/`.bc`）；`-c` 多文件分别编译为 `.o`（改为遍历按模块聚合）；`--sysroot` 透传 LLD；`-O0/-O1/-O2/-Os/-O3` 映射 `PassBuilder`/`OptLevel`（配合 debug/release/size，§10.4）；`--incremental`（`.build/cache` 按源内容 hash + 依赖图缓存，依赖 BLK-B/T1）。
-- **落地文件**：`main.cpp`（依赖 BLK-B）。
+### 6.1 目标里程碑
+- **M1（本期）**：词法 / 语法 / AST 基础 + `@freestanding(expression)` 宏端到端可用。
+  - `macro` 关键字声明；`@freestanding(expression)` / `@freestanding(declaration)` 属性。
+  - 宏体中的 `#makeExpr("…")` / `#makeDecl("…")` 原语，支持 `\(node)` unquote。
+  - 调用点 `#name(args)` 解析为宏展开表达式 / 声明。
+  - 展开 pass（在 Sema 之前）：按名字查找宏声明 → 取模板字符串 → 将 `\(argName)` 替换为对应实参的**原始源代码文本** → 整体重新解析为 AST → 就地替换（freestanding(expression) 替换表达式节点，freestanding(declaration) 替换声明列表）。
+  - 卫生性：展开体内新建绑定名加 `__suki_macro_<scopeID>_` 前缀；unquote 嵌入节点保留调用方作用域。
+  - `#unique("base")` 生成 `__suki_unique_<module>_<base>_<counter>` 标识符。
+  - `sukic -expand-macros <file>` 打印展开后源码 / AST。
+- **M2（已完成 ✅）**：`@attached(member|accessor|peer)` 宏；错误报告指向模板子位置；`MacroExpansionTooComplex` 上限。详见 6.5 节。
+- **M3**：沙盒（`SukiSyntax` API 受限环境），真正的编译期解释执行而非字符串重解析（当前 M1 用「源码文本替换 + 重解析」满足规范边界规则，是合规实现）。
 
-### B3 DWARF 调试信息（§14.3）
-- **现状**：**0 匹配**（无 `DIBuilder`/`DWARF`）。
-- **待实现**：`IRGeneratorImpl.cpp` 用 `llvm::DIBuilder` 为每个函数/变量/类型生成 `!DISubprogram`/`!DILocalVariable`/`!DILocation`；泛型实例化类型名纳入 DWARF。
-- **落地文件**：`IRGeneratorImpl.cpp`（依赖 BLK-B）。
+### 6.2 关键设计决策
+- **展开时机**：宏展开在 parse 之后、Sema 之前完成，展开产物是普通 AST，复用现有 Sema / codegen，不污染后端。
+- **quote/unquote 形式化**（遵循 §5.6）：`#makeExpr(s)` 的 `s` 必须是字符串字面量；编译器以 `\(node)`（node 为宏参数或宏体构造的 SyntaxNode）做 unquote——将 node 的**原始源代码文本**替换进模板，最后一次性解析整段字符串为单个语法树。unquote 只接受 `SyntaxNode`，不接受运行期值，从机制上防注入。
+- **卫生性**：每个宏调用点分配唯一 `scopeID`；展开体内部新引入的绑定名重写为 `__suki_macro_<scopeID>_<origName>`；unquote 嵌入的节点（来自调用方）保留原始作用域、不被重命名。
+- **错误信息**：指向 `#makeExpr` 模板中的具体字符位置（子位置），需保留原始名与源位置映射供 LSP。
 
-### B4 `sukipm` 完善（§11/§14.6）
-- **现状**：`tools/sukipm/` 有 `main.cpp`/`Manifest`/`DependencyResolver` 源码，但：`build`/`test` 的 `sukic` 调用语法错误（`sukipm/main.cpp:125/152`，应为 `sukic build ... -o ...`/`sukic run`）；`add` 打印 TODO（`:175`）；`publish`/`docs` "not yet implemented"（`:221-224`）；`DependencyResolver::resolve` 仅复制依赖、版本/范围解析全 TODO（`DependencyResolver.cpp:9-53`）。
-- **待实现**：修正 CLI 调用；实现 `add`/`publish`/`docs`；`DependencyResolver` 接入 PubGrub 版本/范围解析；`sukipm docs` 从 `///` 注释抽取生成 HTML/Markdown（复用 `suki-doc`，§14.6）。
-- **落地文件**：`tools/sukipm/**`。
-
-### B5 `suki-lsp` 真实实现（§14.2）
-- **现状**：**无法编译**——引用了不存在的编译器 API（`CompilationUnit`/`Decl`/`DeclKind`/`lexAll()`/`parse()`/`DiagnosticEngine::diagnostics()`/`hadErrors()`/`printAll()`，`LSPServer.cpp:269-272/343-346`），与真实 `Lexer.h:20,23`（`tokenizeAll()`）、`Parser.h:19,21`（`parseModule()` 返回 `NodeList`，AST 为 `Node`/`NodeKind`）、`DiagnosticEngine.h:13-56`（无 `diagnostics()`）不符；`hover` 返回 null、completion 仅静态关键字。
-- **待实现**：对接真实编译器 API（改用 `tokenizeAll`/`parseModule`/`Node`/`NodeKind`/`DiagnosticEngine` 真实接口）；补全补全/跳转定义/重构/错误提示（复用 Sema 诊断）。
-- **落地文件**：`tools/suki-lsp/**`。
-
-### B6 `suki-fmt` 真实实现（§14.4）
-- **现状**：**无法编译**——`Formatter` 引用不存在的 AST（`CompilationUnit`/`Decl`/`DeclKind`/`Stmt`/`Expr`/`Pattern`/`GenericParam`，`Formatter.cpp:10-229`），真实 AST 为 `Node`/`NodeKind`；二元表达式一律输出 `" ? "` 占位（`:156-163`）。
-- **待实现**：改用真实 AST（`Node`/`NodeKind`）做格式化；按 §1.9 风格规则（4 空格缩进、大括号位置、运算符空格、命名约定），支持 `.suki-fmt.json` 配置。
-- **落地文件**：`tools/suki-fmt/**`。
-
-> **备注**：`suki-doc`（`tools/suki-doc/`）经审计为**真实可用**（纯正则 `///` 抽取 + HTML/Markdown 生成，独立可跑），不列入未实现清单。
+### 6.3 集成点（待实现时落点）
+- `Lexer`：`macro` 关键字；`#makeExpr`/`#makeDecl`/`#unique` 作为 `#`-前缀宏调用 token（区别于 `#if`/`#define` 预处理指令，由上下文区分）。
+- `AST.h`：`MacroDecl`（已占位，需补字段）、`MacroExpansionExpr`、`MacroExpansionDecl`；`MakeExprExpr` / `MakeDeclExpr` 承载模板字符串与 unquote 节点列表。
+- `Parser`：`parseMacroDecl`、`parseMacroExpansion`（表达式位与声明位）、宏体解析（复用普通表达式/声明解析）。
+- `Sema`：在 `collectDecls` 之后、`resolveDecls` 之前插入 `expandMacros()` pass；维护 `scopeID` 计数器与 `#unique` 计数器。
+- `main.cpp`：`-expand-macros` 选项；展开 pass 调用位置。
 
 ---
 
-## 实施顺序建议（依赖关系）
+### 6.5 M2 实现状态（已完成 ✅）
 
-1. **阶段 0（BLK-A / BLK-B）** → 必须先做，否则后续大量特性无法编译/链接/验证。
-2. **阶段 1（T1–T4）** → 类型系统收尾；T1 多文件模块是访问控制/增量编译前提。
-3. **阶段 2（M1）** → 独立，建议在 Sema 管线稳定后做。
-4. **阶段 3（S1–S4）** → S1 依赖 BLK-A/T4（COW）；S2/S3 依赖 BLK-A；S4 独立。
-5. **阶段 4（C1–C6）** → C1 async 状态机是 C2/C3/C4/C5 的共同底座；C3/C4 依赖 BLK-A；C6 依赖 BLK-A。
-6. **阶段 5（E1–E9）** → E1/E2 依赖 BLK-A；E3 是 E5/E6 前提；E4 依赖 E5；E6/E7/E8/E9 为第 11 次新增，E8/E9 与 C1/C3 强相关。
-7. **阶段 6（B2–B6）** → B2/B3 依赖 BLK-B；B4/B5/B6 可并行，但 B5/B6 依赖真实编译器 API 稳定（阶段 1 完成后）。
+> 状态：宏系统 M2 已实现并验证通过。回归套件 66 PASS / 1 FAIL（仅 `examples/memory`，本任务前既有的未实现特性失败，与宏无关）。新增用例 `moduleTest/codegen/macros_m2.suki` 覆盖全部 M2 形态。
 
-> 所有含 `.suki` 标准库的实现（T4、S1、S3、C3、C4、C6、E1、E2、E7、E8、E9）均**依赖 BLK-A 先重建 `src/stdlib` 骨架**。
+#### 6.5.1 已落地能力
+- **`@freestanding(declaration)` 声明位宏**：宏体 `return #makeDecl("…\n…")`（多声明以字面量换行分隔）。调用点 `#name(args)` 作为顶层/块内表达式语句承载，由 `expandDeclList` 列表级 pass 替换为重解析得到的声明列表（顶层、函数体 `BlockStmt.statements`、类型 `members`、各控制流语句体均递归覆盖）。
+- **`@attached(member)` 成员宏**：被注解类型（`@MacroName struct/enum/class/...`）在 `expandMacros` 阶段被识别属性匹配，宏展开产物拼接到 `TypeDecl.members`。模板内 `\(self)` 引用被注解类型名（如 `Widget` → `func typeName() -> String { return "Widget" }`）。
+- **`#unique` 卫生性原语**：模板内 `\(#unique)` 展开为全局唯一标识符 `__suki_unique_<n>`，用于宏引入的稳定唯一绑定名（避免与调用方作用域冲突）。
+- **`MacroExpansionTooComplex` 复杂度上限**：`expandBudget_`（默认 200000 节点）在每次展开后按产出节点数递减，超限即报 `macro expansion exceeded MacroExpansionTooComplex limit` 并终止该次展开（防失控/自引用）。
+- **展开错误子位置/子诊断透传**：重解析失败（`parseModule`/`parseExpression` 报错的 `subDiags`）经 `DiagnosticEngine::lastErrorMessage()` 透传，例如 `error: macro 'bad' produced invalid declaration expansion: <子诊断>`。
+
+#### 6.5.2 关键实现决策（相对 6.2/6.3 的落地调整）
+- **列表级展开 `expandDeclList` + `expandDeclListContainers`**：声明位宏调用是 `ExprStmt -> CallExpr(#name)`，单个 `CallExpr` 节点无法就地替换为多条声明，故在列表层面把该 `ExprStmt` 整体替换为展开声明列表，并递归处理嵌套块/类型成员。表达式位宏仍由 `expandInNode` 的 `CallExpr` 替换路径处理（M1）。
+- **模板抽取前移**：`collectMacro` 注册时即调用 `extractTemplate`，使 `expansionKind_`（expr/decl）在 gate 判断（是否声明位宏、是否 attached member）之前就绪，避免「尚未抽取 → 判断为假 → 不展开」的竞态。
+- **`selfType` 透传**：`buildMacroCode(md, call, selfType)` 统一构造展开源码；`selfType` 非空时 `\(self)`/`\(Self)` 解析为被注解类型名（`Self` 关键字被词法规范为小写 `self`，故两者都匹配）。
+- **顶层 `#name(...)` 解析**：`parseModule` 顶层循环在 `parseDecl` 前识别 `#` + `Ident` + `(` 形式，作为表达式语句承载，交给 Sema 展开（规范 5.6 的顶层声明宏写法）。
+- **`walkChildren` 首参数改为 `Node*`**（原 `NodePtr&`）：便于 `countNodes` 等静态/非持有遍历复用，避免 `Node*`→`NodePtr&` 转换失败。
+
+#### 6.5.3 涉及文件与落点
+- `src/compiler/ast/AST.h`：`MacroDecl::expansionKind_`（expr/decl）。
+- `src/compiler/parser/Parser.cpp`：`parseModule` 顶层识别 `#name(...)` 宏调用；`parseMacroDecl` 已落 M1。
+- `src/compiler/diag/DiagnosticEngine.{h,cpp}`：`lastErrorMessage()` 取最近错误文本（子诊断透传）。
+- `src/compiler/sema/Sema.{h,cpp}`：`buildMacroCode` / `expandDeclTemplate` / `tryExpandDeclMacro` / `tryExpandAttached` / `expandDeclList` / `expandDeclListContainers` / `isDeclMacroCall` / `countNodes`；`expandMacros` 注入 attached 成员并运行列表级展开；`MacroExpansionTooComplex` 预算与 `#unique` 计数器。
+- `moduleTest/codegen/macros_m2.suki`：M2 回归（freestanding 声明宏生成 `GenPoint`；`User` 注入 `id`+`uid`；`Widget` 注入 `typeName`→`"Widget"`；`#unique` 生成全局变量）。
+
+#### 6.5.4 验证方式
+- 端到端：`sukic run moduleTest/codegen/macros_m2.suki` → 退出码 0（5 项断言全过）。
+- 展开诊断：`sukic check moduleTest/codegen/macros_m2.suki --expand-macros` 可见 `Struct GenPoint`、`User(members=3)`、`Widget.func typeName`、`Var __suki_unique_1` 等展开产物。
+- 错误子位置：`sukic check <含非法展开的宏>` → `error: macro 'bad' produced invalid declaration expansion: <子诊断>`（不崩溃）。
+- 回归：`bash run_all_tests.sh --no-build` —— 仅 `examples/memory`（既有失败，与宏无关）失败；其余全绿。
+
+#### 6.5.5 M3 待办（未实现）
+- 沙盒（`SukiSyntax` 受限 API，编译期解释执行而非字符串重解析）——当前 M1/M2 的字符串重解析实现合规且端到端可用。
+- `@attached(accessor|peer)` 展开位置（当前仅 `member`）。
+- `import SukiSyntax` 元编程 API。
+- 卫生性重命名闭环（以 `scopeID` 前缀重写展开体内新绑定名）；`#unique` 已提供唯一名，闭环重命名留待 M3。

@@ -1,0 +1,32 @@
+// for await（规范 7.6）：异步序列迭代。
+// Spec 7.6: iterate an async sequence to completion.
+//
+// 期望行为：生产者经 Channel 发送 0..4 后关闭，消费者用 `for await` 收齐并求和得 10，
+// 退出码 0。
+
+@main
+func main() -> Int {
+    let ch = Channel<Int>(capacity: 4)
+    let p = producer(ch)
+    var total = 0
+    for await v in ch {
+        total = total + v
+    }
+    let _ = await p
+    if total != 10 {
+        print("FAIL total=", total)
+        return 1
+    }
+    print("ok total=", total)
+    return 0
+}
+
+async func producer(ch: Channel<Int>) -> Int {
+    var i = 0
+    while i < 5 {
+        await ch.send(i)
+        i = i + 1
+    }
+    await ch.close()
+    return 0
+}

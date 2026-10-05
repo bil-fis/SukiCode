@@ -678,8 +678,8 @@ static void usage(FILE* out) {
         "\n"
         "Usage:\n"
         "  sukic lex    <file>...               dump the token stream\n"
-        "  sukic parse  <file>... [--dump-ast]  parse to AST and report diagnostics\n"
-        "  sukic check  <file>...               parse and run semantic analysis\n"
+        "  sukic parse  <file>... [--dump-ast] [--expand-macros]  parse to AST and report diagnostics\n"
+        "  sukic check  <file>... [--expand-macros]  parse and run semantic analysis\n"
         "  sukic emit-ir <file>... [--target=T]  print textual LLVM IR\n"
         "  sukic build  <file> -o <out.o>       compile to a target object file\n"
         "  sukic run    <file> [--target=T]      compile, link and execute\n"
@@ -717,7 +717,10 @@ static int commandLex(const std::vector<std::string>& files) {
     return rc;
 }
 
-static int commandParse(const std::vector<std::string>& files, bool dumpAst) {
+// 前向声明（定义见 loadImportedStdlib，位于本文件下方）。
+static void loadImportedStdlib(NodeList& userDecls);
+
+static int commandParse(const std::vector<std::string>& files, bool dumpAst, bool dumpExpanded = false) {
     int rc = 0;
     for (const auto& path : files) {
         std::string src;
@@ -731,7 +734,16 @@ static int commandParse(const std::vector<std::string>& files, bool dumpAst) {
         auto toks = lexer.tokenizeAll();
         Parser parser(std::move(toks), diags);
         NodeList decls = parser.parseModule();
-        if (dumpAst) {
+        if (dumpExpanded) {
+            size_t uc = decls.size();
+            loadImportedStdlib(decls);
+            Sema sema(diags);
+            sema.setStdlibDeclCount(decls.size() - uc);
+            sema.setSource(&src);
+            sema.expandMacros(decls);
+            AstPrinter p;
+            for (auto& d : decls) dumpNode(p, d.get());
+        } else if (dumpAst) {
             printf("== %s ==\n", path.c_str());
             AstPrinter p;
             for (auto& d : decls) dumpNode(p, d.get());
@@ -744,7 +756,7 @@ static int commandParse(const std::vector<std::string>& files, bool dumpAst) {
 // Parse + run semantic analysis, reporting all semantic diagnostics.
 static void loadImportedStdlib(NodeList& userDecls);
 
-static int commandCheck(const std::vector<std::string>& files) {
+static int commandCheck(const std::vector<std::string>& files, bool dumpExpanded = false) {
     int rc = 0;
     for (const auto& path : files) {
         std::string src;
@@ -759,9 +771,20 @@ static int commandCheck(const std::vector<std::string>& files) {
         Parser parser(std::move(toks), diags);
         NodeList decls = parser.parseModule();
         // Only run Sema if parsing produced a usable tree.
+        size_t userDeclCount = decls.size();
         loadImportedStdlib(decls);
         if (!diags.hasErrors()) {
             Sema sema(diags);
+            sema.setStdlibDeclCount(decls.size() - userDeclCount);
+            sema.setSource(&src);
+            // `--expand-macros`：仅展开并 dump AST，不做完整语义分析。
+            if (dumpExpanded) {
+                sema.expandMacros(decls);
+                AstPrinter p;
+                for (auto& d : decls) dumpNode(p, d.get());
+                if (!diags.emit(stderr)) rc = 1;
+                continue;
+            }
             sema.analyze(decls);
         }
         if (!diags.emit(stderr)) rc = 1;
@@ -873,8 +896,14 @@ static bool compileOne(const std::string& path, const std::string& triple,
     DiagnosticEngine diags;
     NodeList decls;
     if (!parseFile(path, diags, decls)) { diags.emit(stderr); return false; }
+    size_t userDeclCount = decls.size();
     loadImportedStdlib(decls);
     Sema sema(diags);
+    sema.setStdlibDeclCount(decls.size() - userDeclCount);
+    // 宏展开需要调用点源码以恢复 unquote 的原始文本（规范 5.6）。
+    std::string src;
+    readFile(path, src);
+    sema.setSource(&src);
     sema.analyze(decls);
     if (diags.hasErrors()) { diags.emit(stderr); return false; }
     IRGenerator gen(resolveTarget(triple));
@@ -897,8 +926,10 @@ static int commandEmitIR(const std::vector<std::string>& files, const std::strin
         DiagnosticEngine diags;
         NodeList decls;
         if (!parseFile(path, diags, decls)) { diags.emit(stderr); rc = 1; continue; }
+        size_t userDeclCount = decls.size();
         loadImportedStdlib(decls);
         Sema sema(diags);
+        sema.setStdlibDeclCount(decls.size() - userDeclCount);
         sema.analyze(decls);
         if (diags.hasErrors()) { diags.emit(stderr); rc = 1; continue; }
         IRGenerator gen(resolveTarget(triple));
@@ -980,9 +1011,11 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> files;
     bool dumpAst = false;
+    bool dumpExpanded = false;
     std::string triple, outPath;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--dump-ast") == 0) dumpAst = true;
+        else if (strcmp(argv[i], "--expand-macros") == 0) dumpExpanded = true;
         else if (strncmp(argv[i], "--target=", 9) == 0) triple = argv[i] + 9;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outPath = argv[++i];
         else files.emplace_back(argv[i]);
@@ -994,11 +1027,11 @@ int main(int argc, char** argv) {
     }
     if (cmd == "parse") {
         if (files.empty()) { fprintf(stderr, "sukic: parse requires at least one file\n"); return 2; }
-        return commandParse(files, dumpAst);
+        return commandParse(files, dumpAst, dumpExpanded);
     }
     if (cmd == "check") {
         if (files.empty()) { fprintf(stderr, "sukic: check requires at least one file\n"); return 2; }
-        return commandCheck(files);
+        return commandCheck(files, dumpExpanded);
     }
     if (cmd == "emit-ir") {
         if (files.empty()) { fprintf(stderr, "sukic: emit-ir requires at least one file\n"); return 2; }

@@ -135,6 +135,17 @@ void suki_mutex_lock(SukiMutex* m);
 void suki_mutex_unlock(SukiMutex* m);
 void suki_mutex_destroy(SukiMutex* m);
 
+// ─── raw pointer helpers (backing UnsafeMutablePointer<T> / @unsafe) ───────────
+// SukiCode has no in-language pointer dereference, so load/store through a raw
+// address is performed by these small runtime entry points. Addresses are carried
+// as `Int` (LP64: identical width to a pointer) by the generated code, which
+// keeps the ABI symmetric with the C `void*` without needing an opaque-pointer
+// type at the language boundary.
+void*   suki_ptr_alloc(int64_t n);
+int64_t suki_ptr_drop(void* p);
+int64_t suki_ptr_read_int(void* p);
+int64_t suki_ptr_write_int(void* p, int64_t v);
+
 // Atomic scalar helpers, used by generated code for atomic access.
 int64_t suki_atomic_load_i64(const int64_t* p);
 void    suki_atomic_store_i64(int64_t* p, int64_t v);
@@ -211,10 +222,18 @@ int suki_closure_thread_start(SukiClosureFn fn, void* ctx, SukiFuture* fut);
 
 typedef struct SukiTaskGroup SukiTaskGroup;
 
-SukiTaskGroup* suki_taskgroup_create(void);
+// `elemSize` is the byte size of a child task's result; 0 means the children
+// produce no value. The group stores it so `for await` can collect results.
+SukiTaskGroup* suki_taskgroup_create(int64_t elemSize);
 void           suki_taskgroup_add(SukiTaskGroup* g, SukiFuture* f);
 // Block until every recorded child has completed.
 void           suki_taskgroup_wait_all(SukiTaskGroup* g);
+// Number of children recorded so far.
+int64_t        suki_taskgroup_count(SukiTaskGroup* g);
+// Wait for child `index` and copy its result into `out_elem`. Returns 0 on
+// success, -1 when the index is out of range or there is no value to collect.
+int32_t        suki_taskgroup_result_at(SukiTaskGroup* g, int64_t index,
+                                        void* out_elem);
 void           suki_taskgroup_free(SukiTaskGroup* g);
 
 #ifdef __cplusplus

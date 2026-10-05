@@ -17,6 +17,7 @@
 #include "compiler/sema/Type.h"
 #include "compiler/util/ScopedTable.h"
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -39,6 +40,7 @@ struct TypeRecord {
     const TypeRecord* superclass = nullptr;      // class single inheritance
     std::vector<const TypeRecord*> protocols;    // declared conformances
     bool isCEnum = false;                        // @enum(C)：C 兼容整数枚举（规范 1.5）
+    bool isStdlib = false;                       // 来自被导入的标准库（受信任，可定义 unsafe 类型）
     // Members are keyed by name; a property and a method may share a name only
     // via distinct overloads, which we keep in one list and match by arity.
     struct Member {
@@ -95,7 +97,15 @@ public:
     explicit Sema(DiagnosticEngine& diags) : diags_(diags) {}
 
     // Analyze a whole translation unit (top-level declarations).
-    void analyze(const NodeList& decls);
+    void analyze(NodeList& decls);
+
+    // 宏展开（规范 5.6）：在类型解析之前就地展开 freestanding 宏。
+    void expandMacros(NodeList& decls);
+    void setSource(const std::string* src) { source_ = src; }
+
+    // 标记为来自被导入标准库（prelude）的声明数量，使其在 unsafe 上下文约束下
+    // 仍可定义 unsafe 类型（见 Sema.cpp analyze()）。
+    void setStdlibDeclCount(size_t n) { stdlibDeclCount_ = n; }
 
     TypeContext& types() { return types_; }
     const TypeContext& types() const { return types_; }
@@ -112,7 +122,7 @@ private:
     // Seed the global scope with runtime/stdlib primitives (print, ...) so
     // user code can call them before the bootstrap stdlib is compiled in.
     void registerBuiltins();
-    void collectTypeDecl(Node* decl);
+    void collectTypeDecl(Node* decl, bool isStdlib = false);
     void collectMembers(TypeRecord& rec, TypeDecl* td);
     // Add a single member node to a record (extracted so extensions and
     // protocol defaults can reuse the same logic without re-collecting).
@@ -205,6 +215,44 @@ private:
     DiagnosticEngine& diags_;
     TypeContext types_;
 
+    // ── 宏展开（规范 5.6） ──────────────────────────────────────────────────
+    void collectMacro(MacroDecl* md);
+    bool extractTemplate(MacroDecl* md);
+    NodePtr tryExpandMacroCall(CallExpr* call, const std::string& macroName);
+    void expandInNode(NodePtr& n);
+    void walkChildren(Node* n, std::function<void(NodePtr&)> fn);
+    // AST→源码递归序列化：把宏实参（unquote 表达式）还原为源码文本，
+    // 避免依赖零长度的 SourceRange 做区间截取（Parser 当前节点 range 均为单点）。
+    std::string exprToSource(Node* n) const;
+    std::string typeToSource(Node* n) const;
+    // unquote 实参若本身含运算符（二元/一元/三元/区间/as/is/赋值等），
+    // 嵌入模板后会被周围运算符抢占优先级，需整体加括号（如 (3 + 4)）。
+    bool macroArgNeedsParens_(Node* n) const;
+    // 由模板 + 实参构造展开源码字符串（M1 表达式宏与 M2 声明宏共用）。
+    // selfType 非空时允许模板内 \(Self) 引用被注解类型的名字（@attached 用）。
+    std::string buildMacroCode(MacroDecl* md, CallExpr* call, const std::string& selfType);
+    // 声明位宏：把 #makeDecl 模板重解析为声明列表。selfType 供 @attached 透传。
+    NodeList tryExpandDeclMacro(CallExpr* call, const std::string& selfType);
+    // 由模板源码重新解析为声明列表（freestanding(declaration) 与 @attached(member) 共用）。
+    NodeList expandDeclTemplate(MacroDecl* md, CallExpr* call, const std::string& selfType);
+    // @attached(member) 宏：被注解类型无显式实参，用合成空 CallExpr 触发模板展开。
+    NodeList tryExpandAttached(MacroDecl* md, const std::string& selfType);
+    // 列表级展开：把列表里「#name(...)」形式的声明位宏调用（以 ExprStmt 承载）
+    // 就地替换为展开得到的声明列表，并递归处理嵌套的语句块/类型成员。
+    void expandDeclList(NodeList& list);
+    // 对单个节点的「含声明列表」子容器递归调用 expandDeclList。
+    void expandDeclListContainers(Node* n);
+    // 判断节点是否为声明位宏调用（ExprStmt -> CallExpr(#name) 且 name 指向
+    // 已注册的 freestanding(declaration) 宏）。
+    bool isDeclMacroCall(Node* n) const;
+    size_t countNodes(Node* n);
+    std::unordered_map<std::string, MacroDecl*> macros_;
+    const std::string* source_ = nullptr;   // 调用点源码，unquote 取原始文本用
+    uint64_t uniqueCounter_ = 0;
+    uint32_t expandDepth_ = 0;
+    long expandBudget_ = 0;   // MacroExpansionTooComplex 复杂度预算（节点数）
+    static const long kMaxMacroComplexity_ = 200000;
+
     // Global type index: name → record.
     std::unordered_map<std::string, TypeRecord*> typeIndex_;
     // `typealias ID = Int` maps the alias name to the type it stands for, so
@@ -241,6 +289,9 @@ private:
     bool hadError_ = false;
     // 进入 `unsafe` 块时置位（规范 8.6）：裸指针/非托管类型仅在此上下文可用。
     bool unsafeContext_ = false;
+    // 被导入标准库（prelude）声明的数量。这些声明受信任，可定义 unsafe 类型；
+    // 用户代码仍受 unsafe 上下文约束。见 analyze() 中各 pass 的按索引切换。
+    size_t stdlibDeclCount_ = 0;
     // Current generic parameter names in scope (for constraints / type names).
     std::vector<std::string> genericParams_;
     // Concrete type for each in-scope type parameter of the instantiation being

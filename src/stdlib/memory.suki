@@ -1,0 +1,24 @@
+module memory
+
+foreign func suki_ptr_alloc(_ n: Int) -> Int
+foreign func suki_ptr_drop(_ p: Int) -> Int
+foreign func suki_ptr_read_int(_ p: Int) -> Int
+foreign func suki_ptr_write_int(_ p: Int, _ v: Int) -> Int
+
+// 裸指针封装：地址以 Int 保存（LP64 下与指针同宽），不携带元素类型信息，
+// 因此本实现为非泛型；pointee 固定为 Int，与运行时的 suki_ptr_read/write_int 对应。
+struct RawPtr {
+    var raw: Int
+    init(raw addr: Int) { self.raw = addr }
+    var pointee: Int {
+        get { return suki_ptr_read_int(self.raw) }
+        set { suki_ptr_write_int(self.raw, newValue) }
+    }
+    func deallocate() { suki_ptr_drop(self.raw) }
+}
+
+func allocate(capacity n: Int) -> RawPtr {
+    let bytes = n * 8
+    let addr = suki_ptr_alloc(bytes)
+    return RawPtr(raw: addr)
+}

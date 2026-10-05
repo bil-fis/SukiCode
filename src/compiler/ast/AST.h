@@ -231,7 +231,22 @@ struct AssociatedTypeDecl : Node {
 struct MacroDecl : Node {
     MacroDecl() : Node(NodeKind::MacroDecl) {}
     std::string name;
-    std::vector<std::string> params;
+    // 角色与种类，由属性 `@freestanding(expression)` / `@attached(member)` 推得。
+    //   role  ∈ { "freestanding", "attached" }
+    //   kind ∈ { "expression", "declaration", "member", "accessor", "peer" }
+    std::string role;
+    std::string kind;
+    std::vector<Param> params;
+    NodePtr returnType;
+    NodeList body;   // 宏体语句（M1 仅支持 `return #makeExpr("…") / #makeDecl("…")`）
+    // 从宏体提取的展开模板（规范 5.6）。不变量（与 StrLitExpr 交错约定一致）：
+    //   templateSegments_.size() == unquoteNames_.size() + 1
+    // 即 文本、\(x)、文本、\(y)、文本……
+    std::vector<std::string> templateSegments_;
+    std::vector<std::string> unquoteNames_;  // 每个 \(x) 引用的宏参数名
+    std::string expansionKind_;              // "#makeExpr" => "expr", "#makeDecl" => "decl"
+    bool expansionExtracted = false;
+    bool extractionFailed   = false;
 };
 
 struct StructDecl : TypeDecl { StructDecl() : TypeDecl(NodeKind::StructDecl) {} };
