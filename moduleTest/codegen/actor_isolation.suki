@@ -1,3 +1,4 @@
+import concurrency
 // actor 隔离（规范 7.4）：跨 actor 的调用是异步的，且同一 actor 的方法串行执行，
 // 因此其可变状态不会出现数据竞争。
 // Spec 7.4: actor isolation — calls into an actor are async and serialised, so its

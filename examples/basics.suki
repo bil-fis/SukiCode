@@ -126,11 +126,16 @@ func readFile(path: String) throws -> String {
     return "file contents"
 }
 
-do {
-    let content = try readFile(path: "/tmp/data")
-    print(content)
-} catch let error as FileError {
-    print("File error: \(error)")
-} catch {
-    print("Unknown error")
+// 入口：把概览中的顶层演示包进 @main，使本文件既能被编译验证、也能运行。
+@main
+func main() -> Int {
+    do {
+        let content = try readFile(path: "/tmp/data")
+        print(content)
+    } catch let error as FileError {
+        print("File error: \(error)")
+    } catch {
+        print("Unknown error")
+    }
+    return 0
 }

@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <stdint.h>
 #if !defined(_WIN32)
   #include <unistd.h>   // nanosleep (POSIX)
@@ -163,6 +164,24 @@ SukiString suki_str_from_cstr(const char* z) {
     return s;
 }
 
+// ─── Time ────────────────────────────────────────────────────────────────────────
+// Safe wrappers around libc time functions. The SukiCode side declares these as
+// parameterless foreign functions returning Int, so no pointer-sized argument
+// crosses the FFI boundary (avoids an ABI quirk where the compiler does not
+// reliably place the NULL pointer argument for time(NULL)/clock()).
+int64_t suki_time_now_sec(void) {
+    time_t t = time(NULL);
+    return (int64_t)t;
+}
+int64_t suki_clock_cpu_micros(void) {
+    // clock(3) is unreliable in some environments (returns 0 / garbage); use a
+    // monotonic clock via clock_gettime for a stable, monotonically increasing
+    // microsecond timer suitable for benchmarking / elapsed-time measurement.
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+}
+
 int64_t suki_str_length(SukiString s) { return s.length; }
 
 const char* suki_str_data(SukiString s) { return s.data ? s.data : ""; }
@@ -188,6 +207,22 @@ int32_t suki_str_compare(SukiString a, SukiString b) {
     if (c) return c < 0 ? -1 : 1;
     if (a.length == b.length) return 0;
     return a.length < b.length ? -1 : 1;
+}
+
+// Debug representation used when a value that has no built-in textual form (an
+// enum, struct, class, tuple, ...) is interpolated into a string literal. Without
+// this the compiler would pass the raw aggregate value where a String is expected,
+// producing a type mismatch in the IR verifier. We return "<TypeName>" instead.
+SukiString suki_debug_repr(const char* t) {
+    if (!t) { SukiString s = { (char*)"", 0 }; return s; }
+    size_t n = strlen(t);
+    char* buf = (char*)suki_alloc(n + 3);
+    buf[0] = '<';
+    if (n) memcpy(buf + 1, t, n);
+    buf[n + 1] = '>';
+    buf[n + 2] = '\0';
+    SukiString s = { buf, (int64_t)(n + 2) };
+    return s;
 }
 
 // Returns the byte length of the UTF-8 sequence starting at `p`.
@@ -1170,10 +1205,13 @@ int32_t suki_taskgroup_result_at(SukiTaskGroup* g, int64_t index,
     suki_bmtx_unlock(&g->mtx);
     if (!f) return -1;
     // Await outside the lock: the child signals completion without needing it.
+    // 写回与否依据 future 自身的大小（startClosureTask 已按结果类型大小分配），
+    // 而非 group 的 elemSize——后者在 withTaskGroup 创建时固定为 0，会导致结果
+    // 被丢弃而留下未初始化垃圾值。
     int64_t dummy = 0;
-    if (g->elemSize > 0) suki_future_await(f, out_elem);
+    if (f->resultSize > 0) suki_future_await(f, out_elem);
     else suki_future_await(f, &dummy);
-    return g->elemSize > 0 ? 0 : -1;
+    return f->resultSize > 0 ? 0 : -1;
 }
 
 void suki_taskgroup_add(SukiTaskGroup* g, SukiFuture* f) {

@@ -27,6 +27,8 @@
 #include <fstream>
 #include <functional>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -877,17 +879,19 @@ static bool parseFile(const std::string& path, DiagnosticEngine& diags, NodeList
 }
 
 // Map an `import X` directive to the matching standard-library source file and
-// prepend its declarations to the translation unit. This is a minimal,
-// import-driven module loader; full multi-file module resolution is tracked
-// separately (todo T1). Loading is opt-in: files that do not `import` a stdlib
-// module compile exactly as before, so the existing test suite is unaffected.
+// prepend its declarations to the translation unit. This is an import-driven
+// module loader that resolves a module's own `import` statements recursively
+// (transitive dependencies), with cycle detection so two modules that import
+// each other (e.g. `core` <-> `system`) do not loop forever. Loading stays
+// opt-in: files that do not `import` any stdlib module compile exactly as
+// before, so the existing test suite is unaffected.
 static void loadImportedStdlib(NodeList& userDecls) {
     std::string dir = SUKI_STDLIB_DIR;
     std::string files = SUKI_STDLIB_FILES;
     if (dir.empty() || files.empty()) return;
 
     // Build moduleName -> absolute path from the CMake-provided file list.
-    std::vector<std::pair<std::string, std::string>> mods;
+    std::map<std::string, std::string> modPath;
     size_t start = 0;
     while (start <= files.size()) {
         size_t end = files.find('|', start);
@@ -898,49 +902,63 @@ static void loadImportedStdlib(NodeList& userDecls) {
             const size_t ext = name.find(".suki");
             if (!name.empty() && ext != std::string::npos && ext == name.size() - 5)
                 name.resize(name.size() - 5);
-            mods.emplace_back(name, p);
+            modPath[name] = p;
         }
         if (end == files.size()) break;
         start = end + 1;
     }
 
-    // Collect (moduleName, path) requested via `import`.
-    std::vector<std::pair<std::string, std::string>> toLoad;
+    // Transitive import resolution with cycle detection.
+    // `worklist` holds module names still to be parsed; `seen` records every
+    // module already enqueued so a module is parsed at most once and an
+    // `import` cycle cannot cause unbounded recursion.
+    std::vector<std::string> worklist;
+    std::set<std::string> seen;
     for (auto& d : userDecls) {
         if (d && d->kind == NodeKind::ImportDecl) {
-            auto* imp = static_cast<ImportDecl*>(d.get());
-            for (auto& m : mods)
-                if (m.first == imp->moduleName) { toLoad.push_back(m); break; }
+            std::string nm = static_cast<ImportDecl*>(d.get())->moduleName;
+            if (modPath.count(nm) && seen.insert(nm).second)
+                worklist.push_back(nm);
         }
     }
-    if (toLoad.empty()) return;
 
-    // De-duplicate (by path) and parse + prepend.
-    std::sort(toLoad.begin(), toLoad.end(),
-              [](const std::pair<std::string, std::string>& a,
-                 const std::pair<std::string, std::string>& b) {
-                  return a.second < b.second;
-              });
-    toLoad.erase(std::unique(toLoad.begin(), toLoad.end(),
-                             [](const std::pair<std::string, std::string>& a,
-                                const std::pair<std::string, std::string>& b) {
-                                 return a.second == b.second;
-                             }),
-                 toLoad.end());
-    NodeList prelude;
-    for (const auto& m : toLoad) {
+    // name -> parsed declarations (parsed exactly once per module).
+    std::map<std::string, NodeList> parsed;
+    while (!worklist.empty()) {
+        std::string nm = worklist.back();
+        worklist.pop_back();
+        std::string path = modPath[nm];
         DiagnosticEngine d;
         NodeList dl;
-        if (parseFile(m.second, d, dl)) {
-            // 规范 §10.1：给被导入模块的声明打上模块名，访问据此区分
-            // 「同模块」与「跨模块」（跨模块仅 public/open 可见）。
-            for (auto& n : dl) {
-                if (n) n->sourceModule = m.first;
-                prelude.push_back(std::move(n));
+        if (parseFile(path, d, dl)) {
+            parsed[nm] = std::move(dl);
+            // Enqueue this module's own imports (recursive resolution). The
+            // Sema phase ignores ImportDecl nodes, and `seen` above prevents
+            // both double-loading and cycles.
+            for (auto& n : parsed[nm]) {
+                if (n && n->kind == NodeKind::ImportDecl) {
+                    std::string child = static_cast<ImportDecl*>(n.get())->moduleName;
+                    if (modPath.count(child) && seen.insert(child).second)
+                        worklist.push_back(child);
+                }
             }
         } else {
             fprintf(stderr, "sukic: warning: stdlib module '%s' failed to parse\n",
-                    m.second.c_str());
+                    path.c_str());
+        }
+    }
+
+    // Prepend every loaded module's declarations. `seen` ensures a module's
+    // transitive imports are loaded before the module itself is consumed, so
+    // dependencies always precede their dependents. 规范 §10.1：给被导入模块
+    // 的声明打上模块名，访问据此区分「同模块」与「跨模块」（跨模块仅 public/
+    // open 可见）。ImportDecl/ModuleDecl 节点由 Sema 的 default 分支忽略，
+    // 故一并保留无副作用。
+    NodeList prelude;
+    for (auto& kv : parsed) {
+        for (auto& n : kv.second) {
+            if (n) n->sourceModule = kv.first;
+            prelude.push_back(std::move(n));
         }
     }
     if (!prelude.empty())

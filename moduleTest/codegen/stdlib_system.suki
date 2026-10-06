@@ -1,0 +1,51 @@
+// System 标准库验证：环境变量、文件读写、进程捕获、路径、时钟。
+// 通过返回 0，否则返回累计失败权重。
+// 注意：因编译器缺陷，返回 String 的 API 以顶层函数暴露（system.basename 等），
+// 详见 system.suki 头部注释。
+
+import system
+
+@main func main() -> Int {
+    var score = 0
+
+    // 1. Path 工具（返回值与字面量比较，规避 Optional<String> ABI 缺陷）
+    let base = basename("/a/b/c.txt")
+    if stringContains(base, "c.txt") && stringLength(base) == 5 { score += 1 }
+    let dir = dirname("/a/b/c.txt")
+    if stringContains(dir, "/a/b/") { score += 2 }
+    let ext = pathExtension("/a/b/c.txt")
+    if stringContains(ext, "txt") { score += 4 }
+    let joined = joinPath("/a/b", "c.txt")
+    if stringContains(joined, "/a/b/c.txt") { score += 8 }
+
+    // 2. Environment（PATH 应存在且非空）
+    let p = getEnv("PATH")
+    if stringLength(p) > 0 { score += 16 }
+    if hasEnv("PATH") { score += 32 }
+
+    // 3. File 写 + 读 往返
+    let path = "/tmp/suki_sys_test.txt"
+    if writeAllText(path, "hello suki") { score += 64 }
+    let content = readAllText(path)
+    if stringContains(content, "hello suki") && stringLength(content) == 10 { score += 128 }
+    if fileExists(path) { score += 256 }
+
+    // 4. Process.capture（echo 应回显）
+    let out = captureProcess("echo suki-ok")
+    if stringContains(out, "suki-ok") { score += 512 }
+
+    // 5. Clock 单调递增
+    let t1 = Clock.now()
+    let t2 = Clock.now()
+    if t2 >= t1 { score += 1024 }
+    let c1 = Clock.cpuMicros()
+    var busy = 0
+    var k = 0
+    while k < 100000 { busy = busy + k; k = k + 1 }
+    let c2 = Clock.cpuMicros()
+    if c2 >= c1 { score += 2048 }
+
+    let expected = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 256 + 512 + 1024 + 2048
+    if score == expected { return 0 }
+    return score
+}

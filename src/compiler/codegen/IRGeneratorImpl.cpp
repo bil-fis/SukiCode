@@ -683,8 +683,16 @@ private:
                 owner_->b_->CreateCall(cf, { llvm::ConstantInt::get(i64, esz) }));
         }
 
-        void genConcurrencyBuiltinMethod(const std::string& base, const std::string& mem) {
-            const std::string key = base + "." + mem;
+        // 第三个参数 elemTy 是 TaskGroup 的子结果类型 T。addTask 的闭包返回 T，
+        // 必须用它的大小去创建能装下结果的 Future（否则 resultSize=0，运行时
+        // suki_future_store 因 size<=0 直接返回、result 为 NULL，for-await 读到
+        // 未初始化垃圾值）。group 在标准库中登记为裸 TaskGroup（elements 为空），
+        // 因此 T 由调用点从闭包返回类型推断后传进来。把它并入 cache key，避免
+        // 同一 base.mem 在不同 T 下共享同一份（大小不同的）IR。
+        void genConcurrencyBuiltinMethod(const std::string& base, const std::string& mem,
+                                         const Type* elemTy = nullptr) {
+            std::string key = base + "." + mem;
+            if (elemTy) key += "/" + (elemTy->name.empty() ? std::string("?") : elemTy->name);
             if (owner_->methodFns_.count(key)) return;
             llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
             llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
@@ -727,11 +735,13 @@ private:
                     owner_->module_.get());
                 owner_->b_->SetInsertPoint(llvm::BasicBlock::Create(*owner_->ctx_, "entry", f));
                 llvm::Value* g = loadHandle(f->getArg(0), grpSty);
-                llvm::Value* fut = startClosureTask(f->getArg(1), f, nullptr);
+                // 子结果类型 T 的大小：nullptr 等价于 void（不存结果）。
+                llvm::Type* elemLLVM = elemTy ? owner_->layout_->lower(elemTy) : nullptr;
+                llvm::Value* fut = startClosureTask(f->getArg(1), f, elemLLVM);
                 owner_->b_->CreateCall(owner_->declareExternalSig("suki_taskgroup_add",
                     { i8p, i8p }, voidTy), { g, fut });
                 owner_->b_->CreateRetVoid();
-                owner_->methodFns_["TaskGroup.addTask"] = f;
+                owner_->methodFns_[key] = f;
                 return;
             }
         }
@@ -1876,7 +1886,7 @@ private:
                 llvm::Value* acc = makeStr(s->segments.empty() ? "" : s->segments[0]);
                 for (size_t i = 0; i < s->expressions.size(); ++i) {
                     llvm::Value* ev = genExpr(s->expressions[i].get());
-                    if (ev) acc = owner_->b_->CreateCall(cat, {acc, owner_->interpolateToString(ev)});
+                    if (ev) acc = owner_->b_->CreateCall(cat, {acc, owner_->interpolateToString(ev, s->expressions[i]->semaType)});
                     if (i + 1 < s->segments.size())
                         acc = owner_->b_->CreateCall(cat, {acc, makeStr(s->segments[i + 1])});
                 }
@@ -4031,7 +4041,7 @@ private:
 
     // Convert a value used inside string interpolation to a String, going
     // through the runtime's integer/float formatting helpers.
-    llvm::Value* interpolateToString(llvm::Value* v) {
+    llvm::Value* interpolateToString(llvm::Value* v, const Type* semaTy = nullptr) {
         llvm::Type* sty = layout_->stringTy();
         if (!v) return llvm::UndefValue::get(sty);
         if (v->getType() == sty) return v;
@@ -4048,7 +4058,19 @@ private:
                 declareExternalSig("suki_double_to_string",
                                    {llvm::Type::getDoubleTy(*ctx_)}, sty), {d});
         }
-        return v; // aggregate values print via their default representation
+        // Enums, structs, classes, tuples and other aggregates have no built-in
+        // textual form here, so fall back to a "<TypeName>" debug representation.
+        // This avoids handing `suki_str_concat` a raw aggregate value (which would
+        // fail IR verification). A richer form would come from a
+        // CustomStringConvertible conformance, which is not wired up yet.
+        if (v->getType()->isStructTy() || v->getType()->isPointerTy()) {
+            std::string tn = (semaTy && !semaTy->name.empty()) ? semaTy->name : "?";
+            llvm::Value* p = b_->CreateGlobalStringPtr(tn);
+            return b_->CreateCall(
+                declareExternalSig("suki_debug_repr",
+                                   {llvm::PointerType::get(*ctx_, 0)}, sty), {p});
+        }
+        return v; // last-resort: caller must coerce; should not normally be reached
     }
 
     // Map Array/Dictionary methods onto runtime entry points.
@@ -4906,8 +4928,9 @@ private:
     // Task/TaskGroup 运行时辅助已迁移至 ConcurrencyLowerer，此处为转发桩。
     llvm::Value* genTaskInit(CallExpr* e) { return conc_.genTaskInit(e); }
     llvm::Value* genTaskGroupInit(const Type* elemTy) { return conc_.genTaskGroupInit(elemTy); }
-    void genConcurrencyBuiltinMethod(const std::string& base, const std::string& mem) {
-        conc_.genConcurrencyBuiltinMethod(base, mem);
+    void genConcurrencyBuiltinMethod(const std::string& base, const std::string& mem,
+                                     const Type* elemTy = nullptr) {
+        conc_.genConcurrencyBuiltinMethod(base, mem, elemTy);
     }
     void genSleepSpawn() { conc_.genSleepSpawn(); }
 
@@ -4975,23 +4998,70 @@ private:
         if (e->callee->kind == NodeKind::MemberExpr) {
             auto* m = static_cast<MemberExpr*>(e->callee.get());
             const Type* bt = m->base ? m->base->semaType : nullptr;
+            // Resolve the owning type of the member call. The base may be a value
+            // of the type (instance call, resolved normally) or the type name
+            // itself — a `Metatype` — which is how `Type.staticMethod()` is written.
+            const Type* ownerRecord = nullptr;
             if (bt && bt->kind == TypeKind::Named && bt->record) {
-                const std::string mkey = bt->name + "." + m->member;
+                ownerRecord = bt;
+            } else if (bt && bt->kind == TypeKind::Metatype && bt->element &&
+                       bt->element->kind == TypeKind::Named && bt->element->record) {
+                ownerRecord = bt->element;
+            }
+            if (ownerRecord) {
+                // addTask 的子结果类型 T 由闭包实参返回类型推断（裸 TaskGroup 无
+                // elements）。该 T 必须并入查找/存储 key，否则生成后查不到而无法调用。
+                const Type* egElemTy = nullptr;
+                if (ownerRecord->name == "TaskGroup" && m->member == "addTask" &&
+                    !e->arguments.empty() && e->arguments[0] &&
+                    e->arguments[0]->semaType) {
+                    const TypeKind k = e->arguments[0]->semaType->kind;
+                    if (k == TypeKind::Function || k == TypeKind::Closure)
+                        egElemTy = e->arguments[0]->semaType->ret;
+                }
+                std::string mkey = ownerRecord->name + "." + m->member;
+                if (egElemTy) mkey += "/" + (egElemTy->name.empty() ? std::string("?") : egElemTy->name);
                 auto it = methodFns_.find(mkey);
                 // Runtime-backed concurrency members of the base Task / TaskGroup
                 // are emitted on first use, so programmes that never touch them
                 // ship no such machinery. The generator moves the IR builder into
                 // the new function, so restore the caller's insertion point.
                 if (it == methodFns_.end() &&
-                    (bt->name == "Task" || bt->name == "TaskGroup")) {
+                    (ownerRecord->name == "Task" || ownerRecord->name == "TaskGroup")) {
                     llvm::BasicBlock* savedIP = b_->GetInsertBlock();
-                    genConcurrencyBuiltinMethod(bt->name, m->member);
+                    genConcurrencyBuiltinMethod(ownerRecord->name, m->member, egElemTy);
                     if (savedIP) b_->SetInsertPoint(savedIP);
                     it = methodFns_.find(mkey);
                 }
                 if (it != methodFns_.end()) {
                     llvm::Function* mf = it->second;
                     llvm::FunctionType* fty = mf->getFunctionType();
+                    // Static method call `Type.method(args)`: no receiver is passed.
+                    if (staticMethods_.count(mkey)) {
+                        std::vector<llvm::Value*> args;
+                        std::vector<bool> isNilArg;
+                        for (auto& a : e->arguments) {
+                            isNilArg.push_back(a && a->kind == NodeKind::NilLitExpr);
+                            args.push_back(genExpr(a.get()));
+                        }
+                        adaptArgs(args, isNilArg, fty);
+                        for (size_t i = 0; i < args.size() && i < fty->getNumParams(); ++i)
+                            args[i] = coerce(args[i], fty->getParamType(i));
+                        const bool methodThrows =
+                            methodThrows_.count(mkey) ? methodThrows_[mkey] : false;
+                        llvm::Value* errSlot = nullptr;
+                        if (methodThrows) { errSlot = errorSlotForCall(); args.push_back(errSlot); }
+                        llvm::Value* result = nullptr;
+                        if (methodThrows) {
+                            for (size_t i = 0; i < args.size() && i < fty->getNumParams(); ++i)
+                                args[i] = coerce(args[i], fty->getParamType(i));
+                            result = b_->CreateCall(mf, args);
+                            finishThrowingCall(errSlot);
+                        } else {
+                            result = b_->CreateCall(mf, args);
+                        }
+                        return result;
+                    }
                     // How `self` is passed depends on the receiver:
                     //  - a `mutating` struct method takes the address of the
                     //    caller's copy, so writes are visible to the caller;
@@ -5401,7 +5471,8 @@ public:
                     // 规范 §8.7：@no_mangle 保留给定符号名，不改写成 "Type.method"。
                     std::string nmSym = mf->name;
                     declareMethod(td->name + "." + mf->name, mf, td->semaType,
-                                  hasAttr(mf, "no_mangle") ? &nmSym : nullptr);
+                                  hasAttr(mf, "no_mangle") ? &nmSym : nullptr,
+                                  mem.isStatic);
                     methodOrder_.emplace_back(mf, td->semaType);
                 }
                 for (const auto& mem : td->semaType->record->members) {
@@ -5465,7 +5536,8 @@ public:
                 // 规范 §8.7：@no_mangle 保留给定符号名，不改写成 "Type.method"。
                 std::string nmSym = mf->name;
                 declareMethod(td->name + "." + mf->name, mf, td->semaType,
-                              hasAttr(mf, "no_mangle") ? &nmSym : nullptr);
+                              hasAttr(mf, "no_mangle") ? &nmSym : nullptr,
+                              mem.isStatic);
                 methodOrder_.emplace_back(mf, td->semaType);
             }
         }
@@ -5515,7 +5587,8 @@ public:
                         continue;
                     }
                     const std::string mkey = gi.key + "." + mf->name;
-                    declareMethod(mkey, mf, instTy);
+                    declareMethod(mkey, mf, instTy, /*symbolOverride=*/nullptr,
+                                  mem.isStatic);
                     auto mit = methodFns_.find(mkey);
                     if (mit != methodFns_.end()) genMethodBody(mf, instTy, mit->second);
                 }
@@ -5738,18 +5811,25 @@ public:
     // 而 `key` 仍为分派用的改写名，二者解耦：调用方按 "Type.method" 查找，
     // 链接器看到的是未改写的给定符号名。
     void declareMethod(const std::string& key, FunctionDecl* fn, const Type* ownerTy,
-                       const std::string* symbolOverride = nullptr) {
+                       const std::string* symbolOverride = nullptr,
+                       bool isStatic = false) {
         // A generic type's methods are emitted once per monomorphised instance
         // (`Box<Int>.get`), never for the uninstantiated generic: its members still
         // mention the type parameter, so its signature cannot be lowered.
         if (ownerTy && ownerTy->record && !ownerTy->record->genericParams.empty())
             return;
         if (methodFns_.count(key)) return;
-        llvm::Type* selfTy = layout_->lower(ownerTy);
-        llvm::Type* selfParam = fn->isMutating
-            ? static_cast<llvm::Type*>(llvm::PointerType::getUnqual(selfTy))
-            : selfTy;
-        std::vector<llvm::Type*> params{ selfParam };
+        std::vector<llvm::Type*> params;
+        if (!isStatic) {
+            // A value-type instance method receives the receiver as an implicit
+            // first parameter: a `mutating` method gets its address (so writes
+            // hit the caller's copy), otherwise a copy by value.
+            llvm::Type* selfTy = layout_->lower(ownerTy);
+            llvm::Type* selfParam = fn->isMutating
+                ? static_cast<llvm::Type*>(llvm::PointerType::getUnqual(selfTy))
+                : selfTy;
+            params.push_back(selfParam);
+        }
         for (auto& p : fn->params)
             params.push_back(lowerDeclType(p.semaType, p.type.get()));
         // A throwing method carries the hidden error slot just like a function.
@@ -5768,6 +5848,7 @@ public:
             llvm::GlobalValue::ExternalLinkage,
             symbolOverride ? *symbolOverride : key, module_.get());
         methodFns_[key] = f;
+        if (isStatic) staticMethods_.insert(key);
     }
 
     void declareInit(const std::string& key, InitDecl* id, const Type* ownerTy) {
@@ -6122,15 +6203,20 @@ public:
 
         llvm::Type* selfTy = layout_->lower(ownerTy);
         unsigned arg = 0;
-        if (fn->isMutating) {
-            // Keep the receiver pointer: field writes go through it.
-            locals_["self"] = f->getArg(0);
-            arg = 1;
-        } else {
-            llvm::Value* slot = b_->CreateAlloca(selfTy, nullptr, "self");
-            b_->CreateStore(f->getArg(0), slot);
-            locals_["self"] = slot;
-            arg = 1;
+        // A static method has no receiver: do not bind `self` and start binding
+        // its real parameters at index 0 (the signature has no `self` slot).
+        bool isStatic = staticMethods_.count(ownerTy->name + "." + fn->name) > 0;
+        if (!isStatic) {
+            if (fn->isMutating) {
+                // Keep the receiver pointer: field writes go through it.
+                locals_["self"] = f->getArg(0);
+                arg = 1;
+            } else {
+                llvm::Value* slot = b_->CreateAlloca(selfTy, nullptr, "self");
+                b_->CreateStore(f->getArg(0), slot);
+                locals_["self"] = slot;
+                arg = 1;
+            }
         }
         for (auto& p : fn->params) {
             llvm::Type* pt = lowerDeclType(p.semaType, p.type.get());
@@ -6420,6 +6506,10 @@ public:
     std::map<std::string, const Type*> enumTypes_;
     // Instance methods of value types, keyed by mangled "Type.method".
     std::map<std::string, llvm::Function*> methodFns_;
+    // Keys of methodFns_ that are *static* (no receiver); used to emit a direct
+    // call without a `self` argument at the call site, and to skip the implicit
+    // `self` binding while generating the method body.
+    std::set<std::string> staticMethods_;
     // Free functions keyed by name, for call-site default/variadic expansion.
     std::map<std::string, FunctionDecl*> fnDecls_;
     std::vector<std::pair<FunctionDecl*, const Type*>> methodOrder_; // decl, owner

@@ -6,6 +6,8 @@
 
 module concurrency
 
+import core
+
 /// An execution context that runs work serially (e.g. the main actor).
 protocol TaskExecutor {}
 
@@ -28,3 +30,41 @@ struct Mutex {
 struct AtomicInt {
     var value: Int
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  并发原语：Channel / Task / TaskGroup / withTaskGroup
+//
+//  「类型与方法签名」由本标准库以源码声明提供（即「释放编译器硬编码」），但其
+//  方法体由编译器按类型名合成、桥接到 src/runtime/runtime.c 的 C 运行时，
+//  源码不含方法体，故标注 `@intrinsic`。结构体首字段必须是 `handle: OpaquePointer`，
+//  与代码生成期望的内存布局（{ i8* handle }）严格一致，否则运行时会取错句柄。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 有界、阻塞式 FIFO 通道，由 C 运行时支撑。
+struct Channel<T> {
+    var handle: OpaquePointer
+    /// 发送一个值；可能阻塞，调用方须 `await`。
+    @intrinsic async func send(_ value: T)
+    /// 接收一个值；可能阻塞，调用方须 `await`。
+    @intrinsic async func receive() -> T
+    /// 关闭通道，使其被耗尽后结束 `for await`。
+    @intrinsic async func close()
+}
+
+/// 在独立线程上运行的任务；`wait()` 阻塞至其完成。
+struct Task {
+    var handle: OpaquePointer
+    @intrinsic func wait()
+}
+
+/// 结构化并发的任务组：派发的子任务在组作用域退出前全部完成。
+struct TaskGroup<T> {
+    var handle: OpaquePointer
+    /// 派发一个产出 T 的子任务。
+    @intrinsic func addTask(_ body: () -> T)
+    /// 等待组内所有子任务完成。
+    @intrinsic func waitForAll()
+}
+
+/// 在作用域内运行一组子任务，作用域退出前 `await` 全部完成（结构化并发）。
+@intrinsic async func withTaskGroup(_ body: (TaskGroup) -> Void)

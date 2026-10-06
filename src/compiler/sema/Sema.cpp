@@ -468,7 +468,7 @@ void Sema::analyze(NodeList& decls) {
     expandMacros(decls);
     globals_.pushScope();
     locals_.pushScope();
-    registerBuiltins();
+    registerBuiltins(decls);
 
     // Pass 1: create type records for every named type declaration.
     // Declarations belonging to the imported stdlib prelude (index < stdlibDeclCount_)
@@ -869,7 +869,7 @@ void Sema::checkInitRules() {
 }
 
 // ─── Collection ────────────────────────────────────────────────────────────
-void Sema::registerBuiltins() {
+void Sema::registerBuiltins(const NodeList& decls) {
     auto addFn = [&](const char* name, std::vector<const Type*> params, const Type* ret) {
         Symbol s;
         s.kind = Symbol::Kind::Function;
@@ -929,12 +929,41 @@ void Sema::registerBuiltins() {
     addBuiltinFn("sleep", { types_.intType() }, types_.voidType(),
                  true, "suki_sleep");
 
+    // ── 兼容性回退守卫 ────────────────────────────────────────────────────────
+    // 自本版起，Channel / Task / TaskGroup / withTaskGroup 的「类型与方法签名」由
+    // 标准库 src/stdlib/concurrency/concurrency.suki 以 @intrinsic 声明提供，编译器
+    // 仅负责按类型名合成其运行时方法体（见 IRGenerator 的 genChannelMethod 等）。
+    // 若某个程序未 `import concurrency`（标准库未被载入，decls 中无同名声明），
+    // 则在此按旧方式硬编码合成，保证向后兼容。一旦标准库已声明同名符号，便跳过
+    // 合成，避免重复定义——标准库声明成为唯一真相来源（即「释放硬编码」）。
+    auto stdlibProvides = [&](const char* nm) -> bool {
+        for (auto& d : decls) {
+            if (!d) continue;
+            // 类型声明在 AST 中以 StructDecl / EnumDecl / ClassDecl / ActorDecl 出现，
+            // 统一经 TypeDecl 基类访问其 name；函数声明为 FunctionDecl。
+            if (d->kind == NodeKind::StructDecl || d->kind == NodeKind::EnumDecl ||
+                d->kind == NodeKind::ClassDecl || d->kind == NodeKind::ActorDecl) {
+                auto* td = static_cast<TypeDecl*>(d.get());
+                if (td->name == nm) return true;
+            } else if (d->kind == NodeKind::FunctionDecl) {
+                auto* fd = static_cast<FunctionDecl*>(d.get());
+                if (fd->name == nm) return true;
+            }
+        }
+        return false;
+    };
+
+    // 供下方 Task / TaskGroup / withTaskGroup 合成共用的 `Void` 类型表达辅助。
+    auto voidRepr = []() { auto* n = new NamedType(); n->name = "Void"; return n; };
+
     // ─── Channel<T> ─────────────────────────────────────────────────────────
     // A bounded, blocking FIFO backed by the C runtime. An instance stores only
     // the runtime handle; `send` / `receive` block the calling thread, which is
     // the right behaviour inside an async function (it runs on its own thread).
     // The bodies are emitted by the code generator against the runtime, so the
     // declarations carry no SukiCode body.
+    // 标准库 concurrency 已声明 Channel 时优先使用其定义，不在此硬编码合成。
+    if (!stdlibProvides("Channel")) {
     {
         auto rec = std::make_unique<TypeRecord>();
         rec->name = "Channel";
@@ -1008,14 +1037,15 @@ void Sema::registerBuiltins() {
         Symbol s; s.kind = Symbol::Kind::Type; s.record = raw;
         globals_.declare("Channel", s);
     }
+    } // !stdlibProvides("Channel")
 
     // ─── Task / TaskGroup (structured concurrency) ──────────────────────────
     // Both are single-field wrappers around a runtime handle. `Task { ... }` runs
     // a closure on its own thread; a TaskGroup records each child's Future so
     // `waitForAll` can join them — the guarantee behind structured concurrency
     // that no child outlives the group that spawned it.
-    auto voidRepr = []() { auto* n = new NamedType(); n->name = "Void"; return n; };
-
+    // 标准库 concurrency 已声明 Task / TaskGroup 时跳过此硬编码合成。
+    if (!stdlibProvides("Task") && !stdlibProvides("TaskGroup")) {
     auto addHandleStruct = [&](const char* name,
                                std::vector<TypeRecord::Member> extras) {
         auto rec = std::make_unique<TypeRecord>();
@@ -1092,9 +1122,12 @@ void Sema::registerBuiltins() {
         // knows how large each result is.
         tgRec->genericParams = { "T" };
     }
+    } // !stdlibProvides("Task") && !stdlibProvides("TaskGroup")
 
     // `withTaskGroup { group in ... }` — runs the body with a fresh group and
     // waits for every child before returning. It is async so callers `await` it.
+    // 标准库 concurrency 已声明 withTaskGroup 时跳过此硬编码合成。
+    if (!stdlibProvides("withTaskGroup")) {
     {
         auto* fd = new FunctionDecl();
         fd->name = "withTaskGroup";
@@ -1122,6 +1155,7 @@ void Sema::registerBuiltins() {
             types_.voidType());
         globals_.declare("withTaskGroup", s);
     }
+    } // !stdlibProvides("withTaskGroup")
 }
 
 void Sema::collectTypeDecl(Node* decl, bool isStdlib) {
@@ -1589,9 +1623,9 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
 
             // Owned<T>：唯一所有权（规范 §6.4）。编译器原生识别，因为规范强制
             // 在实例化 `Owned<class>` / `Owned<actor>` 时报错——这一规则无法仅靠
-            // 泛型约束表达。当标准库 `memory` 模块尚未声明真实 `struct Owned<T>`
-            // （当前情形）时在此合成；一旦 memory 模块给出该结构体，应改为依赖
-            // 其泛型约束并在 monomorphise 处校验，避免与本地合成冲突。
+            // 泛型约束表达。若 `memory` 标准库已声明真实 `struct Owned<T>`，则交由
+            // 下方常规记录解析（含 `.value` 成员与泛型约束）；否则在此合成内建 Ref
+            // 类型作为回退，保证尚未提供该结构体时仍可编译。
             if (name == "Owned") {
                 const Type* e = nt->genericArgs.empty()
                     ? types_.unknownType()
@@ -1605,7 +1639,10 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
                     diags_.reportError(
                         "'Owned<T>' cannot wrap a class/actor type; 'T' must be a "
                         "value type or Unmanaged<T> (spec §6.4)", rangeOf(repr));
-                return types_.ref(RefKind::Owned, e);
+                // 仅当 memory 模块未声明真实 `Owned` 时才回退合成；已声明则走下方
+                // 常规记录路径（保留 .value 等成员）。
+                if (!findType("Owned"))
+                    return types_.ref(RefKind::Owned, e);
             }
 
             // 规范 §8.7：`Never` 是内建 bottom 类型（`!`），没有类型记录，
@@ -2131,7 +2168,15 @@ const Type* Sema::inferOpaqueReturnType(FunctionDecl* fn, const TypeRecord* owne
 }
 
 void Sema::checkFunctionBody(FunctionDecl* fn, const TypeRecord* owner) {
-    if (fn->isForeign) return; // external declaration: no body to check
+    // `@intrinsic` 函数体由编译器按类型名合成（运行时桥接），源码不提供 body，
+    // 因此与 `foreign` 一样跳过函数体检查——这是「释放硬编码」的标准库侧机制：
+    // 标准库声明类型与方法签名（标注 @intrinsic），编译器据类型名生成其实现。
+    {
+        bool isIntrinsic = false;
+        for (const auto& a : fn->attributes)
+            if (a == "intrinsic") { isIntrinsic = true; break; }
+        if (fn->isForeign || isIntrinsic) return; // 外部声明 / 编译器内建：无 body 可查
+    }
     // 确定性赋值（§1.3）：待初始化集合按函数体重置，避免跨函数污染。
     pendingInit_.clear();
     currentType_ = owner;
@@ -3340,14 +3385,18 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                 }
             }
             const Type* base = checkExpr(m->base.get(), context);
-            // 类型名作命名空间：`Type.case` / `Type.self` 等成员访问（规范 1.7
-            // 枚举成员值）。裸类型名本身在引用处被解析为 Unknown，但作为成员
-            // 访问的基时，应还原为其具名类型，使枚举 case 值可达。
+            // 类型名作命名空间：`Type.case` / `Type.self` / `Type.staticMethod()`
+            // 等成员访问（规范 1.7 枚举成员值；§8.4 静态方法）。裸类型名作为
+            // 表达式被解析为 Unknown，但作为成员访问的基时，应还原为其具名类型，
+            // 并把"类型引用"记录在 base 节点上（Metatype），使下游代码生成能区分
+            // `Type.method()` 是"静态派发"（无接收者）还是"实例调用"。
             if (base && base->kind == TypeKind::Unknown &&
                 m->base->kind == NodeKind::IdentExpr) {
                 const std::string& bn = static_cast<IdentExpr*>(m->base.get())->name;
-                if (const TypeRecord* brec = findType(bn))
+                if (const TypeRecord* brec = findType(bn)) {
                     base = types_.named(brec, bn);
+                    m->base->semaType = types_.metatype(base, false);
+                }
             }
             // 类型化非托管指针特化（规范 §6.5 / §8.1）：`pointee` 与 `deallocate`
             // 均非普通成员，由 codegen 特化生成。`UnsafeMutablePointer<T>` /

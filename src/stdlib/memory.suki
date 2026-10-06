@@ -65,3 +65,61 @@ func allocate<T>(capacity n: Int) -> UnsafeMutablePointer<T> {
 // 导入方访问应被拒绝。供 moduleTest 的访问控制用例对照验证。
 public func memoryPublicHelper() -> Int { return 7 }
 internal func memoryInternalHelper() -> Int { return 8 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  内存管理原语（规范 §6.4 / §12.3）：唯一所有权、字节缓冲、内存池、连接池、资源集合
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 唯一所有权包装。T 必须为值类型或 Unmanaged<T>（编译器在实例化
+/// `Owned<class>` / `Owned<actor>` 时强制报错）。移动语义由 `move` 关键字保证：
+/// 移动后原变量被禁用，确保任意时刻仅一个所有者持有该值。
+public struct Owned<T> {
+    public var value: T
+    public init(_ v: T) { self.value = v }
+}
+
+/// 固定容量字节缓冲区。
+public struct ByteBuffer {
+    public var size: Int
+    public init(capacity c: Int) { self.size = c }
+}
+
+/// 可被统一释放的资源。Collection 在其析构时对每个持有项调用 `shutdown()`。
+public class Resource {
+    public init() {}
+    public func shutdown() {}
+}
+
+/// 内存池：预分配并复用对象（规范 §12.3）。
+public class MemoryPool<T> : Resource {
+    public var capacity: Int
+    private var defaultValue: T
+    public init(capacity c: Int, defaultValue d: T) {
+        self.capacity = c
+        self.defaultValue = d
+    }
+    /// 取出一个对象；池为空时返回 nil（此处简化为始终返回默认值）。
+    public func allocate() -> T? { return self.defaultValue }
+    /// 释放池中所有对象（演示用：立即清空）。
+    public func releaseAll() {}
+    public override func shutdown() {}
+}
+
+/// 连接池（资源管理演示）。
+public class ConnectionPool : Resource {
+    public var capacity: Int
+    public init(capacity c: Int) { self.capacity = c }
+    public override func shutdown() {}
+}
+
+/// 资源集合：析构时统一释放所持有的全部资源（规范 §12.3）。
+public class Collection {
+    private var items: [Resource] = []
+    public init() {}
+    public func add(_ item: Resource) { self.items.append(item) }
+    deinit {
+        // `collection` 离开作用域时此处运行：对每个持有资源调用 shutdown()，
+        // 先释放 dbPool 再释放 cachePool。
+        for it in self.items { it.shutdown() }
+    }
+}

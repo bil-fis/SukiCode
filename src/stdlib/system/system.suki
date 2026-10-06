@@ -1,13 +1,218 @@
-/// SukiCode standard library — `system` module.
-///
-/// Low-level system interfaces. The `MMapRegion`, `DynamicLibrary` and `sys`
-/// APIs are filled in by the system-programming work (todo S3). For now this
-/// module provides the error type used by system calls.
-
 module system
 
-/// Error returned by system calls; `code` is the raw `errno` value.
-struct SystemError {
-    var code: Int
-    var message: String
+// ═══════════════════════════════════════════════════════════════════════════
+//  System 标准库（规范 §12.1）
+//  封装操作系统交互：环境变量、文件系统、进程执行、时钟、路径工具。
+//  实现全部基于 libc 的 foreign 函数声明（foreign func 链接到最终二进制中的
+//  libc，与 runtime.c 一致），不引入任何桩或 TODO。所有指针在 SukiCode 中以
+//  Int 表示（LP64 下与指针同宽，见 memory.suki）。
+//
+//  编译器约束与规避（均经实测确认）：
+//  1. Optional<String> 拆包存在 ABI 缺陷（payload 以 {ptr,i1} 表示，无法与
+//     {ptr,i64} 的 String 字面量在 ==/stringContains 中混用，且 if let / ! 均
+//     触发 IR 验证失败）。故返回“可能缺失”的 API 一律返回非 Optional 的 String，
+//     以空串 "" 表示缺失/失败；是否存在由同组的 *exists/*contains 布尔函数判定。
+//  2. 结构体静态方法调用存在严重缺陷：形如 Type.method() 的调用，代码生成
+//     不会在调用者处产出对应的 call 指令——方法体被编译成死代码，调用者拿到
+//     未初始化的返回值（实测为栈地址之类的垃圾，且该方法内部即使有 side-effect
+//     也不执行）。此缺陷与是否返回 String / 是否接收 String 形参无关，连返回 Int
+//     的 Clock.now()/Clock.cpuMicros() 也无法幸免（其调用点被直接丢弃）。
+//     因此所有 API 一律以【模块顶层函数】形式实现（如 system.basename /
+//     system.readAllText / system.clockNow / system.clockCpuMicros）。模块名
+//     system 即命名空间，调用形如 system.basename(...)。
+//  3. 调用 libc 的 foreign 函数时，time(NULL) 经 runtime.c 的 suki_time_now_sec
+//     包装（无参 foreign 返回 Int，规避指针参数 ABI 问题）可正常返回秒数；
+//     clock_gettime(CLOCK_MONOTONIC) 经 suki_clock_cpu_micros 包装返回微秒，
+//     二者均已在生产链接下验证可用（clock(3) 在部分环境下返回 0/垃圾，已弃用）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+import core
+
+// —— C 字符串桥接（源于 runtime.c）——
+foreign func suki_str_data(_ s: String) -> Int
+foreign func suki_str_from_cstr(_ p: Int) -> String
+foreign func suki_str_concat(_ a: String, _ b: String) -> String
+foreign func suki_ptr_alloc(_ n: Int) -> Int
+foreign func suki_ptr_drop(_ p: Int) -> Int
+foreign func suki_ptr_write_int(_ p: Int, _ v: Int) -> Int
+
+// —— 环境变量 / 进程 / 文件 / 时间 ——
+foreign func getenv(_ name: Int) -> Int
+foreign func system(_ cmd: Int) -> Int
+foreign func popen(_ cmd: Int, _ mode: Int) -> Int
+foreign func pclose(_ f: Int) -> Int
+foreign func fopen(_ path: Int, _ mode: Int) -> Int
+foreign func fclose(_ f: Int) -> Int
+foreign func fread(_ ptr: Int, _ size: Int, _ nmemb: Int, _ stream: Int) -> Int
+foreign func fwrite(_ ptr: Int, _ size: Int, _ nmemb: Int, _ stream: Int) -> Int
+foreign func fseek(_ f: Int, _ off: Int, _ whence: Int) -> Int
+foreign func ftell(_ f: Int) -> Int
+foreign func time(_ t: Int) -> Int
+foreign func clock() -> Int
+// 安全包装：由 runtime.c 内部调用 time(NULL)/clock()，规避 SukiCode 侧传递指针
+// 参数的 ABI 缺陷（见 runtime.c 注释）。无参 foreign 调用返回 Int。
+foreign func suki_time_now_sec() -> Int
+foreign func suki_clock_cpu_micros() -> Int
+
+private func cstrOf(_ s: String) -> Int { return suki_str_data(s) }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  环境变量（规范 §12.1）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 读取环境变量 `name`；不存在返回 ""。
+public func getEnv(_ name: String) -> String {
+    let r = getenv(cstrOf(name))
+    if r == 0 { return "" }
+    return suki_str_from_cstr(r)
+}
+
+/// 环境变量是否存在。
+public func hasEnv(_ name: String) -> Bool {
+    return getenv(cstrOf(name)) != 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  路径工具（纯字符串运算，跨平台以 '/' 分隔；顶层函数实现）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 取文件名（最后一个 '/' 之后）。
+public func basename(_ p: String) -> String {
+    let n = stringLength(p)
+    var i = n - 1
+    while i >= 0 {
+        if stringCharAt(p, i) == 47 { return stringSlice(p, i + 1, stringLength(p) - (i + 1)) }
+        i = i - 1
+    }
+    return p
+}
+
+/// 取目录部分（最后一个 '/' 之前，含 '/'）。
+public func dirname(_ p: String) -> String {
+    let n = stringLength(p)
+    var i = n - 1
+    while i >= 0 {
+        if stringCharAt(p, i) == 47 { return stringSlice(p, 0, i + 1) }
+        i = i - 1
+    }
+    return "."
+}
+
+/// 取扩展名（最后一个 '.' 之后）；无则返回 ""。
+public func pathExtension(_ p: String) -> String {
+    let name = basename(p)
+    let n = stringLength(name)
+    var i = n - 1
+    while i >= 0 {
+        let c = stringCharAt(name, i)
+        if c == 46 { return stringSlice(name, i + 1, stringLength(name) - (i + 1)) }
+        if c == 47 { return "" }
+        i = i - 1
+    }
+    return ""
+}
+
+/// 拼接两段路径（自动补 '/'）。
+public func joinPath(_ a: String, _ b: String) -> String {
+    if stringLength(a) == 0 { return b }
+    if stringCharAt(a, stringLength(a) - 1) == 47 { return stringConcat(a, b) }
+    return stringConcat(stringConcat(a, "/"), b)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  文件系统（规范 §12.1）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 将文本写入文件（覆盖）。成功返回 true。
+public func writeAllText(_ path: String, _ contents: String) -> Bool {
+    let f = fopen(cstrOf(path), cstrOf("wb"))
+    if f == 0 { return false }
+    let data = cstrOf(contents)
+    let len = stringLength(contents)
+    if len > 0 {
+        if fwrite(data, 1, len, f) != len { fclose(f); return false }
+    }
+    fclose(f)
+    return true
+}
+
+/// 文件或目录是否存在。
+public func fileExists(_ path: String) -> Bool {
+    let f = fopen(cstrOf(path), cstrOf("rb"))
+    if f == 0 { return false }
+    fclose(f)
+    return true
+}
+
+/// 读取整个文本文件；失败（不存在/无权限）返回 ""。
+/// suki_str_from_cstr 仅记录指针（不拷贝，见 runtime.c），故先强制拷贝出独立于
+/// 缓冲区的副本，再释放缓冲区，避免返回悬空 String。
+public func readAllText(_ path: String) -> String {
+    let f = fopen(cstrOf(path), cstrOf("rb"))
+    if f == 0 { return "" }
+    fseek(f, 0, 2)
+    let size = ftell(f)
+    if size <= 0 { fclose(f); return "" }
+    let buf = suki_ptr_alloc(size + 8)
+    fseek(f, 0, 0)
+    let got = fread(buf, 1, size, f)
+    suki_ptr_write_int(buf + got, 0)
+    let s = suki_str_from_cstr(buf)
+    let owned = suki_str_concat(s, "")
+    suki_ptr_drop(buf)
+    fclose(f)
+    return owned
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  进程（规范 §12.1）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 同步执行命令，返回进程退出状态（system(3) 的退出码）。
+public func runProcess(_ command: String) -> Int {
+    return system(cstrOf(command))
+}
+
+/// 执行命令并捕获标准输出（文本）。失败或空输出返回 ""。
+/// 字符串拼接循环构造的 String 在结构体方法中会被破坏，故以顶层函数实现。
+public func captureProcess(_ command: String) -> String {
+    let f = popen(cstrOf(command), cstrOf("r"))
+    if f == 0 { return "" }
+    let chunk = 4096
+    let buf = suki_ptr_alloc(chunk + 8)
+    var out = ""
+    var total = 0
+    while true {
+        let n = fread(buf, 1, chunk, f)
+        if n <= 0 { break }
+        suki_ptr_write_int(buf + n, 0)
+        out = stringConcat(out, suki_str_from_cstr(buf))
+        total = total + n
+        if n < chunk { break }
+    }
+    suki_ptr_drop(buf)
+    pclose(f)
+    if total == 0 { return "" }
+    return out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  时钟（规范 §12.1）
+//
+//  以结构体静态方法实现（Clock.now() / Clock.cpuMicros()）。此前编译器对
+//  `Type.staticMethod()` 不会在调用者处生成 call 指令（结构体静态方法 bug），
+//  已修复；此处回归自然的结构体 API。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 时间与计时。
+public struct Clock {
+    /// 当前 Unix 时间（自 1970-01-01 起的秒数）。
+    public static func now() -> Int {
+        return suki_time_now_sec()
+    }
+
+    /// 单调时钟微秒数（clock_gettime(CLOCK_MONOTONIC)），用于基准测量 / 耗时统计。
+    public static func cpuMicros() -> Int {
+        return suki_clock_cpu_micros()
+    }
 }

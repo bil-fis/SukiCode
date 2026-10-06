@@ -1,3 +1,4 @@
+import concurrency
 // 结构化并发（规范 7.3）：TaskGroup 派发子任务并等待全部完成。
 // Spec 7.3: structured concurrency — a TaskGroup spawns children and joins them.
 //

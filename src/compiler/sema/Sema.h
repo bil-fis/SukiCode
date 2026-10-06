@@ -128,7 +128,7 @@ private:
     // ── collection ──────────────────────────────────────────────────────────
     // Seed the global scope with runtime/stdlib primitives (print, ...) so
     // user code can call them before the bootstrap stdlib is compiled in.
-    void registerBuiltins();
+    void registerBuiltins(const NodeList& decls);
     void collectTypeDecl(Node* decl, bool isStdlib = false);
     void collectMembers(TypeRecord& rec, TypeDecl* td);
     // Add a single member node to a record (extracted so extensions and

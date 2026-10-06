@@ -1,3 +1,4 @@
+import concurrency
 // 通道（规范 7.5）：有界阻塞 FIFO，跨线程传递值。
 // Spec 7.5: a bounded blocking channel used across threads.
 //

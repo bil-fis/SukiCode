@@ -1,69 +1,87 @@
-// Concurrency — SukiCode async/await, actors, channels
+// Concurrency — async/await, actor, TaskGroup, Channel, select (specification §7).
+// Demonstrates the full concurrency family implemented in the `concurrency`
+// standard-library module. Runs to completion and exits 0; every subsystem is
+// exercised through a real call path.
 
-// Async function
-async func fetchData(from url: String) throws -> String {
-    let data = await httpClient.get(url)
-    return data
-}
+import concurrency
 
-// Actor for thread-safe state
+// ── Actor: serialised mutable state ──────────────────────────────────────────
 actor Counter {
-    private var value = 0
-
-    func increment() {
-        value += 1
-    }
-
-    func getValue() -> Int {
-        return value
-    }
+    private var value: Int = 0
+    func increment() { value = value + 1 }
+    func getValue() -> Int { return value }
 }
 
-// Structured concurrency with TaskGroup
-func downloadAll(urls: [String]) async -> [String] {
-    var results: [String] = []
-
-    await withTaskGroup(of: String.self) { group in
-        for url in urls {
-            group.addTask {
-                return await fetchData(from: url)
-            }
-        }
-        for await data in group {
-            results.append(data)
-        }
-    }
-
-    return results
+// ── async function ───────────────────────────────────────────────────────────
+async func compute(_ n: Int) -> Int {
+    return n * 2
 }
 
-// Channel communication
+// ── Channel: producer / consumer with for-await ──────────────────────────────
 async func producerConsumer() {
     let channel = Channel<Int>(capacity: 10)
-
-    // Producer
     Task {
-        for i in 0..<100 {
+        var i = 0
+        while i < 100 {
             await channel.send(i)
+            i = i + 1
         }
+        await channel.close()
     }
+    var sum = 0
+    for await value in channel {
+        sum = sum + value
+    }
+    print("channel sum = \(sum)")
+}
 
-    // Consumer
-    Task {
-        while let value = await channel.receive() {
-            print("Received: \(value)")
-        }
+// ── select: receive from whichever channel is ready ──────────────────────────
+async func selectDemo() {
+    let ch1 = Channel<String>(capacity: 1)
+    await ch1.send("hello")
+    select {
+    case msg <- ch1:
+        print("select got: \(msg)")
+    default:
+        print("select default")
     }
 }
 
-// Select statement
-async func selectExample(ch1: Channel<String>, ch2: Channel<Int>) {
-    select {
-    case msg <- ch1:
-        print("Got string: \(msg)")
-    case num <- ch2:
-        print("Got number: \(num)")
-    default:
-        print("No data available")
+// ── TaskGroup: fan-out fan-in ────────────────────────────────────────────────
+async func taskGroupDemo() {
+    await withTaskGroup { group in
+        var i = 0
+        while i < 4 {
+            // 每次迭代绑定独立的 `n`，供闭包按引用捕获正确的值
+            // （与全局可变状态共享一致，遵循本语言的引用捕获语义）。
+            let n = i
+            group.addTask { return await compute(n) }
+            i = i + 1
+        }
+        var total = 0
+        for await data in group {
+            total = total + data
+        }
+        print("taskgroup total = \(total)")
     }
+}
+
+@main func main() async -> Int {
+    // 1. Actor: increment three times (serialised, no data race).
+    let counter = Counter()
+    counter.increment()
+    counter.increment()
+    counter.increment()
+
+    // 2. Channel producer/consumer (for-await drains until closed).
+    await producerConsumer()
+
+    // 3. select: receive the value we just sent.
+    await selectDemo()
+
+    // 4. TaskGroup fan-out/fan-in.
+    await taskGroupDemo()
+
+    print("concurrency demo done")
+    return 0
 }

@@ -106,7 +106,11 @@ foreign func suki_str_has_suffix(_ s: String, _ p: String) -> Int32
 foreign func suki_str_to_int(_ s: String) -> Int
 foreign func suki_int_to_string(_ v: Int) -> String
 foreign func suki_double_to_string(_ v: Double) -> String
-foreign func suki_char_to_string(_ v: Int32) -> String
+foreign func suki_char_to_string(_ v: Int) -> String
+// 返回 s[index] 处的 Unicode 标量（21 位）；越界返回 -1（见 runtime.c）。
+// 注意：索引参数必须用 Int（i64）传递——本编译器对 Int32 作为 FFI 第二参数
+// 存在传递缺失的缺陷，会令调用方拿到未初始化的 index；改用 Int（i64）后正常。
+foreign func suki_str_utf8_get(_ s: String, _ index: Int) -> Int
 // ABI-compatible trap that takes a `String` by value (see runtime.c). The
 // compiler builtin `panic` is only visible inside the main module.
 foreign func suki_panic_string(_ msg: String)
@@ -154,7 +158,7 @@ func doubleToString(_ v: Double) -> String {
 }
 
 /// Render a Unicode scalar (21-bit) as a one-character string.
-func charToString(_ v: Int32) -> String {
+func charToString(_ v: Int) -> String {
     return suki_char_to_string(v)
 }
 
@@ -389,4 +393,375 @@ func randomIntInRange(_ lo: Int, _ hi: Int) -> Int {
 /// Returns a pseudo-random `Bool`.
 func randomBool() -> Bool {
     return (randomInt() % 2) == 0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  高阶集合 API（规范 §1.6 / §3.3）
+//  编译器尚不能单态化「带 2 个类型参数的泛型函数」（见模块头 note 4），故
+//  以具体类型重载提供高阶函数：Int / String / Double / Bool。每个函数接受
+//  闭包作为实参（闭包 codegen 已支持），在循环内调用闭包完成 map / filter /
+//  reduce / forEach 等操作。闭包作实参、在循环内调用的形态已被 codegen 验证
+//  （见 moduleTest/codegen/closure.suki）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// —— Int 数组 ——
+
+/// 对数组中每个元素应用 `f`，返回结果新数组。
+func mapInt(_ xs: [Int], _ f: (Int) -> Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < xs.count {
+        out = out.append(f(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+/// 保留使 `pred(x)` 为真的元素。
+func filterInt(_ xs: [Int], _ pred: (Int) -> Bool) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { out = out.append(xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+/// 以 `initial` 为初值，依次用 `f(累加器, 元素)` 折叠出单一结果。
+func reduceInt(_ xs: [Int], _ initial: Int, _ f: (Int, Int) -> Int) -> Int {
+    var acc = initial
+    var i = 0
+    while i < xs.count {
+        acc = f(acc, xs[i])
+        i = i + 1
+    }
+    return acc
+}
+
+/// 对每个元素执行 `body`（忽略其返回值）。
+func forEachInt(_ xs: [Int], _ body: (Int) -> Void) {
+    var i = 0
+    while i < xs.count {
+        body(xs[i])
+        i = i + 1
+    }
+}
+
+/// 是否存在元素使 `pred` 为真。
+func containsIntWhere(_ xs: [Int], _ pred: (Int) -> Bool) -> Bool {
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+/// 第一个使 `pred` 为真的元素下标，找不到返回 -1。
+func firstIndexIntWhere(_ xs: [Int], _ pred: (Int) -> Bool) -> Int {
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+/// 是否所有元素都满足 `pred`。
+func allInt(_ xs: [Int], _ pred: (Int) -> Bool) -> Bool {
+    var i = 0
+    while i < xs.count {
+        if !pred(xs[i]) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+/// 求和。
+func sumInt(_ xs: [Int]) -> Int {
+    var s = 0
+    var i = 0
+    while i < xs.count {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return s
+}
+
+/// 返回升序排列的新数组（选择排序，原地于副本）。
+func sortedInt(_ xs: [Int]) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < xs.count {
+        out = out.append(xs[i])
+        i = i + 1
+    }
+    var n = out.count
+    var a = 0
+    while a < n {
+        var best = a
+        var b = a + 1
+        while b < n {
+            if out[b] < out[best] { best = b }
+            b = b + 1
+        }
+        if best != a {
+            let t = out[a]
+            out[a] = out[best]
+            out[best] = t
+        }
+        a = a + 1
+    }
+    return out
+}
+
+/// 用 `sep` 连接字符串数组。
+func joined(_ parts: [String], _ sep: String) -> String {
+    var out = ""
+    var i = 0
+    while i < parts.count {
+        out = stringConcat(out, parts[i])
+        if i < parts.count - 1 { out = stringConcat(out, sep) }
+        i = i + 1
+    }
+    return out
+}
+
+// —— String 数组 ——
+
+/// 对每个字符串元素应用 `f`。
+func mapString(_ xs: [String], _ f: (String) -> String) -> [String] {
+    var out: [String] = []
+    var i = 0
+    while i < xs.count {
+        out = out.append(f(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+/// 保留使 `pred` 为真的字符串元素。
+func filterString(_ xs: [String], _ pred: (String) -> Bool) -> [String] {
+    var out: [String] = []
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { out = out.append(xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+/// 第一个使 `pred` 为真的字符串下标，找不到返回 -1。
+func firstIndexStringWhere(_ xs: [String], _ pred: (String) -> Bool) -> Int {
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+/// 是否存在字符串元素使 `pred` 为真。
+func containsStringWhere(_ xs: [String], _ pred: (String) -> Bool) -> Bool {
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// —— Double 数组 ——
+
+/// 对 Double 数组每个元素应用 `f`。
+func mapDouble(_ xs: [Double], _ f: (Double) -> Double) -> [Double] {
+    var out: [Double] = []
+    var i = 0
+    while i < xs.count {
+        out = out.append(f(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+/// 保留使 `pred` 为真的 Double 元素。
+func filterDouble(_ xs: [Double], _ pred: (Double) -> Bool) -> [Double] {
+    var out: [Double] = []
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { out = out.append(xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+/// Double 数组求和。
+func sumDouble(_ xs: [Double]) -> Double {
+    var s = 0.0
+    var i = 0
+    while i < xs.count {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return s
+}
+
+// —— Bool 数组 ——
+
+/// Bool 数组是否全为真。
+func allTrue(_ xs: [Bool]) -> Bool {
+    var i = 0
+    while i < xs.count {
+        if !xs[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+/// Bool 数组是否至少有一个为真。
+func anyTrue(_ xs: [Bool]) -> Bool {
+    var i = 0
+    while i < xs.count {
+        if xs[i] { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Result 类型（规范 §9.4）
+//  Result<T, E: Error> 由编译器以泛型枚举形式支持，构造（Result<T,E>.success(x)/
+//  .failure(e)）与 switch 解构均可用（见 moduleTest/codegen/result.suki）。
+//  注意（编译器约束，已实测确认）：当前编译器无法将 `Result<Int, E>` 作为泛型函数的
+//  参数或返回值类型进行正确的单态化（E 会被错误推断为嵌套 Result，且无法构造返回
+//  Result<Int,E>）。因此「Result 的泛型高阶辅助函数」暂不可用；用户应直接对 Result
+//  做 switch 解构。该限制将在后续编译器升级后补齐，此处不引入会破坏构建的桩。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  更多数值工具（规范 §12.1）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 最大公约数（欧几里得）。
+func gcd(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    if x < 0 { x = -x }
+    var y = b
+    if y < 0 { y = -y }
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+/// 最小公倍数。
+func lcm(_ a: Int, _ b: Int) -> Int {
+    if a == 0 || b == 0 { return 0 }
+    let g = gcd(a, b)
+    return (a / g) * b
+}
+
+/// `base` 的 `exp` 次幂（exp >= 0）。
+func powInt(_ base: Int, _ exp: Int) -> Int {
+    if exp < 0 { return 0 }
+    var result = 1
+    var e = exp
+    var b = base
+    while e > 0 {
+        if e % 2 == 1 { result = result * b }
+        e = e / 2
+        if e > 0 { b = b * b }
+    }
+    return result
+}
+
+/// 符号：-1 / 0 / 1。
+func sign(_ v: Int) -> Int {
+    if v > 0 { return 1 }
+    if v < 0 { return -1 }
+    return 0
+}
+
+/// 闭区间 `[lo, hi]` 内整数数组（含端点）。
+func rangeInclusive(_ lo: Int, _ hi: Int) -> [Int] {
+    var out: [Int] = []
+    var i = lo
+    while i <= hi {
+        out = out.append(i)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  字符串工具（规范 §1.5）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 以 `sep` 分割字符串，返回子串数组（不含分隔符）。
+func split(_ s: String, _ sep: String) -> [String] {
+    var out: [String] = []
+    let n = stringLength(s)
+    let m = stringLength(sep)
+    if m == 0 { return out }
+    var i = 0
+    var start = 0
+    while i + m <= n {
+        if sliceEquals(s, i, m, sep) {
+            out = out.append(stringSlice(s, start, i - start))
+            start = i + m
+            i = i + m
+        } else {
+            i = i + 1
+        }
+    }
+    out = out.append(stringSlice(s, start, n - start))
+    return out
+}
+
+/// 判断 `s[from ..< from+len]` 是否等于 `sub`（逐字符比较）。
+func sliceEquals(_ s: String, _ from: Int, _ len: Int, _ sub: String) -> Bool {
+    if stringLength(sub) != len { return false }
+    var i = 0
+    while i < len {
+        if stringCharAt(s, from + i) != stringCharAt(sub, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+/// 返回 `s[from ..< from+len]` 子串。
+func stringSlice(_ s: String, _ from: Int, _ len: Int) -> String {
+    var out = ""
+    var i = 0
+    var j = from
+    let end = from + len
+    while i < len && j < stringLength(s) {
+        let c = stringCharAt(s, j)
+        out = stringConcat(out, charToString(c))
+        i = i + 1
+        j = j + 1
+    }
+    return out
+}
+
+/// 返回 `s[index]` 处的 Unicode 标量（Char 的底层 Int 值）。
+func stringCharAt(_ s: String, _ index: Int) -> Int {
+    return suki_str_utf8_get(s, index)
+}
+
+/// `s` 是否包含子串 `needle`。
+func stringContains(_ s: String, _ needle: String) -> Bool {
+    let n = stringLength(s)
+    let m = stringLength(needle)
+    if m == 0 { return true }
+    if m > n { return false }
+    var i = 0
+    while i + m <= n {
+        if sliceEquals(s, i, m, needle) { return true }
+        i = i + 1
+    }
+    return false
 }

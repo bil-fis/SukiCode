@@ -1157,18 +1157,56 @@ NodePtr Parser::parseSelectStmt() {
             c->isDefault = true;
         } else {
             expectKw(KeywordID::Case, "expected 'case'");
-            // `case let v` 是值绑定模式：不比较，只绑定。
+            // `case let v <- chan` / `case var v <- chan`：接收通道值并绑定到新变量 v；
+            // `case v <- chan`：接收并绑定到 v；`case val <- chan`：向通道发送 val。
+            // parseCasePatternExpr 内的 parseExpr 会把 `<-` 当作中缀运算符吃掉，因此
+            // 解析后 `pat` 已是 BinaryExpr(LeftArrow)。但 `let/var` 前缀要先消费名字
+            // 再补上 `<- chan`，单独构造接收绑定模式。
             bool bindPattern = checkKw(KeywordID::Let) || checkKw(KeywordID::Var);
-            NodePtr pat = parseCasePatternExpr(c->bindings);
-            // `case <pat> <- <chan>`：一次通道操作。左侧是发送表达式（`case msg
-            // <- ch`）或接收绑定（`case let v <- ch` / `case _ <- ch`），由
-            // isBindingPattern 区分；右侧是通道。整体记为 `<-` 二元表达式。
-            if (matchPunct(PunctuatorID::LeftArrow)) {
-                auto be = std::make_unique<BinaryExpr>();
-                be->op = PunctuatorID::LeftArrow;
-                be->lhs = std::move(pat);
-                be->rhs = parseExpr();
-                pat = std::move(be);
+            NodePtr pat = nullptr;
+            if (bindPattern) {
+                advance(); // let / var
+                if (!check(TokenKind::TK_Identifier)) {
+                    errorAt(cur(), "expected a binding name after 'let'/'var' in select case");
+                } else {
+                    const std::string bname = cur().text;
+                    advance(); // name
+                    if (matchPunct(PunctuatorID::LeftArrow)) {
+                        // `case let v <- chan`：构造 BinaryExpr(LeftArrow, v, chan)。
+                        auto be = std::make_unique<BinaryExpr>();
+                        be->op = PunctuatorID::LeftArrow;
+                        auto lhs = std::make_unique<IdentExpr>();
+                        lhs->name = bname;
+                        be->lhs = std::move(lhs);
+                        be->rhs = parseExpr();
+                        c->bindings.push_back(bname);
+                        pat = std::move(be);
+                    } else {
+                        // `case let v` 纯值绑定：以 IdentExpr 占位，仅绑定不做比较。
+                        auto id = std::make_unique<IdentExpr>();
+                        id->name = bname;
+                        c->bindings.push_back(bname);
+                        pat = std::move(id);
+                    }
+                }
+            } else {
+                pat = parseCasePatternExpr(c->bindings);
+                // 识别 `case <dst> <- <chan>`（接收）或 `case <chan> <- <val>`（发送）。
+                // 左侧为接收目标（绑定名或 `_` 通配）时登记为"接收绑定"。
+                if (pat && pat->kind == NodeKind::BinaryExpr) {
+                    auto* be = static_cast<BinaryExpr*>(pat.get());
+                    if (be->op == PunctuatorID::LeftArrow &&
+                        be->lhs && be->lhs->kind == NodeKind::IdentExpr) {
+                        const std::string& nm =
+                            static_cast<IdentExpr*>(be->lhs.get())->name;
+                        if (nm == "_") {
+                            bindPattern = true;            // 接收并丢弃
+                        } else if (!bindPattern) {
+                            c->bindings.push_back(nm);
+                            bindPattern = true;            // 接收并绑定到 nm
+                        }
+                    }
+                }
             }
             c->pattern = std::move(pat);
             c->isBindingPattern = bindPattern;

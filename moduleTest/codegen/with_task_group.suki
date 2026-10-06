@@ -1,3 +1,4 @@
+import concurrency
 // `withTaskGroup`（规范 7.3）：作用域内派发的子任务在作用域退出前全部完成。
 // Spec 7.3: withTaskGroup — children never outlive the group scope.
 //

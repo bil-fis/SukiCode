@@ -1,0 +1,14 @@
+// 递归 import 验证：本文件只 `import concurrency`，但通过传递依赖应能用
+// `core` 模块的符号（min 由 core 定义），证明 loadImportedStdlib 的递归解析生效。
+// 若递归解析失效，core 不会被加载，min 将报 "cannot find"。
+
+import concurrency
+
+@main func main() -> Int {
+    // core 提供的 min（Int, Int）-> Int
+    if min(3, 7) != 3 { return 1 }
+    // concurrency 自身提供的类型也可用
+    let m = Mutex()
+    if m.state != 0 { return 2 }
+    return 0
+}

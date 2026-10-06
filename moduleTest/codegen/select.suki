@@ -1,3 +1,4 @@
+import concurrency
 // `select` 语句（规范 7.5）：等待多个通道操作中第一个就绪的分支。
 // Spec 7.5: select waits for the first ready channel operation.
 //
