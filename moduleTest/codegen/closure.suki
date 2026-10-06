@@ -1,0 +1,83 @@
+module m
+// 闭包（codegen 已实现）：作为高阶函数的实参、被循环内调用、携带捕获变量、
+// 以及泛型高阶函数（含 2 类型参数）。全部通过表示高阶集合 API 的闭包支撑可用。
+// 退出码 0 表示所有断言通过。
+
+// 1) 闭包作为函数实参，循环内被调用（集合 API 的核心形态）。
+func apply(_ f: (Int) -> Int, _ x: Int) -> Int {
+    return f(x)
+}
+// 2) 泛型高阶函数（1 类型参数）。
+func applyGeneric<T>(_ f: (T) -> T, _ x: T) -> T {
+    return f(x)
+}
+// 3) 泛型高阶函数（2 类型参数）—— map<T,U> 形态。
+func convert<T, U>(_ x: T, _ f: (T) -> U) -> U {
+    return f(x)
+}
+// 4) 泛型集合 API。
+func map<T, U>(_ xs: [T], _ transform: (T) -> U) -> [U] {
+    var out: [U] = []
+    var i = 0
+    while i < xs.count {
+        out = out.append(transform(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+func filter<T>(_ xs: [T], _ pred: (T) -> Bool) -> [T] {
+    var out: [T] = []
+    var i = 0
+    while i < xs.count {
+        if pred(xs[i]) { out = out.append(xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+func reduce<T, U>(_ xs: [T], _ initial: U, _ combine: (U, T) -> U) -> U {
+    var acc = initial
+    var i = 0
+    while i < xs.count {
+        acc = combine(acc, xs[i])
+        i = i + 1
+    }
+    return acc
+}
+
+func test() -> Int {
+    var total = 0
+
+    // 具体高阶函数 + 循环调用。
+    let doubled = apply({ x in x * 2 }, 21)
+    if (doubled != 42) { total = total + 1 }
+
+    // 捕获变量（闭包作为带签名实参时上下文可见，捕获按引用）。
+    var off = 100
+    let captured = apply({ x in x + off }, 5)   // 期望 105
+    if (captured != 105) { total = total + 1 }
+
+    // 1 参数泛型高阶。
+    let g = applyGeneric({ x in x * 2 }, 21)
+    if (g != 42) { total = total + 1 }
+
+    // 2 参数泛型高阶。
+    let c = convert(21, { x in x * 2 })
+    if (c != 42) { total = total + 1 }
+
+    // 泛型集合 API：map / filter / reduce。
+    let a = [1, 2, 3, 4]
+    let mapped = map(a, { x in x * 2 })          // [2,4,6,8]
+    if (mapped[0] != 2 || mapped[3] != 8) { total = total + 1 }
+    let kept = filter(a, { x in x > 2 })          // [3,4]
+    if (kept[0] != 3 || kept[1] != 4) { total = total + 1 }
+    let summed = reduce(a, 0, { acc, x in acc + x }) // 10
+    if (summed != 10) { total = total + 1 }
+
+    return total
+}
+
+@main func main() -> Int {
+    let t = test()
+    if (t == 0) { return 0 }
+    return 1
+}

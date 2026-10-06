@@ -398,6 +398,18 @@ private:
     // read as a character rather than a String.
     const Type* checkAsChar(Node* e, const TypeRecord* context);
     const Type* inferTypeArgument(const Type* t);
+    // Bind a generic function's type parameters by matching a *declared* parameter
+    // type (a TypeRepr node that may mention the type variables, possibly nested
+    // inside `Array` / `FuncType` / `...`) against the *actual* argument type.
+    // Returns true if a previously-unbound variable was bound. Unifying against the
+    // raw node (not the resolved `Type*`) preserves variable names such as `T`/`U`
+    // that `resolveTypeRepr` would otherwise collapse to `Unknown`, which is what
+    // lets a closure argument such as `{ x in x * 2 }` receive its concrete
+    // parameter types and lets its return type resolve the remaining variables —
+    // the generic `map`/`filter`/`reduce`/`forEach` callbacks (规范 3.3/3.4).
+    bool unifyGenericParamNode(Node* declared, const Type* actual,
+                              const std::vector<std::string>& typeParams,
+                              std::unordered_map<std::string, const Type*>& bind);
     // 不透明返回类型（规范 5.5）：`func f() -> some P` 的底层具体类型由函数体
     // 推断后原地替换函数类型对象的 ret 字段。此处记录 fn → 推断出的具体类型，
     // 供 checkFunctionBody 取返回类型与调用点一致。

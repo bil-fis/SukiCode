@@ -47,7 +47,7 @@ while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
 
 构建过程中逐项二分确认以下限制，已在 `core.suki` 头部注释与本文记录；相关特性以「具体类型 / 规避写法」替代，或移入 pending。
 
-1. **闭包未实现**：任何接收并调用闭包的高阶函数（`map`/`filter`/`reduce`/`forEach`/`sorted`/`compactMap`/`zip`）无法表达。规范 §12.2/§12.3/§12.7 的绝大多数集合高阶 API 因此无法落地。
+1. ~~**闭包未实现**~~ **已修复**：原先任何接收并调用闭包的高阶函数（`map`/`filter`/`reduce`/`forEach`/`sorted`/`compactMap`/`zip`）无法表达。现已支持：闭包字面量 `{ x in x * 2 }` 被 codegen 降为 `{ captures, fnptr }` 的 `SukiClosure` 值，可作为函数参数、被循环内间接调用、携带捕获变量、并参与泛型高阶函数（含 2 类型参数）。配套修复了泛型函数单态化：调用点能递归 unify 声明类型（含 `[T]`、`(T)->U` 内嵌套变量）与实参类型以绑定类型参数，并对仅出现在返回类型中的变量（如 `allocate<T>() -> UnsafeMutablePointer<T>` 的 `T`）回退到旧式启发式推断。规范 §12.2/§12.3/§12.7 的集合高阶 API 现已可落地。回归用例 `moduleTest/codegen/closure.suki` 通过。剩余边界：把**无上下文类型**的闭包字面量赋给局部变量（参数/返回类型须纯靠函数体推断）尚未支持，建议优先把闭包作为带签名实参传入。
 2. ~~**泛型枚举不可用**~~ **已修复**：原先 `enum Box<T> { case wrapped(T); case empty }` 实例化时报 `cannot convert value of type 'Box' to 'Box<Int><Int>'`（实例名被双重包裹）。根因有二：(a) 构造 `E.case(...)` 时返回的是未单态化的泛型 `Box` 而非实例 `Box<Int>`；(b) `typeToString` 对单态化实例（`name` 已是 `Box<Int>` 且 `elements=[Int]`）再次追加 `<Int>`，渲染为 `Box<Int><Int>`。两类均已在后续编译器修复中消弭。规范 §9.4 的 `Result<T, E: Error>` 现已作为泛型枚举落地于 `src/stdlib/core/core.suki`，回归用例 `moduleTest/codegen/result.suki` 通过。
 3. **`for … in` over `Set` 导致编译器段错误**（数组 for-in 正常）。故依赖迭代的 `setUnionInt`/`setIntersectionInt`/`setSubtractInt` 无法提供；单元素的 `insert`/`contains` 可正常使用。
 4. **2 参数泛型函数不被单态化**：`func pair<T>(_ a: T, _ b: T)` 的实例未被生成，调用点回退为变参 `(ptr, ...)` 占位，最终 IR 校验失败。故通用的 `unwrapOr<T>(_ o: T?, fallback: T)` 改为四个具体类型重载。
@@ -64,5 +64,5 @@ while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
 
 ## 六、下一步
 
-- 若需 `Result<T, E>` 与集合高阶 API，须先修复编译器：泛型枚举单态化（限制 2）、闭包（限制 1）、`Set` 的 for-in 代码生成（限制 3）、2 参数泛型单态化（限制 4）。
-- `memory` 模块（`Owned<T>`/`ByteBuffer`/ARC）、`system`/`io`/`concurrency` 等标准库模块受上述限制约束，需按「无闭包 / 无泛型枚举 / 规避分支返回结构体」的写法渐进构建。
+- 编译器层面「泛型枚举单态化（限制 2）、闭包（限制 1）、2 参数泛型单态化（限制 4）」均已修复，故 `Result<T, E>` 与集合高阶 API 已可落地（见 `moduleTest/codegen/result.suki`、`moduleTest/codegen/closure.suki`）。剩余唯一编译器限制为 `Set` 的 for-in 代码生成（限制 3），阻塞集合代数 API 的迭代写法。
+- `memory` 模块（`Owned<T>`/`ByteBuffer`/ARC）、`system`/`io`/`concurrency` 等标准库模块此前受「无闭包 / 无泛型枚举」约束，现已解除；可按正规泛型 + 闭包写法构建。

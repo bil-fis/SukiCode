@@ -300,6 +300,78 @@ const Type* Sema::inferTypeArgument(const Type* t) {
     }
 }
 
+bool Sema::unifyGenericParamNode(Node* declared, const Type* actual,
+                                 const std::vector<std::string>& typeParams,
+                                 std::unordered_map<std::string, const Type*>& bind) {
+    if (!declared || !actual) return false;
+    switch (declared->kind) {
+        case NodeKind::NamedType: {
+            auto* nt = static_cast<NamedType*>(declared);
+            // A bare type variable (e.g. `T`, `U`): bind it to the concrete actual.
+            if (nt->genericArgs.empty() &&
+                std::find(typeParams.begin(), typeParams.end(), nt->name) !=
+                    typeParams.end()) {
+                if (bind.count(nt->name)) return false;
+                if (actual->kind == TypeKind::Unknown) return false;
+                bind[nt->name] = actual;
+                return true;
+            }
+            // A generic container such as `Array<T>` / `Optional<T>` /
+            // `Dictionary<K, V>`: recurse into its element(s).
+            if (!nt->genericArgs.empty()) {
+                bool ch = false;
+                const Type* inner = nullptr;
+                if (nt->name == "Array" || nt->name == "Set")
+                    inner = (actual->kind == TypeKind::Array ||
+                             actual->kind == TypeKind::Set) ? actual->element : nullptr;
+                else if (nt->name == "Optional")
+                    inner = actual->kind == TypeKind::Optional ? actual->element : nullptr;
+                else if (nt->name == "Dictionary") {
+                    inner = actual->kind == TypeKind::Dict ? actual->key : nullptr;
+                    if (nt->genericArgs.size() >= 2 && actual->kind == TypeKind::Dict &&
+                        actual->value)
+                        ch |= unifyGenericParamNode(nt->genericArgs[1].get(),
+                                                    actual->value, typeParams, bind);
+                }
+                if (inner && nt->genericArgs.size() >= 1)
+                    ch |= unifyGenericParamNode(nt->genericArgs[0].get(), inner,
+                                                typeParams, bind);
+                return ch;
+            }
+            return false;
+        }
+        case NodeKind::FuncType: {
+            auto* ft = static_cast<FuncType*>(declared);
+            if (actual->kind != TypeKind::Function &&
+                actual->kind != TypeKind::Closure) return false;
+            if (ft->params.size() != actual->elements.size()) return false;
+            bool ch = false;
+            for (size_t i = 0; i < ft->params.size(); ++i)
+                if (ft->params[i] && actual->elements[i])
+                    ch |= unifyGenericParamNode(ft->params[i].get(),
+                                                actual->elements[i], typeParams, bind);
+            if (ft->ret && actual->ret)
+                ch |= unifyGenericParamNode(ft->ret.get(), actual->ret,
+                                            typeParams, bind);
+            return ch;
+        }
+        case NodeKind::ArrayType: {
+            auto* at = static_cast<ArrayType*>(declared);
+            if (actual->kind != TypeKind::Array || !at->element) return false;
+            return unifyGenericParamNode(at->element.get(), actual->element,
+                                        typeParams, bind);
+        }
+        case NodeKind::OptionalType: {
+            auto* ot = static_cast<OptionalType*>(declared);
+            if (actual->kind != TypeKind::Optional || !ot->wrapped) return false;
+            return unifyGenericParamNode(ot->wrapped.get(), actual->element,
+                                        typeParams, bind);
+        }
+        default:
+            return false;
+    }
+}
+
 void Sema::checkInstance(size_t index, FunctionDecl* fn) {
     bindInstance(index, fn);
     unbindInstance();
@@ -3723,72 +3795,161 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                             }
                             return false;
                         };
+                        // Infer the generic type arguments by unifying each
+                        // declared parameter type (a TypeRepr that may mention the
+                        // type variables, possibly nested inside `Array` /
+                        // `FuncType` / `...`) against the corresponding *actual*
+                        // argument type. Closure arguments are first given the
+                        // parameter types they receive, then re-checked so their
+                        // body — and therefore their return type — is fully typed;
+                        // that lets the remaining variables (e.g. `U` in `(T) -> U`)
+                        // be bound from the callback. This is what makes `map` /
+                        // `filter` / `reduce` / `forEach` work generically with
+                        // `(_ x: T) -> U` callbacks (规范 3.3/3.4).
                         std::vector<std::string> targs;
                         std::vector<const Type*> tys;
-                        bool inferOk = true;
-                        if (fs->function->genericParams.size() == argTypes.size()) {
-                            // Common case: one type argument per value argument
-                            // (e.g. `id<T>(_ x: T)`, generic initialisers such as
-                            // `UnsafeMutablePointer<Int>(...)`). Keep the original
-                            // inference so existing stdlib generics keep working.
-                            for (const Type* at : argTypes) {
-                                const Type* base = inferTypeArgument(at);
-                                targs.push_back(typeToString(base));
-                                tys.push_back(base);
-                            }
-                        } else {
-                            // Mismatched counts: a single type parameter may be
-                            // referenced by several value parameters and the number
-                            // of type parameters need not equal the number of
-                            // arguments (e.g. `unwrapOr<T>(_ o: T?, fallback: T)`
-                            // has one type parameter but two arguments, and
-                            // `pair<T>(_ a: T, _ b: T)` likewise). Infer each type
-                            // parameter from the function parameter that references
-                            // it, then read the concrete type off the matching
-                            // argument.
-                            tys.resize(fs->function->genericParams.size());
-                            targs.resize(fs->function->genericParams.size());
-                            for (size_t gi = 0; gi < fs->function->genericParams.size(); ++gi) {
-                                const std::string& gp = fs->function->genericParams[gi];
-                                bool found = false;
-                                for (size_t p = 0;
-                                     p < fs->function->params.size() && p < argTypes.size();
-                                     ++p) {
-                                    if (mentions(typeToSource(fs->function->params[p].type.get()),
-                                                 gp)) {
-                                        const Type* base = inferTypeArgument(argTypes[p]);
-                                        if (base) {
-                                            targs[gi] = typeToString(base);
-                                            tys[gi] = base;
-                                            found = true;
-                                            break;
+                        targs.resize(fs->function->genericParams.size());
+                        tys.resize(fs->function->genericParams.size());
+                        std::unordered_map<std::string, const Type*> bind;
+                        std::vector<Node*> argNodes;
+                        for (auto& a : c->arguments) argNodes.push_back(a.get());
+
+                        bool progress = true;
+                        int iterGuard = 0;
+                        while (progress && iterGuard++ < 8) {
+                            progress = false;
+                            for (size_t p = 0;
+                                 p < fs->function->params.size() && p < argNodes.size();
+                                 ++p) {
+                                const Type* argT = argTypes[p];
+                                Node* argNode = argNodes[p];
+                                // Resolve the declared parameter type under the
+                                // bindings gathered so far, to learn the concrete
+                                // types a closure argument should receive.
+                                std::unordered_map<std::string, const Type*> saved =
+                                    genericBindings_;
+                                for (auto& kv : bind)
+                                    genericBindings_[kv.first] = kv.second;
+                                const Type* pT = fs->function->params[p].type
+                                    ? resolveTypeRepr(
+                                          fs->function->params[p].type.get(), nullptr)
+                                    : types_.unknownType();
+                                genericBindings_ = saved;
+                                if (!pT) continue;
+                                if (pT->kind == TypeKind::Function ||
+                                    pT->kind == TypeKind::Closure) {
+                                    // The argument is (or should become) a closure.
+                                    if (argNode &&
+                                        argNode->kind == NodeKind::ClosureExpr &&
+                                        !hadError_) {
+                                        auto* cl = static_cast<ClosureExpr*>(argNode);
+                                        // Seed the closure's parameter types once we
+                                        // know them concretely, then re-check so its
+                                        // return type is inferred (needed to bind the
+                                        // remaining type variables). `hadError_` guards
+                                        // against re-reporting an already-flagged body.
+                                        bool seedUnknown =
+                                            cl->semaType == nullptr ||
+                                            cl->semaType->elements.empty() ||
+                                            cl->semaType->elements[0]->kind ==
+                                                TypeKind::Unknown;
+                                        if (seedUnknown) {
+                                            for (size_t k = 0;
+                                                 k < cl->params.size() &&
+                                                 k < pT->elements.size(); ++k) {
+                                                const Type* pt = pT->elements[k];
+                                                if (pt && pt->kind != TypeKind::Unknown)
+                                                    cl->params[k].semaType = pt;
+                                            }
+                                            const Type* clT = checkExpr(argNode, context);
+                                            if (clT) argT = clT;
                                         }
+                                        argTypes[p] = argT;
                                     }
+                                    if (unifyGenericParamNode(
+                                            fs->function->params[p].type.get(), argT,
+                                            fs->function->genericParams, bind))
+                                        progress = true;
+                                    continue;
                                 }
-                                if (!found) { inferOk = false; break; }
+                                if (unifyGenericParamNode(
+                                        fs->function->params[p].type.get(), argT,
+                                        fs->function->genericParams, bind))
+                                    progress = true;
                             }
                         }
-                        if (inferOk && !targs.empty()) {
+
+                        // Promote the solved bindings into targs/tys.
+                        for (size_t i = 0; i < fs->function->genericParams.size(); ++i) {
+                            const std::string& gp = fs->function->genericParams[i];
+                            auto it = bind.find(gp);
+                            if (it != bind.end() && it->second &&
+                                it->second->kind != TypeKind::Unknown) {
+                                tys[i] = it->second;
+                                targs[i] = typeToString(it->second);
+                            }
+                        }
+                        // Fallback for type variables that appear *only* in the return
+                        // type (e.g. `allocate<T>(capacity: Int) -> UnsafeMutablePointer<T>`):
+                        // unifying against the value arguments cannot see them, so reuse the
+                        // original heuristic for the remaining variables to avoid a regression.
+                        for (size_t gi = 0; gi < fs->function->genericParams.size(); ++gi) {
+                            const std::string& gp = fs->function->genericParams[gi];
+                            if (bind.count(gp) && bind[gp] &&
+                                bind[gp]->kind != TypeKind::Unknown) continue;
+                            bool found = false;
+                            for (size_t p = 0;
+                                 p < fs->function->params.size() && p < argTypes.size(); ++p) {
+                                if (mentions(typeToSource(fs->function->params[p].type.get()),
+                                             gp)) {
+                                    const Type* base = inferTypeArgument(argTypes[p]);
+                                    if (base && base->kind != TypeKind::Unknown) {
+                                        bind[gp] = base;
+                                        tys[gi] = base;
+                                        targs[gi] = typeToString(base);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!found) {
+                                const Type* base = inferTypeArgument(
+                                    argTypes.empty() ? types_.unknownType() : argTypes[0]);
+                                if (base && base->kind != TypeKind::Unknown) {
+                                    bind[gp] = base;
+                                    tys[gi] = base;
+                                    targs[gi] = typeToString(base);
+                                }
+                            }
+                        }
+                        bool inferOk = !targs.empty();
+                        for (const auto& t : tys)
+                            if (!t || t->kind == TypeKind::Unknown) { inferOk = false; break; }
+                        if (inferOk) {
                             recordGenericInstance(fname, targs);
                             // Keep the resolved type arguments on the call so codegen
-                            // can locate the exact monomorphised instance (规范 5.2):
-                            // the symbol built from these strings matches the one the
-                            // monomorphiser emits, which fixes generic functions with
-                            // 2+ type parameters that previously fell back to the
-                            // first instance and crashed.
+                            // can locate the exact monomorphised instance (规范 5.2).
                             c->genericTypeArgs = targs;
-                            // Resolve the call's result type against this
-                            // instantiation, so `let n = f(x)` learns the concrete
-                            // type instead of inheriting the opaque one.
+                            // Resolve the call's result + parameter types against
+                            // this instantiation, so `let n = f(x)` and the closure
+                            // body both learn the concrete types.
                             std::unordered_map<std::string, const Type*> saved =
                                 genericBindings_;
                             for (size_t i = 0; i < targs.size(); ++i)
                                 genericBindings_[fs->function->genericParams[i]] = tys[i];
+                            std::vector<const Type*> resolvedParams;
+                            resolvedParams.reserve(fs->function->params.size());
+                            for (auto& prm : fs->function->params) {
+                                const Type* rt = prm.type
+                                    ? resolveTypeRepr(prm.type.get(), nullptr)
+                                    : types_.unknownType();
+                                resolvedParams.push_back(rt);
+                            }
                             const Type* ret = fs->function->returnType
                                 ? resolveTypeRepr(fs->function->returnType.get(), nullptr)
                                 : types_.voidType();
                             genericBindings_ = saved;
-                            callee = types_.function(argTypes, ret);
+                            callee = types_.function(resolvedParams, ret);
                         }
                     }
                 }

@@ -12,10 +12,15 @@
 ///
 /// IMPORTANT — compiler limitations (see `moduleTest/codegen/closures.suki` and
 /// the diagnostics gathered while building this module):
-///   1. Closures are NOT implemented, so any higher-order function that receives
-///      and *calls* a closure (`map`/`filter`/`reduce`/`forEach`/`sorted`/
-///      `compactMap`/`zip` over collections) cannot be expressed. They are
-///      intentionally omitted until the compiler gains closure support.
+///   1. Closures ARE implemented by codegen: a closure literal (`{ x in x * 2 }`)
+///      lowers to a `{ captures, fnptr }` value (SukiClosure) and can be passed as
+///      a function parameter, stored, returned, and called indirectly. Higher-order
+///      functions such as `map`/`filter`/`reduce`/`forEach` over collections are
+///      therefore expressible (see `moduleTest/codegen/closure.suki`). The remaining
+///      edge case is binding a closure literal assigned to a local *without* a
+///      contextual type (so its parameter/return types must be inferred from the
+///      body alone); prefer passing closures as function arguments where the
+///      signature is known.
 ///   2. Generic enums ARE supported by codegen (`enum Box<T> {…}` instantiates
 ///      correctly and payloads extract via `switch`), so `Result<T, E: Error>`
 ///      ships as the spec's typed generic enum.
