@@ -187,6 +187,15 @@ void Sema::resolveFunctionSignature(FunctionDecl* fn) {
     checkFunctionBody(fn, nullptr);
 }
 
+// 泛型类型实例的 `init` 共享同一份 AST，绑定具体类型实参后须重新解析形参类型，
+// 使下沉（lower）时拿到本实例的具体类型而非未绑定的类型参数 `T`。
+void Sema::resolveInitSignature(InitDecl* id) {
+    if (!id) return;
+    for (Param& prm : id->params)
+        prm.semaType = prm.type ? resolveTypeRepr(prm.type.get(), nullptr)
+                                : prm.semaType;
+}
+
 // Build (or reuse) the monomorphised record for `Box<Int>`: a copy of the generic
 // record whose every member type is re-resolved with the type parameters bound to
 // the concrete arguments, so fields store real values and methods return them.
@@ -218,11 +227,23 @@ const Type* Sema::monomorphiseGenericType(const TypeRecord* rec,
     inst->isCEnum = rec->isCEnum;
     inst->origRec = rec;   // 回指原始声明，便于枚举穷举比较规范化
     // The instance is concrete: it has no parameters or constraints left to bind.
-    for (const auto& m : rec->members) {
-        TypeRecord::Member nm = m;
+    // 以「声明 AST（rec->decl）」而非「已收集的成员（rec->members）」为权威来源构建
+    // 特化成员。原因：泛型类型可能在 Pass 3 成员收集之前就被实例化并缓存，此时
+    // rec->members 尚为空，会得到无字段的特化类型（Bug：泛型 struct 实例为空，如
+    // Owned<ByteBuffer>）。声明 AST 始终包含完整成员，与实例化时机无关。
+    auto* gtd = static_cast<TypeDecl*>(rec->decl);
+    for (auto& mnode : gtd->members) {
+        if (!mnode) continue;
+        NodeKind k = mnode->kind;
+        if (k != NodeKind::VarDecl && k != NodeKind::FunctionDecl &&
+            k != NodeKind::InitDecl && k != NodeKind::DeinitDecl) continue;
+        TypeRecord::Member nm;
         nm.owner = inst;
-        if (m.isFunction && m.decl && m.decl->kind == NodeKind::FunctionDecl) {
-            auto* fd = static_cast<FunctionDecl*>(m.decl);
+        nm.decl = mnode.get();
+        if (k == NodeKind::FunctionDecl) {
+            auto* fd = static_cast<FunctionDecl*>(mnode.get());
+            nm.isFunction = true;
+            nm.name = fd->name;
             std::vector<const Type*> pts;
             for (auto& p : fd->params)
                 pts.push_back(p.type ? resolveTypeRepr(p.type.get(), nullptr)
@@ -230,12 +251,28 @@ const Type* Sema::monomorphiseGenericType(const TypeRecord* rec,
             const Type* rt = fd->returnType
                 ? resolveTypeRepr(fd->returnType.get(), nullptr)
                 : types_.voidType();
-            // Calling an async member yields a Future of its declared result, so
-            // the instance's member type must say so for `await` to type-check.
+            // 调用 async 成员返回其声明结果的 Future，实例成员类型须如此标注以便
+            // `await` 通过类型检查。
             nm.type = types_.function(std::move(pts),
                                       fd->isAsync ? types_.future(rt) : rt);
-        } else if (m.decl && m.decl->kind == NodeKind::VarDecl) {
-            auto* vd = static_cast<VarDecl*>(m.decl);
+        } else if (k == NodeKind::InitDecl) {
+            auto* id = static_cast<InitDecl*>(mnode.get());
+            nm.isFunction = true;
+            nm.name = "init";
+            std::vector<const Type*> pts;
+            for (auto& p : id->params)
+                pts.push_back(p.type ? resolveTypeRepr(p.type.get(), nullptr)
+                                     : (p.semaType ? p.semaType : types_.unknownType()));
+            nm.type = types_.function(std::move(pts),
+                                      types_.named(inst, key, args));
+        } else if (k == NodeKind::DeinitDecl) {
+            nm.isFunction = true;
+            nm.name = "deinit";
+            nm.type = types_.function({}, types_.voidType());
+        } else {
+            auto* vd = static_cast<VarDecl*>(mnode.get());
+            nm.isFunction = false;
+            nm.name = vd->name;
             if (vd->type) {
                 const Type* vt = resolveTypeRepr(vd->type.get(), nullptr);
                 if (vt) nm.type = vt;
@@ -468,7 +505,7 @@ void Sema::analyze(NodeList& decls) {
     expandMacros(decls);
     globals_.pushScope();
     locals_.pushScope();
-    registerBuiltins(decls);
+    registerBuiltins();
 
     // Pass 1: create type records for every named type declaration.
     // Declarations belonging to the imported stdlib prelude (index < stdlibDeclCount_)
@@ -869,7 +906,7 @@ void Sema::checkInitRules() {
 }
 
 // ─── Collection ────────────────────────────────────────────────────────────
-void Sema::registerBuiltins(const NodeList& decls) {
+void Sema::registerBuiltins() {
     auto addFn = [&](const char* name, std::vector<const Type*> params, const Type* ret) {
         Symbol s;
         s.kind = Symbol::Kind::Function;
@@ -929,233 +966,6 @@ void Sema::registerBuiltins(const NodeList& decls) {
     addBuiltinFn("sleep", { types_.intType() }, types_.voidType(),
                  true, "suki_sleep");
 
-    // ── 兼容性回退守卫 ────────────────────────────────────────────────────────
-    // 自本版起，Channel / Task / TaskGroup / withTaskGroup 的「类型与方法签名」由
-    // 标准库 src/stdlib/concurrency/concurrency.suki 以 @intrinsic 声明提供，编译器
-    // 仅负责按类型名合成其运行时方法体（见 IRGenerator 的 genChannelMethod 等）。
-    // 若某个程序未 `import concurrency`（标准库未被载入，decls 中无同名声明），
-    // 则在此按旧方式硬编码合成，保证向后兼容。一旦标准库已声明同名符号，便跳过
-    // 合成，避免重复定义——标准库声明成为唯一真相来源（即「释放硬编码」）。
-    auto stdlibProvides = [&](const char* nm) -> bool {
-        for (auto& d : decls) {
-            if (!d) continue;
-            // 类型声明在 AST 中以 StructDecl / EnumDecl / ClassDecl / ActorDecl 出现，
-            // 统一经 TypeDecl 基类访问其 name；函数声明为 FunctionDecl。
-            if (d->kind == NodeKind::StructDecl || d->kind == NodeKind::EnumDecl ||
-                d->kind == NodeKind::ClassDecl || d->kind == NodeKind::ActorDecl) {
-                auto* td = static_cast<TypeDecl*>(d.get());
-                if (td->name == nm) return true;
-            } else if (d->kind == NodeKind::FunctionDecl) {
-                auto* fd = static_cast<FunctionDecl*>(d.get());
-                if (fd->name == nm) return true;
-            }
-        }
-        return false;
-    };
-
-    // 供下方 Task / TaskGroup / withTaskGroup 合成共用的 `Void` 类型表达辅助。
-    auto voidRepr = []() { auto* n = new NamedType(); n->name = "Void"; return n; };
-
-    // ─── Channel<T> ─────────────────────────────────────────────────────────
-    // A bounded, blocking FIFO backed by the C runtime. An instance stores only
-    // the runtime handle; `send` / `receive` block the calling thread, which is
-    // the right behaviour inside an async function (it runs on its own thread).
-    // The bodies are emitted by the code generator against the runtime, so the
-    // declarations carry no SukiCode body.
-    // 标准库 concurrency 已声明 Channel 时优先使用其定义，不在此硬编码合成。
-    if (!stdlibProvides("Channel")) {
-    {
-        auto rec = std::make_unique<TypeRecord>();
-        rec->name = "Channel";
-        rec->kind = TypeDeclKind::Struct;
-        rec->genericParams = { "T" };
-
-        auto typeRepr = [](const char* n) {
-            auto* nt = new NamedType();
-            nt->name = n;
-            return nt;
-        };
-
-        auto* handleDecl = new VarDecl();
-        handleDecl->name = "handle";
-        handleDecl->type.reset(typeRepr("OpaquePointer"));
-        TypeRecord::Member handleMem;
-        handleMem.isFunction = false;
-        handleMem.name = "handle";
-        handleMem.type = types_.primitive(TypeKind::OpaquePointer);
-        handleMem.decl = handleDecl;
-        rec->members.push_back(handleMem);
-
-        // `send` / `receive` / `close` are async: they may block, so callers
-        // `await` them and the result type is a Future (规范 7.5).
-        // func send(_ value: T)
-        {
-            auto* fd = new FunctionDecl();
-            fd->name = "send";
-            fd->isAsync = true;
-            fd->params.emplace_back();
-            Param& p = fd->params.back();
-            p.externalName = "_";
-            p.internalName = "value";
-            p.type.reset(typeRepr("T"));
-            fd->returnType.reset(typeRepr("Void"));
-            TypeRecord::Member m;
-            m.isFunction = true; m.name = "send";
-            m.type = types_.function({ types_.unknownType() },
-                                     types_.future(types_.voidType()));
-            m.decl = fd;
-            rec->members.push_back(m);
-        }
-        // func receive() -> T
-        {
-            auto* fd = new FunctionDecl();
-            fd->name = "receive";
-            fd->isAsync = true;
-            fd->returnType.reset(typeRepr("T"));
-            TypeRecord::Member m;
-            m.isFunction = true; m.name = "receive";
-            m.type = types_.function({}, types_.future(types_.unknownType()));
-            m.decl = fd;
-            rec->members.push_back(m);
-        }
-        // func close()
-        {
-            auto* fd = new FunctionDecl();
-            fd->name = "close";
-            fd->isAsync = true;
-            fd->returnType.reset(typeRepr("Void"));
-            TypeRecord::Member m;
-            m.isFunction = true; m.name = "close";
-            m.type = types_.function({}, types_.future(types_.voidType()));
-            m.decl = fd;
-            rec->members.push_back(m);
-        }
-
-        TypeRecord* raw = rec.get();
-        typeIndex_["Channel"] = raw;
-        ownedRecords_.push_back(std::move(rec));
-        Symbol s; s.kind = Symbol::Kind::Type; s.record = raw;
-        globals_.declare("Channel", s);
-    }
-    } // !stdlibProvides("Channel")
-
-    // ─── Task / TaskGroup (structured concurrency) ──────────────────────────
-    // Both are single-field wrappers around a runtime handle. `Task { ... }` runs
-    // a closure on its own thread; a TaskGroup records each child's Future so
-    // `waitForAll` can join them — the guarantee behind structured concurrency
-    // that no child outlives the group that spawned it.
-    // 标准库 concurrency 已声明 Task / TaskGroup 时跳过此硬编码合成。
-    if (!stdlibProvides("Task") && !stdlibProvides("TaskGroup")) {
-    auto addHandleStruct = [&](const char* name,
-                               std::vector<TypeRecord::Member> extras) {
-        auto rec = std::make_unique<TypeRecord>();
-        rec->name = name;
-        rec->kind = TypeDeclKind::Struct;
-        auto* hd = new VarDecl();
-        hd->name = "handle";
-        auto* hr = new NamedType(); hr->name = "OpaquePointer";
-        hd->type.reset(hr);
-        TypeRecord::Member hm;
-        hm.isFunction = false; hm.name = "handle";
-        hm.type = types_.primitive(TypeKind::OpaquePointer);
-        hm.decl = hd;
-        rec->members.push_back(hm);
-        for (auto& m : extras) rec->members.push_back(m);
-        TypeRecord* raw = rec.get();
-        typeIndex_[name] = raw;
-        ownedRecords_.push_back(std::move(rec));
-        Symbol s; s.kind = Symbol::Kind::Type; s.record = raw;
-        globals_.declare(name, s);
-        return raw;
-    };
-
-    // Task { ... } — fire-and-forget; `wait()` blocks until it completes.
-    {
-        std::vector<TypeRecord::Member> ms;
-        auto* fd = new FunctionDecl();
-        fd->name = "wait";
-        fd->returnType.reset(voidRepr());
-        TypeRecord::Member m;
-        m.isFunction = true; m.name = "wait";
-        m.type = types_.function({}, types_.voidType());
-        m.decl = fd;
-        ms.push_back(m);
-        addHandleStruct("Task", ms);
-    }
-
-    // TaskGroup<T> — `addTask { ... }` spawns a child producing a T, and
-    // `waitForAll` joins them. `T` lets `for await` collect the children's
-    // results; a group used without type arguments behaves as before.
-    {
-        std::vector<TypeRecord::Member> ms;
-        {
-            auto* fd = new FunctionDecl();
-            fd->name = "addTask";
-            fd->params.emplace_back();
-            Param& p = fd->params.back();
-            p.externalName = "_";
-            p.internalName = "body";
-            auto* ft = new FuncType();
-            auto* tRepr = new NamedType(); tRepr->name = "T";
-            ft->ret.reset(tRepr);
-            p.type.reset(ft);
-            fd->returnType.reset(voidRepr());
-            TypeRecord::Member m;
-            m.isFunction = true; m.name = "addTask";
-            m.type = types_.function({ types_.function({}, types_.unknownType()) },
-                                     types_.voidType());
-            m.decl = fd;
-            ms.push_back(m);
-        }
-        {
-            auto* fd = new FunctionDecl();
-            fd->name = "waitForAll";
-            fd->returnType.reset(voidRepr());
-            TypeRecord::Member m;
-            m.isFunction = true; m.name = "waitForAll";
-            m.type = types_.function({}, types_.voidType());
-            m.decl = fd;
-            ms.push_back(m);
-        }
-        TypeRecord* tgRec = addHandleStruct("TaskGroup", ms);
-        // `TaskGroup<T>` is instantiated per child-result type so `for await`
-        // knows how large each result is.
-        tgRec->genericParams = { "T" };
-    }
-    } // !stdlibProvides("Task") && !stdlibProvides("TaskGroup")
-
-    // `withTaskGroup { group in ... }` — runs the body with a fresh group and
-    // waits for every child before returning. It is async so callers `await` it.
-    // 标准库 concurrency 已声明 withTaskGroup 时跳过此硬编码合成。
-    if (!stdlibProvides("withTaskGroup")) {
-    {
-        auto* fd = new FunctionDecl();
-        fd->name = "withTaskGroup";
-        fd->isAsync = true;
-        fd->params.emplace_back();
-        Param& p = fd->params.back();
-        p.externalName = "_";
-        p.internalName = "body";
-        auto* ft = new FuncType();
-        auto* tgRepr = new NamedType(); tgRepr->name = "TaskGroup";
-        ft->params.emplace_back(tgRepr);
-        ft->ret.reset(voidRepr());
-        p.type.reset(ft);
-        fd->returnType.reset(voidRepr());
-        fd->params[0].semaType =
-            types_.function({ types_.named(findType("TaskGroup"), "TaskGroup") },
-                            types_.voidType());
-
-        Symbol s;
-        s.kind = Symbol::Kind::Function;
-        s.function = fd;
-        s.type = types_.function(
-            { types_.function({ types_.named(findType("TaskGroup"), "TaskGroup") },
-                              types_.voidType()) },
-            types_.voidType());
-        globals_.declare("withTaskGroup", s);
-    }
-    } // !stdlibProvides("withTaskGroup")
 }
 
 void Sema::collectTypeDecl(Node* decl, bool isStdlib) {

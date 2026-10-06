@@ -1252,12 +1252,31 @@ private:
                 return owner_->b_->CreateFPToSI(v, to);
             if (to->isFloatingPointTy() && from->isFloatingPointTy())
                 return owner_->b_->CreateFPExt(v, to);
-            // Boxing: a value landing in a pointer slot is copied to the heap
-            // and its address is returned (Optional payload for aggregates).
-            if (to->isPointerTy() && !from->isPointerTy()) {
+            // Boxing: an *aggregate* (struct) value landing in a pointer slot is
+            // copied to the heap and its address is returned (Optional/Any payload).
+            // 标量（整数/浮点）不应被装箱——在 opaque-pointer 模式下所有 GEP 结果都是
+            // `ptr`，若对标量也装箱会把类/结构体字段的值改成野指针。
+            if (to->isPointerTy() && !from->isPointerTy() && from->isStructTy()) {
                 llvm::Value* slot = owner_->b_->CreateAlloca(from, nullptr, "box");
                 owner_->b_->CreateStore(v, slot);
                 return owner_->b_->CreatePointerCast(slot, to);
+            }
+            // Implicit promotion of a bare value `T` into `Optional<T>` (规范 5.4):
+            // Suki lets `return x` / `let o: T? = x` work when `x: T`. The layout is
+            // `{ payload, i1 }` — scalars inline, aggregates/pointers boxed into a
+            // pointer (see TypeLayout::optionalTy). Only wrap when `to` is genuinely
+            // Optional-shaped and the source coerces to the payload type, so a plain
+            // two-field struct is never mistaken for an Optional.
+            if (to->isStructTy() && to->getStructNumElements() == 2 &&
+                to->getStructElementType(1)->isIntegerTy(1)) {
+                llvm::Type* payloadTy = to->getStructElementType(0);
+                llvm::Value* pv = (from == payloadTy) ? v : coerce(v, payloadTy);
+                if (pv && pv->getType() == payloadTy) {
+                    llvm::Value* wrapped = llvm::UndefValue::get(to);
+                    wrapped = owner_->b_->CreateInsertValue(wrapped, pv, {0});
+                    wrapped = owner_->b_->CreateInsertValue(wrapped, owner_->trueVal(), {1});
+                    return wrapped;
+                }
             }
             return v;
         }
@@ -2681,6 +2700,15 @@ private:
                 }
                 {
                     const Type* rt = owner_->selfReceiverType(m->base.get());
+                    // `self` inside a generic type's *instance* body carries the
+                    // un-instantiated generic type (record == null), so fall back
+                    // to `currentOwner_` — the monomorphised instance — exactly as
+                    // genFieldPtr does, otherwise the stored-field gate below skips
+                    // the load and the access returns null.
+                    if (m->base && m->base->kind == NodeKind::IdentExpr &&
+                        static_cast<IdentExpr*>(m->base.get())->name == "self" &&
+                        owner_->currentOwner_)
+                        rt = owner_->currentOwner_;
                     if (rt && rt->kind == TypeKind::Named && rt->record &&
                         (rt->record->kind == TypeDeclKind::Struct ||
                          rt->record->kind == TypeDeclKind::Class ||
@@ -3740,9 +3768,17 @@ private:
         if (!basePtr) return nullptr;
         const Type* bt = m->base ? m->base->semaType : nullptr;
         // `self` carries no annotation of its own; inside a type body the
-        // enclosing type is the receiver.
-        if (!bt && m->base && m->base->kind == NodeKind::IdentExpr &&
-            static_cast<IdentExpr*>(m->base.get())->name == "self")
+        // enclosing type is the receiver. Crucially, when the body belongs to a
+        // generic type's *instance* (`Owned<ByteBuffer>.init`), `self`'s own
+        // annotation still names the un-instantiated generic (`Owned<T>`), whose
+        // record stores `T`-typed members as pointers. We must override it with
+        // `currentOwner_` — the monomorphised instance record — so field GEPs
+        // use the concrete layout (inline struct, not a boxed pointer) and read
+        // the right offsets. This fixes generic value members being boxed and
+        // `self.field` reads inside generic methods returning wrong data.
+        if (m->base && m->base->kind == NodeKind::IdentExpr &&
+            static_cast<IdentExpr*>(m->base.get())->name == "self" &&
+            currentOwner_)
             bt = currentOwner_;
         basePtr = genRefBasePtr(bt, basePtr);
         if (!bt || bt->kind != TypeKind::Named || !bt->record) return nullptr;
@@ -3866,7 +3902,14 @@ private:
         // Run `init(...)` when the class declares one. Arguments are matched by
         // label first (`Point(x: 1)`) and then positionally, mirroring struct
         // construction so both forms read the same.
-        auto initIt = methodFns_.find(rec->name + ".init");
+        // 泛型类特化实例的 record->name 形如 "MemoryPool<Int>"，但方法按泛型基名
+        // 注册（如 "MemoryPool.init"），因此需回退到去掉 "<...>" 的基名查找。
+        std::string initKey = rec->name + ".init";
+        auto initIt = methodFns_.find(initKey);
+        if (initIt == methodFns_.end()) {
+            std::string base = rec->name.substr(0, rec->name.find('<'));
+            if (!base.empty() && base != rec->name) initIt = methodFns_.find(base + ".init");
+        }
         if (initIt != methodFns_.end() && initIt->second) {
             llvm::Function* initFn = initIt->second;
             llvm::FunctionType* fty = initFn->getFunctionType();
@@ -3891,6 +3934,31 @@ private:
         llvm::StructType* stl = llvm::cast<llvm::StructType>(sty);
         llvm::Value* slot = b_->CreateAlloca(sty, nullptr, "init.tmp");
         b_->CreateStore(llvm::Constant::getNullValue(sty), slot);
+
+        // A struct with a custom `init` runs it (the init assigns its own fields);
+        // the default field-wise path below is only for structs with no init.
+        // The init is keyed by the (possibly monomorphised) type name, e.g.
+        // `Buffer.init` or `Owned<ByteBuffer>.init`, with a base-name fallback.
+        std::string initKey = (st->record ? st->record->name : st->name) + ".init";
+        auto initIt = methodFns_.find(initKey);
+        if (initIt == methodFns_.end()) {
+            std::string base = st->name.substr(0, st->name.find('<'));
+            if (!base.empty() && base != st->name) initIt = methodFns_.find(base + ".init");
+        }
+        if (initIt != methodFns_.end() && initIt->second) {
+            llvm::Function* initFn = initIt->second;
+            llvm::FunctionType* fty = initFn->getFunctionType();
+            std::vector<llvm::Value*> args;
+            args.push_back(slot); // `self` is the address of the caller's storage
+            for (unsigned i = 1;
+                 i < fty->getNumParams() && i - 1 < e->arguments.size(); ++i) {
+                llvm::Value* av = genExpr(e->arguments[i - 1].get());
+                if (av) args.push_back(coerce(av, fty->getParamType(i)));
+            }
+            b_->CreateCall(initFn, args);
+            return b_->CreateLoad(sty, slot);
+        }
+
         for (size_t i = 0; i < e->arguments.size(); ++i) {
             llvm::Value* v = genExpr(e->arguments[i].get());
             if (!v) continue;
@@ -5191,10 +5259,18 @@ private:
                         return genTaskGroupInit(tgit->second->elements[0]);
                     return genTaskGroupInit(nullptr);
                 }
+                // 先看非泛型登记名；泛型类/结构体特化实例的 cname 形如 "MemoryPool<Int>"，
+                // 不会出现在 classTypes_/structTypes_ 里，需回落到 semaType 已解析出的特化记录。
+                const Type* ctorTy = nullptr;
                 auto gsit = structTypes_.find(cname);
-                if (gsit != structTypes_.end()) return genStructInit(gsit->second, e);
-                auto gcit = classTypes_.find(cname);
-                if (gcit != classTypes_.end()) return genClassInit(gcit->second, e);
+                if (gsit != structTypes_.end()) ctorTy = gsit->second;
+                else { auto gcit = classTypes_.find(cname); if (gcit != classTypes_.end()) ctorTy = gcit->second; }
+                if (!ctorTy && ct && ct->kind == TypeKind::Named) ctorTy = ct;
+                if (ctorTy) {
+                    if (ctorTy->record && ctorTy->record->kind == TypeDeclKind::Class)
+                        return genClassInit(ctorTy, e);
+                    return genStructInit(ctorTy, e);
+                }
             }
             return nullptr;
         }
@@ -5540,6 +5616,23 @@ public:
                               mem.isStatic);
                 methodOrder_.emplace_back(mf, td->semaType);
             }
+            // A struct with a custom `init` must declare it so constructors can
+            // call it (the default field-wise init applies only when no init
+            // exists); `deinit` too, for value-type cleanup.
+            if (td->semaType->record) {
+                for (const auto& mem : td->semaType->record->members) {
+                    if (!mem.decl) continue;
+                    if (mem.decl->kind == NodeKind::InitDecl) {
+                        auto* id = static_cast<InitDecl*>(mem.decl);
+                        declareInit(td->name + ".init", id, td->semaType);
+                        initOrder_.emplace_back(id, td->semaType);
+                    } else if (mem.decl->kind == NodeKind::DeinitDecl) {
+                        auto* dd = static_cast<DeinitDecl*>(mem.decl);
+                        declareDeinit(td->name + ".deinit", dd, td->semaType);
+                        deinitOrder_.emplace_back(dd, td->semaType);
+                    }
+                }
+            }
         }
 
         // All functions (foreign + ordinary) must be declared *before* any body is
@@ -5569,28 +5662,44 @@ public:
                 layout_->lower(instTy);
                 sema_->bindTypeParams(gi.params, gi.args);
                 for (const auto& mem : instTy->record->members) {
-                    if (!mem.isFunction || !mem.decl ||
-                        mem.decl->kind != NodeKind::FunctionDecl) continue;
-                    auto* mf = static_cast<FunctionDecl*>(mem.decl);
-                    sema_->resolveFunctionSignature(mf);
-                    // Channel's members are runtime-backed and async, so they are
-                    // emitted directly (returning a completed Future) instead of
-                    // being declared from the signature and lowered from a body.
-                    if (gi.typeName == "Channel") {
-                        genChannelMethod(mf, instTy);
-                        continue;
+                    if (!mem.isFunction || !mem.decl) continue;
+                    if (mem.decl->kind == NodeKind::FunctionDecl) {
+                        auto* mf = static_cast<FunctionDecl*>(mem.decl);
+                        sema_->resolveFunctionSignature(mf);
+                        // Channel's members are runtime-backed and async, so they are
+                        // emitted directly (returning a completed Future) instead of
+                        // being declared from the signature and lowered from a body.
+                        if (gi.typeName == "Channel") {
+                            genChannelMethod(mf, instTy);
+                            continue;
+                        }
+                        // TaskGroup<T>'s members are runtime-backed too; the element
+                        // type T drives how the child result is stored / collected.
+                        if (gi.typeName == "TaskGroup" && !instTy->elements.empty()) {
+                            genTaskGroupMethod(mf, instTy);
+                            continue;
+                        }
+                        const std::string mkey = gi.key + "." + mf->name;
+                        declareMethod(mkey, mf, instTy, /*symbolOverride=*/nullptr,
+                                      mem.isStatic);
+                        auto mit = methodFns_.find(mkey);
+                        if (mit != methodFns_.end()) genMethodBody(mf, instTy, mit->second);
+                    } else if (mem.decl->kind == NodeKind::InitDecl) {
+                        // 泛型类的 `init` 同样需要按实例绑定类型实参后下沉形参与
+                        // 函数体，否则构造调用签名不匹配（仅存在泛型版 @MemoryPool.init）。
+                        auto* id = static_cast<InitDecl*>(mem.decl);
+                        sema_->resolveInitSignature(id);
+                        const std::string ikey = gi.key + ".init";
+                        declareInit(ikey, id, instTy);
+                        auto iit = methodFns_.find(ikey);
+                        if (iit != methodFns_.end()) genInitBody(id, instTy, iit->second);
+                    } else if (mem.decl->kind == NodeKind::DeinitDecl) {
+                        auto* dd = static_cast<DeinitDecl*>(mem.decl);
+                        const std::string dkey = gi.key + ".deinit";
+                        declareDeinit(dkey, dd, instTy);
+                        auto dit = methodFns_.find(dkey);
+                        if (dit != methodFns_.end()) genDeinitBody(dd, instTy, dit->second);
                     }
-                    // TaskGroup<T>'s members are runtime-backed too; the element
-                    // type T drives how the child result is stored / collected.
-                    if (gi.typeName == "TaskGroup" && !instTy->elements.empty()) {
-                        genTaskGroupMethod(mf, instTy);
-                        continue;
-                    }
-                    const std::string mkey = gi.key + "." + mf->name;
-                    declareMethod(mkey, mf, instTy, /*symbolOverride=*/nullptr,
-                                  mem.isStatic);
-                    auto mit = methodFns_.find(mkey);
-                    if (mit != methodFns_.end()) genMethodBody(mf, instTy, mit->second);
                 }
                 sema_->unbindTypeParams();
             }
@@ -5853,7 +5962,14 @@ public:
 
     void declareInit(const std::string& key, InitDecl* id, const Type* ownerTy) {
         if (methodFns_.count(key)) return;
+        // A reference type (class/actor) lowers to a pointer, which is already the
+        // receiver shape. A value type (struct/enum) must receive its storage *by
+        // pointer* so the initialiser writes into the caller's slot rather than a
+        // discarded copy — otherwise `let b = Buffer(size: 64)` would leave `b`
+        // zero-initialised. So wrap the lowered value type in a pointer here.
         llvm::Type* selfParam = layout_->lower(ownerTy);
+        if (!layout_->isReferenceType(ownerTy))
+            selfParam = llvm::PointerType::getUnqual(selfParam);
         std::vector<llvm::Type*> params{ selfParam };
         for (auto& p : id->params)
             params.push_back(lowerDeclType(p.semaType, p.type.get()));
@@ -5876,12 +5992,20 @@ public:
         currentScopeMark_ = 0;
         b_->SetInsertPoint(llvm::BasicBlock::Create(*ctx_, "entry", f));
 
-        // `self` is the object under construction; keeping it in a slot lets
-        // field assignment and nested calls share the ordinary code paths.
+        // `self` is the object under construction. A reference type keeps its
+        // object pointer in a slot (the existing convention). A value type,
+        // however, was handed a *pointer to the caller's storage* (see
+        // declareInit), so bind `self` to that pointer directly: wrapping it in an
+        // extra alloca would make every `self.field` access read the wrong
+        // address, and the writes would never reach the caller's slot.
         llvm::Type* selfTy = layout_->lower(ownerTy);
-        llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
-        b_->CreateStore(f->getArg(0), selfSlot);
-        locals_["self"] = selfSlot;
+        if (!layout_->isReferenceType(ownerTy)) {
+            locals_["self"] = f->getArg(0);
+        } else {
+            llvm::Value* selfSlot = b_->CreateAlloca(selfTy, nullptr, "self");
+            b_->CreateStore(f->getArg(0), selfSlot);
+            locals_["self"] = selfSlot;
+        }
 
         unsigned arg = 1;
         for (auto& p : id->params) {

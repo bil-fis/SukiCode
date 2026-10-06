@@ -111,10 +111,12 @@ void TypeLayout::defineRecord(const TypeRecord* rec, llvm::StructType* st) {
             body.push_back(llvm::Type::getInt64Ty(ctx_));
     }
     // Single inheritance: superclass storage precedes the subclass fields.
+    // 仅嵌入「父类的值成员」，并逐级展开所有祖先——切勿嵌入父类的完整结构体
+    // （那会重复祖先头部 vtable/rc/deinit 三个词）。头部在子类统一布局一次。
     if (isRef && rec->superclass) {
-        if (llvm::StructType* base = objectType(rec->superclass))
-            for (unsigned i = 0; i < base->getNumElements(); ++i)
-                body.push_back(base->getElementType(i));
+        for (const TypeRecord* s = rec->superclass; s; s = s->superclass)
+            for (const TypeRecord::Member* sm : valueMembers(s))
+                body.push_back(lower(sm->type));
     }
     for (const TypeRecord::Member* m : valueMembers(rec))
         body.push_back(lower(m->type));
@@ -220,8 +222,9 @@ int TypeLayout::fieldIndex(const TypeRecord* rec, const std::string& name) const
     if (isRefKind(rec->kind)) {
         idx = 3; // skip vtable + retain count + deinit slot
         if (rec->kind == TypeDeclKind::Actor) idx = 4; // ...plus the isolation lock
-        if (rec->superclass)
-            idx += static_cast<int>(valueMembers(rec->superclass).size());
+        // 逐级累加所有祖先的值成员数（与 defineRecord 的父类布局保持一致）。
+        for (const TypeRecord* s = rec->superclass; s; s = s->superclass)
+            idx += static_cast<int>(valueMembers(s).size());
     }
     for (const TypeRecord::Member* m : valueMembers(rec)) {
         if (m->name == name) return idx;

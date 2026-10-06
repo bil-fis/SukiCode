@@ -128,7 +128,7 @@ private:
     // ── collection ──────────────────────────────────────────────────────────
     // Seed the global scope with runtime/stdlib primitives (print, ...) so
     // user code can call them before the bootstrap stdlib is compiled in.
-    void registerBuiltins(const NodeList& decls);
+    void registerBuiltins();
     void collectTypeDecl(Node* decl, bool isStdlib = false);
     void collectMembers(TypeRecord& rec, TypeDecl* td);
     // Add a single member node to a record (extracted so extensions and
@@ -377,6 +377,10 @@ public:
     // Re-resolve a function's parameter and return types under the current
     // bindings and re-check its body, so lowering sees this instance's types.
     void resolveFunctionSignature(FunctionDecl* fn);
+    // 泛型类型实例的 `init` 同样共享一份 AST：在绑定具体类型实参后，必须按当前
+    // genericBindings_ 重新解析其形参类型（规范 5.2 泛型单态化）。否则下沉 init
+    // 时仍见到未绑定的类型参数 `T`，导致 `@MemoryPool<Int>.init` 形参类型错误。
+    void resolveInitSignature(InitDecl* id);
 
 private:
     std::vector<GenericInstance> genericInstances_;
