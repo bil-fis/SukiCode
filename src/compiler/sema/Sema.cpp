@@ -1457,7 +1457,13 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
             if (auto ait = typeAliases_.find(name); ait != typeAliases_.end())
                 return ait->second;
             TypeKind bk;
-            if (builtinTypeFromName(name, bk)) {
+            // Generic stdlib collection/optional names (Array/Set/Dictionary/
+            // Optional) are builtin types but are intentionally absent from
+            // builtinTypeFromName (which maps to a single concrete TypeKind), so
+            // extend the gate here to let the per-name handling below run.
+            if (builtinTypeFromName(name, bk) ||
+                name == "Array" || name == "Set" ||
+                name == "Dictionary" || name == "Optional") {
                 // Generic stdlib names
                 if (name == "Array") {
                     const Type* e = nt->genericArgs.empty()
@@ -2213,6 +2219,7 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                 break;
             }
             const Type* init = nullptr;
+            bool emptyCollectionLit = false;
             if (vd->initializer) {
                 const Type* dt = declared ? declared : nullptr;
                 init = (dt && dt->kind == TypeKind::Char)
@@ -2223,8 +2230,24 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                 if (dt && dt->kind == TypeKind::Set &&
                     vd->initializer->kind == NodeKind::SetLitExpr)
                     vd->initializer->semaType = dt;
+                // Empty `[]` / `[:]` literals carry no elements to infer a type
+                // from. When the annotation is itself a collection (Set / Dict /
+                // Array), treat the literal as that empty collection so its type
+                // matches the annotation (`let s: Set<Int> = []`).
+                Node* initNode = vd->initializer.get();
+                bool emptyArray = initNode->kind == NodeKind::ArrayLitExpr &&
+                                  static_cast<ArrayLitExpr*>(initNode)->elements.empty();
+                bool emptyDict = initNode->kind == NodeKind::DictLitExpr &&
+                                 static_cast<DictLitExpr*>(initNode)->keys.empty();
+                if (dt && (emptyArray || emptyDict) &&
+                    (dt->kind == TypeKind::Set || dt->kind == TypeKind::Dict ||
+                     dt->kind == TypeKind::Array)) {
+                    init = dt;
+                    initNode->semaType = dt;
+                    emptyCollectionLit = true;
+                }
             }
-            if (declared && init)
+            if (declared && init && !emptyCollectionLit)
                 requireAssignable(declared, init, vd->initializer.get(), "variable initializer");
             const Type* type = declared ? declared : (init ? init : types_.unknownType());
             vd->semaType = type; // annotated for the code generator
@@ -2427,6 +2450,11 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
         case NodeKind::ForInStmt: {
             auto* f = static_cast<ForInStmt*>(stmt);
             const Type* seq = checkExpr(f->sequence.get(), context);
+            // Record the sequence's resolved type on the node so the code
+            // generator can classify it (Array / Set / Dict / String) when it
+            // emits the iteration loop. `checkExpr` does not always write this
+            // back, and an Unknown here previously made `for x in set` crash.
+            if (seq) f->sequence->semaType = seq;
             locals_.pushScope();
             // Element type produced by iterating `seq`.
             const Type* elem = types_.unknownType();
@@ -2516,6 +2544,12 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
             }
             const Type* subj = s->subject ? checkExpr(s->subject.get(), context)
                                           : types_.unknownType();
+            // Record the subject's resolved type on the node so the code
+            // generator can recover the generic instantiation of an enum value
+            // (e.g. `Box<Int>`) when it lowers a case pattern's payload. Without
+            // this a generic enum's payload type stays unresolved (T -> ptr) and
+            // the bound value is returned boxed instead of as its concrete type.
+            if (subj && s->subject) s->subject->semaType = subj;
             // `case let v` needs the subject's type to type the binding.
             const Type* savedSubject = switchSubjectType_;
             switchSubjectType_ = subj;
@@ -3514,31 +3548,88 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                 // 的推断类型即实例类型。
                 const TypeRecord* rec = nullptr;
                 const Type* recType = nullptr;
-                if (m->base && m->base->kind == NodeKind::IdentExpr) {
-                    const std::string& bn = static_cast<IdentExpr*>(m->base.get())->name;
-                    rec = findType(bn);
-                    if (rec) recType = types_.named(rec, rec->name);
-                } else if (m->base && m->base->kind == NodeKind::GenericExpr) {
-                    auto* g = static_cast<GenericExpr*>(m->base.get());
-                    if (g->base && g->base->kind == NodeKind::IdentExpr) {
-                        const std::string& bn =
-                            static_cast<IdentExpr*>(g->base.get())->name;
-                        const TypeRecord* gr = findType(bn);
-                        if (gr && !gr->genericParams.empty() &&
-                            g->args.size() == gr->genericParams.size()) {
-                            std::vector<const Type*> args;
-                            for (auto& a : g->args)
-                                args.push_back(resolveTypeRepr(a.get(), context));
-                            bool concrete = true;
-                            for (const Type* a : args)
-                                if (!a || a->kind == TypeKind::Unknown)
-                                    { concrete = false; break; }
-                            if (concrete) {
-                                const Type* instTy = monomorphiseGenericType(gr, bn, args);
-                                rec = instTy ? instTy->record : nullptr;
-                                recType = instTy;
+                if (m->base) {
+                    // Resolve the enum base to its (possibly monomorphised) type so
+                    // the constructed value carries `Box<Int>` rather than the
+                    // generic `Box`. Three spellings exist:
+                    //   * `E<Int>.case(...)`  — GenericExpr, explicit args.
+                    //   * `E.case(...)`        — IdentExpr, generic args inferred
+                    //                             from the payload arguments.
+                    //   * `E` (non-generic)    — plain named type.
+                    const Type* bt = nullptr;
+                    if (m->base->kind == NodeKind::GenericExpr) {
+                        auto* g = static_cast<GenericExpr*>(m->base.get());
+                        if (g->base && g->base->kind == NodeKind::IdentExpr) {
+                            const std::string& bn =
+                                static_cast<IdentExpr*>(g->base.get())->name;
+                            const TypeRecord* gr = findType(bn);
+                            if (gr && !gr->genericParams.empty() &&
+                                g->args.size() == gr->genericParams.size()) {
+                                std::vector<const Type*> args;
+                                for (auto& a : g->args)
+                                    args.push_back(resolveTypeRepr(a.get(), context));
+                                bool concrete = true;
+                                for (const Type* a : args)
+                                    if (!a || a->kind == TypeKind::Unknown)
+                                        { concrete = false; break; }
+                                if (concrete)
+                                    bt = monomorphiseGenericType(gr, bn, args);
                             }
                         }
+                    } else if (m->base->kind == NodeKind::NamedType) {
+                        bt = resolveTypeRepr(m->base.get(), context);
+                    } else if (m->base->kind == NodeKind::IdentExpr) {
+                        const std::string& bn = static_cast<IdentExpr*>(m->base.get())->name;
+                        const TypeRecord* gr = findType(bn);
+                        if (gr && !gr->genericParams.empty() && !inPattern_) {
+                            // `Box.wrapped(5)` — no explicit `<Int>`. Infer each
+                            // generic parameter from the payload argument that
+                            // corresponds to the case's associated type mentioning
+                            // it (e.g. `T` at position 0 ↔ argument `5` : Int).
+                            // Skipped inside a pattern (the "arguments" there are
+                            // bindings, not values) to avoid type-checking them.
+                            const EnumCaseDecl* ecd = nullptr;
+                            if (gr->decl && gr->decl->kind == NodeKind::EnumDecl) {
+                                auto* ed = static_cast<EnumDecl*>(gr->decl);
+                                for (auto& mm : ed->members) {
+                                    if (mm && mm->kind == NodeKind::EnumCaseDecl &&
+                                        static_cast<EnumCaseDecl*>(mm.get())->name == m->member) {
+                                        ecd = static_cast<EnumCaseDecl*>(mm.get());
+                                        break;
+                                    }
+                                }
+                            }
+                            std::vector<const Type*> args(gr->genericParams.size());
+                            bool ok = true;
+                            for (size_t gi = 0; gi < gr->genericParams.size(); ++gi) {
+                                const std::string& gp = gr->genericParams[gi];
+                                bool found = false;
+                                if (ecd) {
+                                    for (size_t p = 0; p < ecd->associatedTypes.size(); ++p) {
+                                        if (ecd->associatedTypes[p] &&
+                                            ecd->associatedTypes[p]->kind == NodeKind::NamedType &&
+                                            static_cast<NamedType*>(ecd->associatedTypes[p].get())->name == gp) {
+                                            if (p < c->arguments.size()) {
+                                                args[gi] = inferTypeArgument(
+                                                    checkExpr(c->arguments[p].get(), context));
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!found) { ok = false; break; }
+                            }
+                            if (ok) bt = monomorphiseGenericType(gr, bn, args);
+                        } else if (gr) {
+                            bt = types_.named(gr, gr->name);
+                        }
+                    }
+                    if (!bt || bt->kind != TypeKind::Named)
+                        bt = checkExpr(m->base.get(), context);
+                    if (bt && bt->kind == TypeKind::Named && bt->record) {
+                        rec = bt->record;
+                        recType = bt;
                     }
                 }
                 if (rec && rec->kind == TypeDeclKind::Enum) {
@@ -3604,32 +3695,101 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                     static_cast<IdentExpr*>(c->callee.get())->name;
                 if (const Symbol* fs = globals_.lookup(fname)) {
                     if (fs->kind == Symbol::Kind::Function && fs->function &&
-                        !fs->function->genericParams.empty() &&
-                        fs->function->genericParams.size() == argTypes.size()) {
+                        !fs->function->genericParams.empty()) {
+                        // Infer one type argument per generic parameter. A type
+                        // parameter may be used in several value parameters and the
+                        // number of type parameters need not equal the number of
+                        // arguments (e.g. `unwrapOr<T>(_ o: T?, fallback: T)` has
+                        // one type parameter but two arguments, and `id<T>(_ x: T)`
+                        // has one of each). We therefore scan each function
+                        // parameter's declared type to learn which argument
+                        // constrains which type variable, then read the concrete
+                        // type off that argument.
+                        auto isIdentChar = [](char c) {
+                            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                   (c >= '0' && c <= '9') || c == '_';
+                        };
+                        auto mentions = [&](const std::string& src,
+                                            const std::string& gp) -> bool {
+                            if (src.empty()) return false;
+                            size_t pos = 0;
+                            while ((pos = src.find(gp, pos)) != std::string::npos) {
+                                bool beforeOk = (pos == 0) || !isIdentChar(src[pos - 1]);
+                                size_t after = pos + gp.size();
+                                bool afterOk = (after >= src.size()) ||
+                                               !isIdentChar(src[after]);
+                                if (beforeOk && afterOk) return true;
+                                pos += gp.size();
+                            }
+                            return false;
+                        };
                         std::vector<std::string> targs;
-                        for (const Type* at : argTypes)
-                            targs.push_back(typeToString(inferTypeArgument(at)));
-                        recordGenericInstance(fname, targs);
-                        // Keep the resolved type arguments on the call so codegen
-                        // can locate the exact monomorphised instance (规范 5.2):
-                        // the symbol built from these strings matches the one the
-                        // monomorphiser emits, which fixes generic functions with
-                        // 2+ type parameters that previously fell back to the first
-                        // instance and crashed.
-                        c->genericTypeArgs = targs;
-                        // Resolve the call's result type against this
-                        // instantiation, so `let n = f(x)` learns the concrete
-                        // type instead of inheriting the opaque one.
-                        std::unordered_map<std::string, const Type*> saved =
-                            genericBindings_;
-                        for (size_t i = 0; i < targs.size(); ++i)
-                            genericBindings_[fs->function->genericParams[i]] =
-                                inferTypeArgument(argTypes[i]);
-                        const Type* ret = fs->function->returnType
-                            ? resolveTypeRepr(fs->function->returnType.get(), nullptr)
-                            : types_.voidType();
-                        genericBindings_ = saved;
-                        callee = types_.function(argTypes, ret);
+                        std::vector<const Type*> tys;
+                        bool inferOk = true;
+                        if (fs->function->genericParams.size() == argTypes.size()) {
+                            // Common case: one type argument per value argument
+                            // (e.g. `id<T>(_ x: T)`, generic initialisers such as
+                            // `UnsafeMutablePointer<Int>(...)`). Keep the original
+                            // inference so existing stdlib generics keep working.
+                            for (const Type* at : argTypes) {
+                                const Type* base = inferTypeArgument(at);
+                                targs.push_back(typeToString(base));
+                                tys.push_back(base);
+                            }
+                        } else {
+                            // Mismatched counts: a single type parameter may be
+                            // referenced by several value parameters and the number
+                            // of type parameters need not equal the number of
+                            // arguments (e.g. `unwrapOr<T>(_ o: T?, fallback: T)`
+                            // has one type parameter but two arguments, and
+                            // `pair<T>(_ a: T, _ b: T)` likewise). Infer each type
+                            // parameter from the function parameter that references
+                            // it, then read the concrete type off the matching
+                            // argument.
+                            tys.resize(fs->function->genericParams.size());
+                            targs.resize(fs->function->genericParams.size());
+                            for (size_t gi = 0; gi < fs->function->genericParams.size(); ++gi) {
+                                const std::string& gp = fs->function->genericParams[gi];
+                                bool found = false;
+                                for (size_t p = 0;
+                                     p < fs->function->params.size() && p < argTypes.size();
+                                     ++p) {
+                                    if (mentions(typeToSource(fs->function->params[p].type.get()),
+                                                 gp)) {
+                                        const Type* base = inferTypeArgument(argTypes[p]);
+                                        if (base) {
+                                            targs[gi] = typeToString(base);
+                                            tys[gi] = base;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!found) { inferOk = false; break; }
+                            }
+                        }
+                        if (inferOk && !targs.empty()) {
+                            recordGenericInstance(fname, targs);
+                            // Keep the resolved type arguments on the call so codegen
+                            // can locate the exact monomorphised instance (规范 5.2):
+                            // the symbol built from these strings matches the one the
+                            // monomorphiser emits, which fixes generic functions with
+                            // 2+ type parameters that previously fell back to the
+                            // first instance and crashed.
+                            c->genericTypeArgs = targs;
+                            // Resolve the call's result type against this
+                            // instantiation, so `let n = f(x)` learns the concrete
+                            // type instead of inheriting the opaque one.
+                            std::unordered_map<std::string, const Type*> saved =
+                                genericBindings_;
+                            for (size_t i = 0; i < targs.size(); ++i)
+                                genericBindings_[fs->function->genericParams[i]] = tys[i];
+                            const Type* ret = fs->function->returnType
+                                ? resolveTypeRepr(fs->function->returnType.get(), nullptr)
+                                : types_.voidType();
+                            genericBindings_ = saved;
+                            callee = types_.function(argTypes, ret);
+                        }
                     }
                 }
             }

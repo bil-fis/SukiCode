@@ -61,9 +61,6 @@ KNOWN_PENDING=(
     # the codegen tests; what this showcase still needs is actor isolation, the
     # `select` statement, `for await` iteration and ranges (`0..<100`).
     "examples/concurrency.suki|concurrency: actor 隔离 / select 语句 / for await / 区间"
-    # 泛型枚举（如 Result<T, E: Error>）当前代码生成不可用：实例化时实例名错误
-    # （Box<Int><Int>），故 §9.4 的 Result 回归用例暂置 pending，待编译器修复。
-    "moduleTest/pending/result.suki|core: 泛型枚举 Result<T, E: Error> 待编译器支持"
     # memory 模块（Owned<T> / ByteBuffer / ARC / Pool / Collection）尚未落地，
     # 其示例依赖泛型结构体与移动语义，归入待实现。
     "examples/memory.suki|memory: Owned<T> / ByteBuffer / ARC 模块待实现"

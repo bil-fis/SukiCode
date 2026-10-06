@@ -1542,9 +1542,11 @@ private:
                     llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
                     llvm::Value* seqSlot = nullptr;
                     llvm::Type* seqTy = nullptr;
+                    llvm::Value* seq = nullptr;
                     llvm::Value* lo = nullptr;
                     llvm::Value* hi = nullptr;
                     bool halfOpen = true;
+                    bool dictLike = false;
                     if (fr->sequence && fr->sequence->kind == NodeKind::RangeExpr) {
                         auto* r = static_cast<RangeExpr*>(fr->sequence.get());
                         halfOpen = r->halfOpen;
@@ -1553,11 +1555,15 @@ private:
                         if (lo) lo = owner_->coerce(lo, i64);
                         if (hi) hi = owner_->coerce(hi, i64);
                     } else {
-                        llvm::Value* seq = fr->sequence ? owner_->genExpr(fr->sequence.get()) : nullptr;
+                        seq = fr->sequence ? owner_->genExpr(fr->sequence.get()) : nullptr;
                         if (!seq) return;
                         seqTy = seq->getType();
                         seqSlot = owner_->b_->CreateAlloca(seqTy, nullptr, "for.seq");
                         owner_->b_->CreateStore(seq, seqSlot);
+                        const Type* seqType0 = fr->sequence ? fr->sequence->semaType : nullptr;
+                        dictLike = seqType0 &&
+                            (seqType0->kind == TypeKind::Dict ||
+                             seqType0->kind == TypeKind::Set);
                     }
                     VarDecl* pat = fr->pattern && fr->pattern->kind == NodeKind::VarDecl
                                        ? static_cast<VarDecl*>(fr->pattern.get())
@@ -1608,7 +1614,13 @@ private:
                     } else {
                         llvm::Value* coll = owner_->b_->CreateLoad(seqTy, seqSlot, "for.coll");
                         llvm::Value* count;
-                        if (owner_->isDictAggregate(coll, seqType)) {
+                        // Set/Dict iterate through the shared hash-table runtime.
+                        // Their variables are stored by pointer (see TypeLayout),
+                        // so we hand the runtime the sequence pointer directly.
+                        // We classify by semantic type rather than by inspecting
+                        // the value: with opaque LLVM pointers the struct shape is
+                        // no longer recoverable from the value alone.
+                        if (dictLike) {
                             count = owner_->b_->CreateCall(
                                 owner_->declareExternalSig("suki_dict_entry_count",
                                     { llvm::PointerType::get(*owner_->ctx_, 0) }, i64),
@@ -1631,7 +1643,7 @@ private:
                         }
                     } else {
                         llvm::Value* coll = owner_->b_->CreateLoad(seqTy, seqSlot, "for.coll");
-                        if (owner_->isDictAggregate(coll, seqType)) {
+                        if (dictLike) {
                             llvm::Value* keySlot = owner_->b_->CreateAlloca(
                                 keyTy, nullptr, names.empty() ? "k" : names[0]);
                             llvm::Value* valSlot = owner_->b_->CreateAlloca(
@@ -1732,7 +1744,8 @@ private:
                         if (defaultArm) {
                             defTarget = llvm::BasicBlock::Create(*owner_->ctx_, "sw.default", f);
                             owner_->b_->SetInsertPoint(defTarget);
-                            owner_->bindCaseBindings(defaultArm, subject);
+                            owner_->bindCaseBindings(defaultArm, subject,
+                                sw->subject ? sw->subject->semaType : nullptr);
                             for (auto& st : defaultArm->body) owner_->genStmt(st.get());
                             if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(merge);
                         }
@@ -1771,7 +1784,8 @@ private:
                     for (size_t i = 0; i < arms.size(); ++i) {
                         CaseClause* cc = arms[i];
                         owner_->b_->SetInsertPoint(bodies[i]);
-                        owner_->bindCaseBindings(cc, subject);
+                        owner_->bindCaseBindings(cc, subject,
+                            sw->subject ? sw->subject->semaType : nullptr);
                         if (cc->whereExpr) {
                             llvm::BasicBlock* okBB = llvm::BasicBlock::Create(*owner_->ctx_, "sw.ok", f);
                             llvm::Value* w = owner_->genExpr(cc->whereExpr.get());
@@ -2237,6 +2251,51 @@ private:
                 // Build via repeated runtime push so one code path serves both
                 // literals and `append`.
                 auto* a = static_cast<ArrayLitExpr*>(e);
+                // A bare `[]` whose annotation is a Set/Dict is an empty (or
+                // key-only) hash table, not an array. Emitting it via
+                // `suki_array_new` would mismatch the table's 4-field struct and
+                // corrupt the capacity fields, so lower it as a dictionary.
+                if (a->semaType &&
+                    (a->semaType->kind == TypeKind::Set ||
+                     a->semaType->kind == TypeKind::Dict)) {
+                    llvm::Type* sty = owner_->layout_->lower(a->semaType);
+                    if (!sty || !sty->isStructTy()) return nullptr;
+                    llvm::Type* kTy = llvm::Type::getInt64Ty(*owner_->ctx_);
+                    llvm::Type* vTy = llvm::Type::getInt64Ty(*owner_->ctx_);
+                    if (a->semaType->kind == TypeKind::Set && a->semaType->element)
+                        kTy = owner_->layout_->lower(a->semaType->element);
+                    else if (a->semaType->kind == TypeKind::Dict && a->semaType->key)
+                        kTy = owner_->layout_->lower(a->semaType->key);
+                    if (a->semaType->kind == TypeKind::Dict && a->semaType->value)
+                        vTy = owner_->layout_->lower(a->semaType->value);
+                    int64_t ksz = (int64_t)owner_->sizeOf(kTy);
+                    int64_t vsz = (int64_t)owner_->sizeOf(vTy);
+                    llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                    llvm::Value* box = owner_->b_->CreateAlloca(sty, nullptr, "set.tmp");
+                    owner_->b_->CreateCall(
+                        owner_->declareExternalSig("suki_dict_new",
+                            { i64, i64, i64, llvm::PointerType::getUnqual(sty) }),
+                        { llvm::ConstantInt::get(i64, ksz),
+                          llvm::ConstantInt::get(i64, vsz),
+                          llvm::ConstantInt::get(i64, (int64_t)a->elements.size()),
+                          box });
+                    for (auto& el : a->elements) {
+                        llvm::Value* v = genExpr(el.get());
+                        if (!v) continue;
+                        llvm::Value* ka = owner_->b_->CreateAlloca(kTy);
+                        owner_->b_->CreateStore(owner_->coerce(v, kTy), ka);
+                        llvm::Value* va = owner_->b_->CreateAlloca(vTy);
+                        owner_->b_->CreateStore(llvm::Constant::getNullValue(vTy), va);
+                        owner_->b_->CreateCall(
+                            owner_->declareExternalSig("suki_dict_set",
+                                { llvm::PointerType::getUnqual(sty), i64, i64,
+                                  llvm::PointerType::getUnqual(kTy),
+                                  llvm::PointerType::getUnqual(vTy) }),
+                            { box, llvm::ConstantInt::get(i64, ksz),
+                              llvm::ConstantInt::get(i64, vsz), ka, va });
+                    }
+                    return owner_->b_->CreateLoad(sty, box);
+                }
                 llvm::Type* aty = owner_->layout_->lower(a->semaType);
                 if (!aty || !aty->isStructTy()) return nullptr;
                 const Type* elemT = a->semaType && a->semaType->kind == TypeKind::Array
@@ -3273,11 +3332,17 @@ private:
                  i < rec->genericParams.size() && i < enumType->elements.size(); ++i)
                 map.emplace_back(rec->genericParams[i], enumType->elements[i]);
         }
-        for (const Type* at : assoc) {
+        for (size_t ai = 0; ai < assoc.size(); ++ai) {
+            const Type* at = assoc[ai];
             const Type* resolved = at;
             if (at && at->kind == TypeKind::Named) {
                 for (auto& kv : map)
                     if (at->name == kv.first) { resolved = kv.second; break; }
+            } else if (at && at->kind == TypeKind::Unknown && !map.empty() &&
+                       ai < map.size()) {
+                // 声明期泛型参数（如 `T`）被解析为 Unknown；按位置映射到对应
+                // 泛型实参（第 ai 个关联值 ⇔ 第 ai 个泛型参数 ⇔ elements[ai]）。
+                resolved = enumType->elements[ai];
             }
             out.push_back(resolved);
         }
@@ -3346,9 +3411,20 @@ private:
         }
         payload = b_->CreateExtractValue(src, {0}, "unwrap");
         // Aggregates are boxed, so an Optional's field 0 is a pointer to the
-        // value rather than the value itself.
-        if (payload->getType()->isPointerTy() && vd->semaType) {
-            llvm::Type* want = layout_->lower(vd->semaType);
+        // value rather than the value itself. Load the boxed value back out,
+        // unless the wrapped type is itself a reference (whose pointer *is* the
+        // value and must not be dereferenced).
+        if (payload->getType()->isPointerTy()) {
+            llvm::Type* want = nullptr;
+            if (vd->semaType) {
+                want = layout_->lower(vd->semaType);
+            } else if (vd->initializer && vd->initializer->semaType &&
+                       vd->initializer->semaType->kind == TypeKind::Optional &&
+                       vd->initializer->semaType->element) {
+                // The binding's declared type was lost; recover the unwrapped
+                // element type from the initialiser's Optional type.
+                want = layout_->lower(vd->initializer->semaType->element);
+            }
             if (want && !want->isPointerTy())
                 payload = b_->CreateLoad(want, payload, "unbox");
         }
@@ -3462,7 +3538,8 @@ private:
     // Introduce the names a case pattern binds. Two forms exist:
     //   * `case E.c(let r)` — unbox the payload field into a local;
     //   * `case let v`       — bind the subject itself (value-binding pattern).
-    void bindCaseBindings(CaseClause* cc, llvm::Value* subject) {
+    void bindCaseBindings(CaseClause* cc, llvm::Value* subject,
+                          const Type* subjectType = nullptr) {
         if (!cc) return;
         if (cc->isBindingPattern) {
             // `case let v`: the subject becomes `v` for the body and the guard.
@@ -3480,7 +3557,13 @@ private:
         int64_t ptag = -1;
         const TypeRecord* prec = enumCaseOf(pm, &ptag);
         if (!prec) return;
-        const Type* baseType = (pm->base ? pm->base->semaType : nullptr);
+        // Prefer the switch subject's resolved type (it carries the generic
+        // instantiation, e.g. `Box<Int>`), falling back to the pattern's base
+        // type. A bare enum reference in the pattern resolves to the generic
+        // form `Box<T>` whose payload would wrongly stay a pointer.
+        const Type* baseType = subjectType
+            ? subjectType
+            : (pm->base ? pm->base->semaType : nullptr);
         llvm::StructType* pt = casePayloadType(prec, (size_t)ptag, baseType);
         if (!pt) return;
         llvm::Value* p = b_->CreateExtractValue(subject, {1}, "payload.ptr");

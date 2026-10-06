@@ -48,7 +48,7 @@ while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
 构建过程中逐项二分确认以下限制，已在 `core.suki` 头部注释与本文记录；相关特性以「具体类型 / 规避写法」替代，或移入 pending。
 
 1. **闭包未实现**：任何接收并调用闭包的高阶函数（`map`/`filter`/`reduce`/`forEach`/`sorted`/`compactMap`/`zip`）无法表达。规范 §12.2/§12.3/§12.7 的绝大多数集合高阶 API 因此无法落地。
-2. **泛型枚举不可用**：`enum Box<T> { case wrapped(T); case empty }` 实例化时报 `cannot convert value of type 'Box' to 'Box<Int><Int>'`（实例名被双重包裹）。故规范 §9.4 的 `Result<T, E: Error>` 无法作为泛型枚举实现。→ `moduleTest/pending/result.suki` 已登记。
+2. ~~**泛型枚举不可用**~~ **已修复**：原先 `enum Box<T> { case wrapped(T); case empty }` 实例化时报 `cannot convert value of type 'Box' to 'Box<Int><Int>'`（实例名被双重包裹）。根因有二：(a) 构造 `E.case(...)` 时返回的是未单态化的泛型 `Box` 而非实例 `Box<Int>`；(b) `typeToString` 对单态化实例（`name` 已是 `Box<Int>` 且 `elements=[Int]`）再次追加 `<Int>`，渲染为 `Box<Int><Int>`。两类均已在后续编译器修复中消弭。规范 §9.4 的 `Result<T, E: Error>` 现已作为泛型枚举落地于 `src/stdlib/core/core.suki`，回归用例 `moduleTest/codegen/result.suki` 通过。
 3. **`for … in` over `Set` 导致编译器段错误**（数组 for-in 正常）。故依赖迭代的 `setUnionInt`/`setIntersectionInt`/`setSubtractInt` 无法提供；单元素的 `insert`/`contains` 可正常使用。
 4. **2 参数泛型函数不被单态化**：`func pair<T>(_ a: T, _ b: T)` 的实例未被生成，调用点回退为变参 `(ptr, ...)` 占位，最终 IR 校验失败。故通用的 `unwrapOr<T>(_ o: T?, fallback: T)` 改为四个具体类型重载。
 5. **从分支体返回结构体值（如 `String`）被错误降级为 `ret ptr`**：`func f(_ o: String?) -> String { if let v = o { return v } … }` 触发 `Function return type does not match operand type of return inst`。规避写法：用局部变量承接、`return` 统一落在函数末尾（已用于 `unwrapOrString` 等）。标量（Int/Double/Bool）从分支返回不受影响。

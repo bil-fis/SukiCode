@@ -16,10 +16,9 @@
 ///      and *calls* a closure (`map`/`filter`/`reduce`/`forEach`/`sorted`/
 ///      `compactMap`/`zip` over collections) cannot be expressed. They are
 ///      intentionally omitted until the compiler gains closure support.
-///   2. Generic enums are not supported by codegen (`enum Box<T> {…}` fails to
-///      instantiate), therefore the spec's `Result<T, E: Error>` cannot ship as
-///      a generic enum. A non-generic, concrete error enum pattern is shown in
-///      the documentation instead; typed `Result` awaits the compiler fix.
+///   2. Generic enums ARE supported by codegen (`enum Box<T> {…}` instantiates
+///      correctly and payloads extract via `switch`), so `Result<T, E: Error>`
+///      ships as the spec's typed generic enum.
 ///   3. `for … in` over `Set` currently crashes the compiler (it works for
 ///      `Array`), so set-algebra helpers that require iteration (union /
 ///      intersection / subtraction) are omitted. Single-element `insert` /
@@ -56,6 +55,18 @@ protocol CustomStringConvertible {
 
 /// The error protocol. Conform to this to throw typed errors.
 protocol Error {}
+
+/// A value that is either a success carrying `T` or a failure carrying `E`
+/// (which must conform to `Error`). Models fallible computations without
+/// exceptions (规范 §9.4). Generic enums are fully supported by codegen, so
+/// this ships as the canonical `Result<T, E: Error>` rather than a concrete
+/// stand-in.
+enum Result<T, E: Error> {
+    /// The computation succeeded with value `T`.
+    case success(T)
+    /// The computation failed with error `E`.
+    case failure(E)
+}
 
 // ─── Bare-metal support (规范 §8.7) ────────────────────────────────────────────
 // These types back the `@panic_handler` / `@global_allocator` attributes. The

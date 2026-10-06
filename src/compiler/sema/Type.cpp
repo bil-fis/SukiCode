@@ -237,12 +237,20 @@ std::string typeToString(const Type* t) {
         case TypeKind::Named: {
             std::string s = t->name;
             if (!t->elements.empty()) {
-                s += "<";
-                for (size_t i = 0; i < t->elements.size(); ++i) {
-                    if (i) s += ", ";
-                    s += typeToString(t->elements[i]);
+                // A monomorphised instance record's `name` already carries its
+                // generic arguments (e.g. "Box<Int>"); its `elements` hold the same
+                // concrete args. Appending them again would double-render the name
+                // ("Box<Int><Int>"). Any name containing '<' is already a fully
+                // qualified instantiation, so skip the suffix in that case.
+                bool alreadyGeneric = s.find('<') != std::string::npos;
+                if (!alreadyGeneric) {
+                    s += "<";
+                    for (size_t i = 0; i < t->elements.size(); ++i) {
+                        if (i) s += ", ";
+                        s += typeToString(t->elements[i]);
+                    }
+                    s += ">";
                 }
-                s += ">";
             }
             return s;
         }
