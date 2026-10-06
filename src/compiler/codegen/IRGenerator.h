@@ -49,11 +49,22 @@ public:
                     const std::string& objPath, std::string* irOut,
                     std::string& errOut);
 
+    // 规范 §10.4 / §14.1.3：编译优化级别与输出形态（由驱动按 `-O*` / `-S` 设置）。
+    // optLevel：0=无优化(O0)，1=Less(O1)，2=Default(O2)，3=Aggressive(O3)。
+    // optSize：配合 `-Os` 开启尺寸优先优化。
+    // emitAssembly：为 true 时 `emitObject` 产出汇编文本（.s）而非对象文件（.o）。
+    void setOptLevel(int level) { optLevel_ = level; }
+    void setOptSize(bool b) { optSize_ = b; }
+    void setEmitAssembly(bool b) { emitAsm_ = b; }
+
     const TargetInfo& target() const;
 
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
+    int optLevel_ = 0;
+    bool optSize_ = false;
+    bool emitAsm_ = false;
 };
 
 } // namespace suki

@@ -348,6 +348,17 @@ void suki_println_str(SukiString s) {
     fputc('\n', stdout);
 }
 
+// ABI-compatible panic that takes a SukiCode `String` by value (the same
+// {i8* data, i64 length} aggregate the compiler uses), so the standard library
+// can trap without reaching for the compiler builtin `panic` (which is only
+// visible inside the main module, not inside imported modules such as `core`).
+void suki_panic_string(SukiString s) {
+    fputs("panic: ", stderr);
+    if (s.data && s.length > 0) fwrite(s.data, 1, (size_t)s.length, stderr);
+    fputc('\n', stderr);
+    abort();
+}
+
 // ─── Array ────────────────────────────────────────────────────────────────
 // Storage is a single block: [ int64 elem_size | capacity * elem_size bytes ].
 // `data` points just past the header, so element i is `data[i]` for any type.
@@ -851,6 +862,46 @@ void suki_spin_unlock(int64_t* lock) {
     __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
 }
 
+// ─── actor 串行执行器（规范 §7.4）────────────────────────────────────────────
+// actor 的隔离语义不只是"任意时刻只有一个线程在跑"：规范要求一个**串行执行器
+// 队列**，并且 actor 方法在 `await` 挂起期间必须**释放**隔离，让其他任务得以
+// 进入（重入 / reentrancy），恢复后再重新排队取回执行权。
+//
+// 实现上把 actor 的锁字（对象头 offset 3，一个 i64）打包成 FIFO 票号锁：
+//   低 32 位 = serving：当前正在被服务的票号
+//   高 32 位 = next   ：下一个将要发出的票号
+// enter 取票（next++）后自旋等待 serving 追上自己的票号，因此先到先服务、
+// 不会像普通自旋锁那样饥饿或乱序 —— 这正是串行执行器队列的语义。
+// leave 推进 serving，把执行权交给队列中的下一个任务。
+//
+// 重入由 codegen 完成：actor 方法体内的每个 `await` 挂起点前后分别插入
+// suki_actor_leave / suki_actor_enter，从而挂起期间放行其他任务。
+void suki_actor_enter(int64_t* lock) {
+    if (!lock) return;
+    // 取票：next 自增，自增前的 next 即自己的票号。
+    uint64_t prev =
+        (uint64_t)__atomic_fetch_add(lock, (int64_t)1 << 32, __ATOMIC_ACQ_REL);
+    uint32_t my = (uint32_t)(prev >> 32);
+    for (;;) {
+        uint64_t cur = (uint64_t)__atomic_load_n(lock, __ATOMIC_ACQUIRE);
+        if ((uint32_t)(cur & 0xffffffffu) == my) return; // 轮到自己
+        // 可移植的自旋提示：不调用任何让出/睡眠函数（它们在部分构建配置下
+        // 不可用），仅以内存屏障打断忙等；actor 临界区通常很短，开销可接受。
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+}
+
+void suki_actor_leave(int64_t* lock) {
+    if (!lock) return;
+    // 推进 serving：把执行权交给队列中的下一个任务。
+    __atomic_fetch_add(lock, 1, __ATOMIC_ACQ_REL);
+}
+
+// actor 实例初始化时清零锁字（serving=0, next=0）。
+void suki_actor_init(int64_t* lock) {
+    if (lock) __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+}
+
 // Threads are created detached. A Future (not a join) is how completion is
 // observed, which keeps the code identical on every platform and avoids leaking
 // joinable threads when a result is never awaited.
@@ -1172,4 +1223,18 @@ void suki_taskgroup_free(SukiTaskGroup* g) {
     }
     suki_bmtx_destroy(&g->mtx);
     suki_free(g);
+}
+
+// ─── C 互操作测试桩（规范 §6.3 / @convention）──────────────────────────────
+// 供 SukiCode 侧以 `@_cdecl("suki_test_add_c") @convention(c) extern` 声明并
+// 调用，验证 C 调用约定路径端到端可用。C 默认调用约定即 CallingConv::C，与
+// 声明一致，链接后可直接调用。
+int64_t suki_test_add_c(int64_t a, int64_t b) {
+    return a + b;
+}
+
+// 供 @convention(stdcall) 端到端测试使用独立符号（与 C 约定变体同名会导致
+// 链接器产生 `.1` 后缀冲突）。x86_64 上 stdcall 按默认 ABI 处理，链接后可直接调用。
+int64_t suki_test_add_c_std(int64_t a, int64_t b) {
+    return a + b;
 }

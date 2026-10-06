@@ -1,0 +1,115 @@
+// 规范 §10.3 条件编译：os() / arch() / suki() 谓词与 #elseif 别名。
+// 退出码 0 表示全部断言通过。
+//
+// 断言刻意写成与主机无关（不写死 Linux/x86_64）：真实目标上 os() 与 arch()
+// 各自恰好命中一个取值，未知取值恒为假，因而本用例可跨平台运行。
+
+// 恰好一个 os() 取值为真。
+func osCount() -> Int {
+    var n = 0
+    #if os(Linux)
+    n = n + 1
+    #endif
+    #if os(macOS)
+    n = n + 1
+    #endif
+    #if os(Windows)
+    n = n + 1
+    #endif
+    #if os(iOS)
+    n = n + 1
+    #endif
+    #if os(Android)
+    n = n + 1
+    #endif
+    #if os(FreeBSD)
+    n = n + 1
+    #endif
+    return n
+}
+
+// 恰好一个 arch() 取值为真。
+func archCount() -> Int {
+    var n = 0
+    #if arch(x86_64)
+    n = n + 1
+    #endif
+    #if arch(arm64)
+    n = n + 1
+    #endif
+    #if arch(arm)
+    n = n + 1
+    #endif
+    #if arch(riscv64)
+    n = n + 1
+    #endif
+    return n
+}
+
+// 未知 OS 名恒为假 → 走 #else 分支。
+func fictionalOS() -> Int {
+    #if os(SukiFictionalOS)
+    return 1
+    #else
+    return 0
+    #endif
+}
+
+// `!os(...)` 取反成立。
+func notFictional() -> Int {
+    #if !os(SukiFictionalOS)
+    return 1
+    #else
+    return 0
+    #endif
+}
+
+// 规范 §10.3 示例写法：#elseif 与 #elif 等价。
+func osBranch() -> Int {
+    #if os(SukiFictionalOS)
+    return 1
+    #elseif os(AnotherFictionalOS)
+    return 2
+    #else
+    return 3
+    #endif
+}
+
+// 版本谓词：当前编译器版本满足 >=0.1，尚不满足 >=1.0。
+func versionOk() -> Int {
+    #if suki(>=0.1)
+    return 1
+    #else
+    return 0
+    #endif
+}
+
+func versionFuture() -> Int {
+    #if suki(>=1.0)
+    return 1
+    #else
+    return 0
+    #endif
+}
+
+// 组合：os 与 arch 可用 && 连接。
+func combined() -> Int {
+    #if !os(SukiFictionalOS) && !arch(SukiFictionalArch)
+    return 1
+    #else
+    return 0
+    #endif
+}
+
+@main
+func main() -> Int {
+    if (osCount() != 1) { return 1 }
+    if (archCount() != 1) { return 1 }
+    if (fictionalOS() != 0) { return 1 }
+    if (notFictional() != 1) { return 1 }
+    if (osBranch() != 3) { return 1 }
+    if (versionOk() != 1) { return 1 }
+    if (versionFuture() != 0) { return 1 }
+    if (combined() != 1) { return 1 }
+    return 0
+}

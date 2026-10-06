@@ -1,0 +1,69 @@
+import memory
+
+// 验证 C 互操作补齐（规范 §6.3 / §8.1）：
+//   1) @convention(c) 外部函数经 @_cdecl 绑定真实 C 符号并正确调用（C 调用约定）；
+//   2) @convention(stdcall) 外部函数的声明/调用路径（x86_64 后端按默认 ABI 处理）；
+//   3) unsafeBitCast<From, To>(value) 位模式重解释：整数↔整数、地址↔类型化指针。
+// 退出码 0 表示全部断言通过。
+
+// 1) C 调用约定的外部函数：绑定 runtime.c 中的 suki_test_add_c。
+@_cdecl("suki_test_add_c") @convention(c)
+extern func testAddC(a: Int, b: Int) -> Int
+
+// 2) stdcall 调用约定的外部函数：绑定独立 C 符号（避免与 C 约定变体同名冲突）。
+@_cdecl("suki_test_add_c_std") @convention(stdcall)
+extern func testAddStdcall(a: Int, b: Int) -> Int
+
+func testConvention() -> Int {
+    var total = 0
+    let c = testAddC(a: 3, b: 4)
+    if (c != 7) { total = total + 1 }          // C 约定调用应返回 7
+    let s = testAddStdcall(a: 10, b: 20)
+    if (s != 30) { total = total + 1 }         // stdcall 路径（x86_64 同 ABI）应返回 30
+    return total
+}
+
+func testBitcastInt() -> Int {
+    var total = 0
+    let x: Int = -1
+    // Int 的位模式按 UInt 重新解释：全 1 的 i64 即 UInt 的最大无符号值。
+    let u: UInt = unsafeBitCast<Int, UInt>(x)
+    let maxU: UInt = unsafeBitCast<Int, UInt>(-1)
+    if (u != maxU) { total = total + 1 }
+    // 往返重解释应保留位模式。
+    let back: Int = unsafeBitCast<UInt, Int>(u)
+    if (back != x) { total = total + 1 }
+    // 一般正整数往返也应保真。
+    let y: Int = 305419896   // 0x12345678
+    let uy: UInt = unsafeBitCast<Int, UInt>(y)
+    let backY: Int = unsafeBitCast<UInt, Int>(uy)
+    if (backY != y) { total = total + 1 }
+    return total
+}
+
+func testBitcastPointer() -> Int {
+    var total = 0
+    unsafe {
+        let ptr: UnsafeMutablePointer<Int> = allocate(capacity: 1)
+        ptr.pointee = 1234
+        let raw: Int = ptr.raw
+        // 地址（Int）按类型化指针重解释，再还原，位模式应一致。
+        let p2: UnsafeMutablePointer<Int> = unsafeBitCast<Int, UnsafeMutablePointer<Int> >(raw)
+        if (p2.pointee != 1234) { total = total + 1 }   // 同一块内存，值应为 1234
+        let back: Int = unsafeBitCast<UnsafeMutablePointer<Int>, Int>(p2)
+        if (back != raw) { total = total + 1 }
+        ptr.deallocate()
+    }
+    return total
+}
+
+@main
+func main() -> Int {
+    let a = testConvention()
+    let b = testBitcastInt()
+    let c = testBitcastPointer()
+    if (a == 0 && b == 0 && c == 0) {
+        return 0
+    }
+    return 1
+}

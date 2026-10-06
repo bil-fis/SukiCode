@@ -7,21 +7,60 @@
 #include "compiler/lexer/Lexer.h"
 #include "compiler/parser/Parser.h"
 
+#include <cerrno>
+#include <cstdlib>
+
 namespace suki {
 
 static SourceRange rangeOf(Node* n) { return n ? n->range : SourceRange{}; }
 
 // 访问控制级别推导（规范 10.1）：修饰符按出现顺序生效，后者覆盖前者；
-// 未标注默认 Internal。
-static AccessLevel accessLevelFromModifiers(const std::vector<std::string>& mods) {
+// 未标注默认 Internal。`explicitLevel` 置为是否出现了访问级别修饰符，
+// 用于区分「显式写 internal」与「未标注」。
+static AccessLevel accessLevelFromModifiers(const std::vector<std::string>& mods,
+                                            bool* explicitLevel = nullptr) {
+    if (explicitLevel) *explicitLevel = false;
     AccessLevel lvl = AccessLevel::Internal;
     for (const auto& m : mods) {
-        if (m == "public" || m == "open") lvl = AccessLevel::Public;
-        else if (m == "private") lvl = AccessLevel::Private;
-        else if (m == "fileprivate") lvl = AccessLevel::Fileprivate;
-        else if (m == "internal") lvl = AccessLevel::Internal;
+        if (m == "public" || m == "open") {
+            lvl = AccessLevel::Public;
+            if (explicitLevel) *explicitLevel = true;
+        } else if (m == "private") {
+            lvl = AccessLevel::Private;
+            if (explicitLevel) *explicitLevel = true;
+        } else if (m == "fileprivate") {
+            lvl = AccessLevel::Fileprivate;
+            if (explicitLevel) *explicitLevel = true;
+        } else if (m == "internal") {
+            lvl = AccessLevel::Internal;
+            if (explicitLevel) *explicitLevel = true;
+        }
     }
     return lvl;
+}
+
+// 声明的访问级别（规范 §10.1）。被 `import` 载入的模块中，未显式标注访问级别
+// 的声明即该模块导出的公开接口 —— 否则用户 import 之后连库的基础类型都无法
+// 访问。显式标注（internal/fileprivate/private）的声明则严格按其标注执行。
+static AccessLevel declaredAccessLevel(Node* n, const std::vector<std::string>& mods) {
+    bool explicitLevel = false;
+    AccessLevel lvl = accessLevelFromModifiers(mods, &explicitLevel);
+    if (!explicitLevel && n && !n->sourceModule.empty()) lvl = AccessLevel::Public;
+    return lvl;
+}
+
+// 声明所属模块（空 = 用户主模块）。
+static std::string moduleOfDecl(Node* n) {
+    return n ? n->sourceModule : std::string();
+}
+
+// 访问控制判定（规范 §10.1）：跨模块访问仅 public/open 可见；同模块内
+// internal/fileprivate 可见（当前为单文件编译，fileprivate 与 internal 等价），
+// private 由 checkMemberAccess 另行按所属类型判定。
+bool Sema::isAccessible(const std::string& targetModule, AccessLevel access) const {
+    if (access == AccessLevel::Public) return true;
+    if (targetModule != currentModule_) return false; // 跨模块：非 public 不可见
+    return true;
 }
 
 // 从 Decl 节点取出其修饰符向量（用于推导成员访问级别）。
@@ -35,6 +74,14 @@ static std::vector<std::string> nodeModifiers(Node* m) {
         case NodeKind::EnumCaseDecl: return static_cast<EnumCaseDecl*>(m)->modifiers;
         case NodeKind::TypealiasDecl: return static_cast<TypealiasDecl*>(m)->modifiers;
         case NodeKind::AssociatedTypeDecl: return static_cast<AssociatedTypeDecl*>(m)->modifiers;
+        // 类型声明（struct/class/actor/enum/protocol）同样带访问级别修饰符，
+        // 规范 §10.1 的 `public struct` 需要据此推导。
+        case NodeKind::StructDecl:
+        case NodeKind::ClassDecl:
+        case NodeKind::ActorDecl:
+        case NodeKind::EnumDecl:
+        case NodeKind::ProtocolDecl:
+            return static_cast<TypeDecl*>(m)->modifiers;
         default: return {};
     }
 }
@@ -169,6 +216,7 @@ const Type* Sema::monomorphiseGenericType(const TypeRecord* rec,
     inst->superclass = rec->superclass;
     inst->protocols = rec->protocols;
     inst->isCEnum = rec->isCEnum;
+    inst->origRec = rec;   // 回指原始声明，便于枚举穷举比较规范化
     // The instance is concrete: it has no parameters or constraints left to bind.
     for (const auto& m : rec->members) {
         TypeRecord::Member nm = m;
@@ -194,6 +242,26 @@ const Type* Sema::monomorphiseGenericType(const TypeRecord* rec,
             }
         }
         inst->members.push_back(nm);
+    }
+    // 枚举：把 case 关联值类型按具体实参单态化后复制进实例记录。声明期关联
+    // 类型（如 `T`）被解析为 Unknown（因彼时 T 尚未绑定），须在 genericBindings_
+    // 已绑定 T→Int 的此刻从原始 EnumCaseDecl 节点重新解析，否则下沉会误判为裸
+    // 枚举（lower 返回 i64 而非 {i64,i8*}）且载荷类型错误，泛型枚举完全不可用。
+    if (rec->kind == TypeDeclKind::Enum && rec->decl &&
+        rec->decl->kind == NodeKind::EnumDecl) {
+        auto* ed = static_cast<EnumDecl*>(rec->decl);
+        size_t ci = 0;
+        for (auto& mnode : ed->members) {
+            if (!mnode || mnode->kind != NodeKind::EnumCaseDecl) continue;
+            auto* ec = static_cast<EnumCaseDecl*>(mnode.get());
+            TypeRecord::EnumCaseInfo nc;
+            nc.name = ec->name;
+            nc.rawValue = (ci < rec->cases.size()) ? rec->cases[ci].rawValue : -1;
+            for (auto& at : ec->associatedTypes)
+                nc.associated.push_back(resolveTypeRepr(at.get(), nullptr));
+            inst->cases.push_back(nc);
+            ++ci;
+        }
     }
     genericBindings_ = bindingStack_.back();
     bindingStack_.pop_back();
@@ -337,6 +405,8 @@ void Sema::analyze(NodeList& decls) {
         auto& d = decls[i];
         if (!d) continue;
         unsafeContext_ = (i < stdlibDeclCount_);
+        checkingStdlib_ = (i < stdlibDeclCount_);
+        currentModule_ = moduleOfDecl(d.get());
         switch (d->kind) {
             case NodeKind::StructDecl: case NodeKind::EnumDecl:
             case NodeKind::ClassDecl: case NodeKind::ActorDecl:
@@ -354,6 +424,10 @@ void Sema::analyze(NodeList& decls) {
     for (auto& kv : typeIndex_) {
         TypeRecord* rec = kv.second;
         if (!rec->decl) continue;
+        // 标准库类型成员的继承解析同样处于受信任上下文。
+        checkingStdlib_ = rec->isStdlib;
+        currentModule_ = moduleOfDecl(rec->decl);
+        unsafeContext_ = rec->isStdlib;
         auto* td = static_cast<TypeDecl*>(rec->decl);
         for (auto& base : td->inherited) {
             if (!base || base->kind != NodeKind::NamedType) continue;
@@ -371,6 +445,11 @@ void Sema::analyze(NodeList& decls) {
     // Pass 3: collect members of every type.
     for (auto& kv : typeIndex_) {
         TypeRecord* rec = kv.second;
+        // 标准库类型的成员（含属性类型标注，如 baseAddress: UnsafePointer<T>）
+        // 处于受信任上下文，可引用 unsafe 类型。
+        checkingStdlib_ = rec->isStdlib;
+        currentModule_ = moduleOfDecl(rec->decl);
+        unsafeContext_ = rec->isStdlib;
         if (rec->decl) collectMembers(*rec, static_cast<TypeDecl*>(rec->decl));
     }
 
@@ -403,6 +482,8 @@ void Sema::analyze(NodeList& decls) {
         auto& d = decls[i];
         if (!d) continue;
         unsafeContext_ = (i < stdlibDeclCount_);
+        checkingStdlib_ = (i < stdlibDeclCount_);
+        currentModule_ = moduleOfDecl(d.get());
         if (d->kind == NodeKind::FunctionDecl) {
             collectFunction(static_cast<FunctionDecl*>(d.get()), nullptr);
         } else if (d->kind == NodeKind::VarDecl) {
@@ -420,6 +501,8 @@ void Sema::analyze(NodeList& decls) {
         if (!rec->decl) continue;
         // 标准库类型的方法体可引用 unsafe 类型（如 UnsafeMutablePointer）。
         unsafeContext_ = rec->isStdlib;
+        checkingStdlib_ = rec->isStdlib;
+        currentModule_ = moduleOfDecl(rec->decl);
         auto* td = static_cast<TypeDecl*>(rec->decl);
         for (auto& m : td->members) {
             if (m && m->kind == NodeKind::FunctionDecl) {
@@ -483,6 +566,8 @@ void Sema::analyze(NodeList& decls) {
     for (size_t i = 0; i < decls.size(); ++i) {
         auto& d = decls[i];
         unsafeContext_ = (i < stdlibDeclCount_);
+        checkingStdlib_ = (i < stdlibDeclCount_);
+        currentModule_ = moduleOfDecl(d.get());
         if (d && d->kind == NodeKind::FunctionDecl) {
             checkFunctionBody(static_cast<FunctionDecl*>(d.get()), nullptr);
         } else if (d && d->kind == NodeKind::VarDecl) {
@@ -503,6 +588,10 @@ void Sema::analyze(NodeList& decls) {
         monomorphise(decls);
         unsafeContext_ = savedUnsafe;
     }
+
+    // 裸机属性（规范 §8.7）在类型与泛型实例化都就绪后校验，
+    // 以便 @global_allocator 的一致性检查能看到已解析的协议列表。
+    validateBareMetalAttrs(decls);
 
     locals_.popScope();
     globals_.popScope();
@@ -574,8 +663,16 @@ void Sema::checkConformances() {
 void Sema::checkMemberAccess(const TypeRecord* owner, const TypeRecord::Member* m, Node* at) {
     (void)owner;
     if (!m) return;
+    // 规范 10.1：跨模块仅 `public`/`open` 可见 —— internal/fileprivate/private
+    // 都不构成模块的公开接口。
+    if (!isAccessible(m->module, m->access)) {
+        hadError_ = true;
+        diags_.reportError("'" + m->name + "' is inaccessible: it is not 'public' "
+                           "and belongs to another module", rangeOf(at));
+        return;
+    }
     // 规范 10.1：`private` 成员仅当 currentType_ 等于其所属类型时可见；
-    // `fileprivate`/`internal`/`public` 在当前单模块模型下均可见。
+    // `fileprivate`/`internal`/`public` 在同模块内可见。
     if (m->access == AccessLevel::Private && currentType_ != m->owner) {
         hadError_ = true;
         diags_.reportError("'" + m->name + "' is private and cannot be accessed from here",
@@ -983,6 +1080,9 @@ void Sema::collectTypeDecl(Node* decl, bool isStdlib) {
     td->semaType = types_.named(raw, td->name);
 
     Symbol s; s.kind = Symbol::Kind::Type; s.record = raw; s.decl = td;
+    // 访问控制（规范 §10.1）。
+    s.access = declaredAccessLevel(td, nodeModifiers(td));
+    s.module = moduleOfDecl(td);
     globals_.declare(td->name, s);
 }
 
@@ -1016,7 +1116,10 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
             if (vd->type) mem.type = resolveTypeRepr(vd->type.get(), &rec);
             else if (vd->initializer) mem.type = checkExpr(vd->initializer.get(), &rec);
             else mem.type = types_.unknownType();
-            mem.access = accessLevelFromModifiers(nodeModifiers(m));
+            // 成员自身没有模块标记，其可见性由**所属类型**的模块决定（规范 §10.1）：
+            // 类型的模块决定成员是否构成公开接口。
+            mem.access = declaredAccessLevel(rec.decl ? rec.decl : m, nodeModifiers(m));
+            mem.module = moduleOfDecl(rec.decl ? rec.decl : m);
             mem.owner = &rec;
             rec.members.push_back(std::move(mem));
         }
@@ -1055,11 +1158,17 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
             // protocol so conforming types can inherit it; a pure requirement
             // (no body) is only a requirement to be satisfied elsewhere.
             fn->isDefaultImpl = !fn->body.empty();
-            mem.access = accessLevelFromModifiers(nodeModifiers(m));
+            // 成员自身没有模块标记，其可见性由**所属类型**的模块决定（规范 §10.1）：
+            // 类型的模块决定成员是否构成公开接口。
+            mem.access = declaredAccessLevel(rec.decl ? rec.decl : m, nodeModifiers(m));
+            mem.module = moduleOfDecl(rec.decl ? rec.decl : m);
             mem.owner = &rec;
             rec.requirements.push_back(mem);
         } else {
-            mem.access = accessLevelFromModifiers(nodeModifiers(m));
+            // 成员自身没有模块标记，其可见性由**所属类型**的模块决定（规范 §10.1）：
+            // 类型的模块决定成员是否构成公开接口。
+            mem.access = declaredAccessLevel(rec.decl ? rec.decl : m, nodeModifiers(m));
+            mem.module = moduleOfDecl(rec.decl ? rec.decl : m);
             mem.owner = &rec;
             rec.members.push_back(std::move(mem));
         }
@@ -1111,7 +1220,10 @@ void Sema::addMember(TypeRecord& rec, Node* m) {
         mem.decl = ta;
         mem.type = ta->underlying ? resolveTypeRepr(ta->underlying.get(), &rec)
                                    : types_.unknownType();
-        mem.access = accessLevelFromModifiers(nodeModifiers(m));
+        // 成员自身没有模块标记，其可见性由**所属类型**的模块决定（规范 §10.1）：
+            // 类型的模块决定成员是否构成公开接口。
+            mem.access = declaredAccessLevel(rec.decl ? rec.decl : m, nodeModifiers(m));
+            mem.module = moduleOfDecl(rec.decl ? rec.decl : m);
         mem.owner = &rec;
         rec.members.push_back(std::move(mem));
     } else if (m->kind == NodeKind::EnumCaseDecl) {
@@ -1267,6 +1379,9 @@ void Sema::collectFunction(FunctionDecl* fn, const TypeRecord* owner) {
     s.kind = Symbol::Kind::Function;
     s.function = fn;
     s.decl = fn;
+    // 访问控制（规范 §10.1）：记录访问级别与所属模块。
+    s.access = declaredAccessLevel(fn, nodeModifiers(fn));
+    s.module = moduleOfDecl(fn);
     std::vector<const Type*> params;
     TypeContext& tc = types_;
     for (auto& prm : fn->params) {
@@ -1284,7 +1399,15 @@ void Sema::collectFunction(FunctionDecl* fn, const TypeRecord* owner) {
                                      : tc.voidType();
     // Record the resolved return type on the node for the code generator.
     if (fn->returnType) fn->returnType->semaType = ret;
-    s.type = tc.function(std::move(params), ret);
+    // @convention(c|stdcall) 声明属性（规范 §6.3）：foreign / 外部函数声明可
+    // 显式指定调用约定，使 codegen 对该符号发射匹配的 LLVM calling convention。
+    CallConv cc = CallConv::Default;
+    if (fn->convention == "c") cc = CallConv::C;
+    else if (fn->convention == "stdcall") cc = CallConv::StdCall;
+    else if (!fn->convention.empty())
+        diags_.reportError("unknown calling convention '@convention(" +
+                               fn->convention + ")'", rangeOf(fn));
+    s.type = tc.function(std::move(params), ret, cc);
     globals_.declare(fn->name, s);
     // 缓存函数类型对象到 AST 节点，供不透明返回类型（some）推断后原地改写 ret。
     fn->semaType = s.type;
@@ -1297,6 +1420,9 @@ void Sema::collectGlobalVar(VarDecl* vd) {
     s.isVar = !vd->isLet;
     s.isWeak = vd->isWeak;
     s.decl = vd;
+    // 访问控制（规范 §10.1）。
+    s.access = declaredAccessLevel(vd, nodeModifiers(vd));
+    s.module = moduleOfDecl(vd);
     globals_.declare(vd->name, s);
 }
 
@@ -1375,15 +1501,10 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
                 bt != genericBindings_.end() && bt->second)
                 return bt->second;
             // `unsafe` 强制（规范 8.6）：裸指针/非托管类型仅可在 unsafe 块内使用。
+            // 受信任标准库（checkingStdlib_）可自由定义/使用这些类型，故仅在
+            // 用户代码且不在 unsafe 块内时强制。
             if ((name == "UnsafePointer" || name == "UnsafeMutablePointer" ||
-                 name == "Unmanaged") && !unsafeContext_) {
-                diags_.reportError("'" + name +
-                    "' may only be used inside an 'unsafe' block", rangeOf(repr));
-            }
-
-            // `unsafe` 强制（规范 8.6）：裸指针/非托管类型仅可在 unsafe 块内使用。
-            if ((name == "UnsafePointer" || name == "UnsafeMutablePointer" ||
-                 name == "Unmanaged") && !unsafeContext_) {
+                 name == "Unmanaged") && !unsafeContext_ && !checkingStdlib_) {
                 diags_.reportError("'" + name +
                     "' may only be used inside an 'unsafe' block", rangeOf(repr));
             }
@@ -1408,6 +1529,11 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
                         "value type or Unmanaged<T> (spec §6.4)", rangeOf(repr));
                 return types_.ref(RefKind::Owned, e);
             }
+
+            // 规范 §8.7：`Never` 是内建 bottom 类型（`!`），没有类型记录，
+            // 故按名字直接映射到 neverType()，使 `-> Never` 真正解析为发散类型
+            // （此前会静默退化为 Unknown）。
+            if (name == "Never") return types_.neverType();
 
             const TypeRecord* rec = findType(name);
             if (rec) {
@@ -1453,7 +1579,15 @@ const Type* Sema::resolveTypeReprUncached(Node* repr, const TypeRecord* context)
             auto* f = static_cast<FuncType*>(repr);
             std::vector<const Type*> params;
             for (auto& e : f->params) params.push_back(resolveTypeRepr(e.get(), context));
-            return types_.function(std::move(params), resolveTypeRepr(f->ret.get(), context));
+            // @convention(c|stdcall) 类型属性（规范 §6.3）：映射为调用约定。
+            CallConv cc = CallConv::Default;
+            if (f->convention == "c") cc = CallConv::C;
+            else if (f->convention == "stdcall") cc = CallConv::StdCall;
+            else if (!f->convention.empty())
+                diags_.reportError("unknown calling convention '@convention(" +
+                                       f->convention + ")'", rangeOf(repr));
+            return types_.function(std::move(params),
+                                   resolveTypeRepr(f->ret.get(), context), cc);
         }
         case NodeKind::RefType: {
             auto* r = static_cast<RefType*>(repr);
@@ -1856,6 +1990,9 @@ const Type* Sema::inferOpaqueReturnType(FunctionDecl* fn, const TypeRecord* owne
                 if (is->elseBranch) visit(is->elseBranch.get());
                 break;
             }
+            case NodeKind::LoopStmt:
+                for (auto& s : static_cast<LoopStmt*>(st)->body) visit(s.get());
+                break;
             case NodeKind::WhileStmt:
                 for (auto& s : static_cast<WhileStmt*>(st)->body) visit(s.get());
                 break;
@@ -1917,6 +2054,8 @@ const Type* Sema::inferOpaqueReturnType(FunctionDecl* fn, const TypeRecord* owne
 
 void Sema::checkFunctionBody(FunctionDecl* fn, const TypeRecord* owner) {
     if (fn->isForeign) return; // external declaration: no body to check
+    // 确定性赋值（§1.3）：待初始化集合按函数体重置，避免跨函数污染。
+    pendingInit_.clear();
     currentType_ = owner;
     currentThrows_ = fn->isThrows;
     const Type* ret = fn->returnType ? resolveTypeRepr(fn->returnType.get(), owner)
@@ -1954,7 +2093,10 @@ void Sema::checkFunctionBody(FunctionDecl* fn, const TypeRecord* owner) {
 
     // Every non-Void function must return on all paths. Protocol requirements
     // and other declaration-only members have an empty body and are exempt.
+    // `-> Never`（规范 §8.7）同样豁免：发散函数靠 `loop {}` / trap 终止控制流，
+    // 不存在可 `return` 的 Never 值，故不强求 return 语句。
     if (ret && ret->kind != TypeKind::Void && ret->kind != TypeKind::Unknown &&
+        ret->kind != TypeKind::Never &&
         !fn->body.empty() && !blockAlwaysTransfers(fn->body)) {
         hadError_ = true;
         diags_.reportError("missing return in function '" + fn->name +
@@ -1988,6 +2130,18 @@ void Sema::checkGlobalVarBody(VarDecl* vd) {
     // 顶层 `let x: Int` 同样允许延迟初始化。
     if (!vd->name.empty() && !vd->initializer && declared)
         pendingInit_.insert(vd->name);
+}
+
+// ─── 确定性赋值分析（规范 §1.3）──────────────────────────────────────────────
+// `pendingInit_` 记录当前路径上「尚未赋值」的 let 名字。汇合多条控制流路径时，
+// 「已赋值」要求**所有**路径都赋过值，因此未赋值集合取**并集**：任一支路仍未
+// 赋值 ⇒ 汇合后仍视为未赋值。这正是规范「所有控制流路径上恰好赋值一次」的语义。
+static std::unordered_set<std::string> mergePendingInit(
+    const std::unordered_set<std::string>& a,
+    const std::unordered_set<std::string>& b) {
+    std::unordered_set<std::string> r = a;
+    for (const auto& k : b) r.insert(k);
+    return r;
 }
 
 // ─── Statements ────────────────────────────────────────────────────────────
@@ -2154,8 +2308,21 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                             rangeOf(ifs->condition.get()));
                 }
             }
-            checkStatements(ifs->thenBody, context, fnReturnType, isThrowing);
-            if (ifs->elseBranch) checkStatement(ifs->elseBranch.get(), context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：then/else 各自在当前状态的副本上分析，
+            // 汇合时未赋值集合取并集 —— 只有两条路都赋值才算已赋值。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(ifs->thenBody, context, fnReturnType, isThrowing);
+                auto thenPending = pendingInit_;
+                pendingInit_ = beforePending;
+                if (ifs->elseBranch) {
+                    checkStatement(ifs->elseBranch.get(), context, fnReturnType, isThrowing);
+                    pendingInit_ = mergePendingInit(thenPending, pendingInit_);
+                } else {
+                    // 无 else：隐含的空分支保持进入前状态。
+                    pendingInit_ = mergePendingInit(thenPending, beforePending);
+                }
+            }
             locals_.popScope();
             break;
         }
@@ -2168,8 +2335,19 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
             } else if (e->condition) {
                 checkStatement(e->condition.get(), context, fnReturnType, isThrowing);
             }
-            checkStatements(e->thenBody, context, fnReturnType, isThrowing);
-            if (e->elseBranch) checkStatement(e->elseBranch.get(), context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：与 IfStmt 相同的并集汇合规则。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(e->thenBody, context, fnReturnType, isThrowing);
+                auto thenPending = pendingInit_;
+                pendingInit_ = beforePending;
+                if (e->elseBranch) {
+                    checkStatement(e->elseBranch.get(), context, fnReturnType, isThrowing);
+                    pendingInit_ = mergePendingInit(thenPending, pendingInit_);
+                } else {
+                    pendingInit_ = mergePendingInit(thenPending, beforePending);
+                }
+            }
             break;
         }
         case NodeKind::GuardStmt: {
@@ -2185,7 +2363,28 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                 if (ct && ct->kind != TypeKind::Bool && ct->kind != TypeKind::Unknown)
                     diags_.reportError("condition must be Bool", rangeOf(g->condition.get()));
             }
-            checkStatements(g->elseBody, context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：guard 的 else 必须转移控制，因此其赋值不
+            // 影响后续路径，汇合时保持进入前状态。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(g->elseBody, context, fnReturnType, isThrowing);
+                pendingInit_ = beforePending;
+            }
+            break;
+        }
+        case NodeKind::LoopStmt: {
+            auto* l = static_cast<LoopStmt*>(stmt);
+            if (!l->label.empty()) loopLabels_.push_back(l->label);
+            locals_.pushScope();
+            // 确定性赋值（§1.3）：循环体可能一次都不执行（或中途 break），
+            // 因此体内的赋值不能算作「所有路径都已赋值」，汇合后恢复进入前状态。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(l->body, context, fnReturnType, isThrowing);
+                pendingInit_ = beforePending;
+            }
+            locals_.popScope();
+            if (!l->label.empty()) loopLabels_.pop_back();
             break;
         }
         case NodeKind::WhileStmt: {
@@ -2198,14 +2397,25 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                     diags_.reportError("while condition must be Bool", rangeOf(w->condition.get()));
             }
             locals_.pushScope();
-            checkStatements(w->body, context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：while 体可能执行 0 次，体内赋值不计入。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(w->body, context, fnReturnType, isThrowing);
+                pendingInit_ = beforePending;
+            }
             locals_.popScope();
             break;
         }
         case NodeKind::RepeatWhileStmt: {
             auto* r = static_cast<RepeatWhileStmt*>(stmt);
             locals_.pushScope();
-            checkStatements(r->body, context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：repeat-while 至少执行一次，但仍可能在赋值前
+            // break，故保守地恢复进入前状态。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(r->body, context, fnReturnType, isThrowing);
+                pendingInit_ = beforePending;
+            }
             locals_.popScope();
             if (r->condition) {
                 const Type* ct = checkExpr(r->condition.get(), context);
@@ -2272,7 +2482,12 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                     }
                 }
             }
-            checkStatements(f->body, context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：序列可能为空，体内赋值不计入。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(f->body, context, fnReturnType, isThrowing);
+                pendingInit_ = beforePending;
+            }
             locals_.popScope();
             break;
         }
@@ -2304,21 +2519,67 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
             // `case let v` needs the subject's type to type the binding.
             const Type* savedSubject = switchSubjectType_;
             switchSubjectType_ = subj;
-            for (auto& c : s->cases) checkStatement(c.get(), context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：各 case 分别在当前状态的副本上分析，未赋值
+            // 集合取并集。若没有 `default`，则还存在「无 case 匹配」这条路径，
+            // 需并入进入前的状态，因此只有穷举（有 default）时才算全路径已赋值。
+            {
+                auto beforePending = pendingInit_;
+                std::unordered_set<std::string> merged;
+                bool hasDefaultCase = false;
+                for (auto& c : s->cases) {
+                    if (c && c->kind == NodeKind::CaseClause &&
+                        static_cast<CaseClause*>(c.get())->isDefault)
+                        hasDefaultCase = true;
+                }
+                for (auto& c : s->cases) {
+                    pendingInit_ = beforePending;
+                    checkStatement(c.get(), context, fnReturnType, isThrowing);
+                    merged = mergePendingInit(merged, pendingInit_);
+                }
+                pendingInit_ = hasDefaultCase ? merged
+                                              : mergePendingInit(merged, beforePending);
+            }
             switchSubjectType_ = savedSubject;
 
-            // 穷举检查（规范 1.7）：枚举 switch 必须覆盖全部 case，否则必须提供
-            // `default` 或值绑定（`case let v`）兜底分支。
-            if (subj && subj->kind == TypeKind::Named && subj->record &&
-                subj->record->kind == TypeDeclKind::Enum) {
-                const TypeRecord* erec = subj->record;
-                std::vector<std::string> covered;
+            // 穷举检查（规范 1.7）：带 `default` / 值绑定兜底（`case let v`）/
+            // 枚举全 case 覆盖，即视为穷举，用于 missing-return 判定。
+            {
+                // 把枚举类型规范化到其原始声明记录：泛型枚举的实例化记录通过
+                // `origRec` 回指，使主体（可能是实例化或原始）与 case 模式在覆盖
+                // 比较中始终视为同一枚举。
+                auto canonEnumRec = [&](const Type* t) -> const TypeRecord* {
+                    if (!t || t->kind != TypeKind::Named) return nullptr;
+                    if (t->record && t->record->kind == TypeDeclKind::Enum)
+                        return t->record->origRec ? t->record->origRec : t->record;
+                    return nullptr;
+                };
                 bool hasDefault = false, hasBinding = false;
+                std::vector<std::string> covered;
+                bool isEnum = canonEnumRec(subj) != nullptr;
+                const TypeRecord* erec = isEnum ? canonEnumRec(subj) : nullptr;
+                auto enumRecordOf = [&](Node* base) -> const TypeRecord* {
+                    if (!base) return nullptr;
+                    if (base->semaType) {
+                        const TypeRecord* r = canonEnumRec(base->semaType);
+                        if (r) return r;
+                    }
+                    // 非泛型：基类 IdentExpr 无 semaType，按名查找。
+                    std::string nm;
+                    if (base->kind == NodeKind::IdentExpr)
+                        nm = static_cast<IdentExpr*>(base)->name;
+                    else if (base->kind == NodeKind::GenericExpr) {
+                        Node* inner = static_cast<GenericExpr*>(base)->base.get();
+                        if (inner && inner->kind == NodeKind::IdentExpr)
+                            nm = static_cast<IdentExpr*>(inner)->name;
+                    }
+                    if (!nm.empty())
+                        if (const TypeRecord* r = findType(nm)) return r;
+                    return nullptr;
+                };
                 auto collectEnumCase = [&](Node* p) {
                     if (!p || p->kind != NodeKind::MemberExpr) return;
                     auto* pm = static_cast<MemberExpr*>(p);
-                    if (pm->base && pm->base->kind == NodeKind::IdentExpr &&
-                        static_cast<IdentExpr*>(pm->base.get())->name == erec->name)
+                    if (enumRecordOf(pm->base.get()) == erec)
                         covered.push_back(pm->member);
                 };
                 for (auto& c : s->cases) {
@@ -2329,7 +2590,8 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                     collectEnumCase(cc->pattern.get());
                     for (auto& alt : cc->alternatives) collectEnumCase(alt.get());
                 }
-                if (!hasDefault && !hasBinding) {
+                bool exhaustive = hasDefault || hasBinding;
+                if (!exhaustive && erec) {
                     std::string missing;
                     for (const auto& ci : erec->cases)
                         if (std::find(covered.begin(), covered.end(), ci.name) == covered.end())
@@ -2339,8 +2601,11 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                         diags_.reportError("switch over enum '" + erec->name +
                             "' must be exhaustive; missing case(s): " + missing,
                             s->subject ? rangeOf(s->subject.get()) : rangeOf(stmt));
+                    } else {
+                        exhaustive = true; // 全部 case 均已覆盖
                     }
                 }
+                static_cast<SwitchStmt*>(stmt)->isExhaustive = exhaustive;
             }
             (void)subj;
             break;
@@ -2378,8 +2643,19 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
             if (!c->isBindingPattern && !c->bindings.empty() && c->pattern &&
                 c->pattern->kind == NodeKind::MemberExpr) {
                 auto* pm = static_cast<MemberExpr*>(c->pattern.get());
-                if (pm->base && pm->base->kind == NodeKind::IdentExpr) {
-                    const std::string& bn = static_cast<IdentExpr*>(pm->base.get())->name;
+                auto baseTypeName = [](Node* base) -> std::string {
+                    if (!base) return "";
+                    if (base->kind == NodeKind::IdentExpr)
+                        return static_cast<IdentExpr*>(base)->name;
+                    if (base->kind == NodeKind::GenericExpr) {
+                        Node* inner = static_cast<GenericExpr*>(base)->base.get();
+                        if (inner && inner->kind == NodeKind::IdentExpr)
+                            return static_cast<IdentExpr*>(inner)->name;
+                    }
+                    return "";
+                };
+                const std::string bn = baseTypeName(pm->base.get());
+                if (!bn.empty()) {
                     if (const TypeRecord* rec = findType(bn)) {
                         if (rec->kind == TypeDeclKind::Enum) {
                             for (auto& ci : rec->cases) {
@@ -2388,7 +2664,23 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
                                      i < c->bindings.size() && i < ci.associated.size(); ++i) {
                                     Symbol bs;
                                     bs.kind = Symbol::Kind::Variable;
-                                    bs.type = ci.associated[i];
+                                    // 关联值可能是泛型枚举的类型参数（如 `Box<T>` 的
+                                    // `T`）；按主体类型 `Box<Int>` 的实际实参替换成具体类型。
+                                    const Type* bt = ci.associated[i];
+                                    if (bt && bt->kind == TypeKind::Named) {
+                                        auto pit = std::find(rec->genericParams.begin(),
+                                                             rec->genericParams.end(),
+                                                             bt->name);
+                                        if (pit != rec->genericParams.end()) {
+                                            size_t idx = std::distance(rec->genericParams.begin(),
+                                                                       pit);
+                                            const Type* subjT = switchSubjectType_;
+                                            if (subjT && subjT->kind == TypeKind::Named &&
+                                                idx < subjT->elements.size())
+                                                bt = subjT->elements[idx];
+                                        }
+                                    }
+                                    bs.type = bt;
                                     locals_.declare(c->bindings[i], bs);
                                 }
                             }
@@ -2420,8 +2712,22 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
         }
         case NodeKind::DoStmt: {
             auto* d = static_cast<DoStmt*>(stmt);
-            checkStatements(d->body, context, fnReturnType, isThrowing);
-            for (auto& c : d->catches) checkStatement(c.get(), context, fnReturnType, isThrowing);
+            // 确定性赋值（§1.3）：do 体可能在中途抛错而由 catch 接手，
+            // 两条路径都要考虑，汇合时未赋值集合取并集。
+            {
+                auto beforePending = pendingInit_;
+                checkStatements(d->body, context, fnReturnType, isThrowing);
+                auto bodyPending = pendingInit_;
+                std::unordered_set<std::string> catchMerged;
+                for (auto& c : d->catches) {
+                    pendingInit_ = beforePending;
+                    checkStatement(c.get(), context, fnReturnType, isThrowing);
+                    catchMerged = mergePendingInit(catchMerged, pendingInit_);
+                }
+                pendingInit_ = d->catches.empty()
+                                   ? bodyPending
+                                   : mergePendingInit(bodyPending, catchMerged);
+            }
             break;
         }
         case NodeKind::CatchClause: {
@@ -2454,8 +2760,23 @@ void Sema::checkStatement(Node* stmt, const TypeRecord* context,
             break;
         }
         case NodeKind::BreakStmt:
-        case NodeKind::ContinueStmt:
+        case NodeKind::ContinueStmt: {
+            // 验证标签（若有）指向真实存在的带标签循环（规范 §1.7）。
+            std::string lbl = (stmt->kind == NodeKind::BreakStmt)
+                                  ? static_cast<BreakStmt*>(stmt)->label
+                                  : static_cast<ContinueStmt*>(stmt)->label;
+            if (!lbl.empty()) {
+                bool found = false;
+                for (auto& x : loopLabels_)
+                    if (x == lbl) { found = true; break; }
+                if (!found) {
+                    hadError_ = true;
+                    diags_.reportError("use of undeclared label '" + lbl + "'",
+                                       rangeOf(stmt));
+                }
+            }
             break;
+        }
         case NodeKind::FallthroughStmt:
             // `fallthrough` is only meaningful as the last statement of a
             // non-final switch arm (规范 1.7). Outside a switch it is an error.
@@ -2500,17 +2821,16 @@ bool Sema::alwaysTransfers(Node* stmt) {
             return thenT && elseT;
         }
         case NodeKind::SwitchStmt: {
-            // An exhaustive switch (has `default`) whose every arm transfers
-            // control transfers on all paths.
+            // 穷举的 switch（枚举全 case / 有 `default` / 有 `case let v` 兜底）
+            // 且每个分支都转移控制，则所有路径都转移（规范 1.7）。
             auto* sw = static_cast<SwitchStmt*>(stmt);
-            bool hasDefault = false;
+            if (!sw->isExhaustive) return false;
             for (auto& c : sw->cases) {
                 if (!c || c->kind != NodeKind::CaseClause) continue;
                 auto* cc = static_cast<CaseClause*>(c.get());
-                if (cc->isDefault) hasDefault = true;
                 if (!blockAlwaysTransfers(cc->body)) return false;
             }
-            return hasDefault;
+            return true;
         }
         default:
             return false;
@@ -2531,10 +2851,67 @@ const Type* Sema::checkExpr(Node* e, const TypeRecord* context) {
     return t;
 }
 
+// 整数字面量范围校验（规范 §1.5）。原始文本含可选前缀（0x/0o/0b）、可选符号、
+// 整数字面量范围校验（规范 §1.5）。编译器当前将所有整数字面量按 Int(i64)
+// 处理、类型后缀（i8…u64）在 codegen 端被忽略，故此处以 i64 为唯一基准判
+// 溢出：超界或 ERANGE 时报错，避免静默饱和成错误值（如 0xFFFFFFFFFFFFFFFF
+// 被当作 -1 生成）。这是真实的非生产级安全/正确性缺陷修复。
+void Sema::checkIntegerLiteral(Node* e) {
+    auto* il = static_cast<IntLitExpr*>(e);
+    const std::string& raw = il->value;
+    size_t i = 0;
+    bool neg = false;
+    if (i < raw.size() && (raw[i] == '+' || raw[i] == '-')) { neg = (raw[i] == '-'); ++i; }
+
+    // 基数前缀（0x/0b/0o）与数字部分（含下划线分隔符）。类型后缀（i8…u64）
+    // 在词法上跟在数字之后，但 codegen 忽略之，故此处不收窄宽度，只以 i64 判溢出。
+    int base = 10;
+    size_t p = i;
+    if (p + 1 < raw.size() && raw[p] == '0' &&
+        (raw[p + 1] == 'x' || raw[p + 1] == 'X')) { base = 16; p += 2; }
+    else if (p + 1 < raw.size() && raw[p] == '0' &&
+             (raw[p + 1] == 'b' || raw[p + 1] == 'B')) { base = 2; p += 2; }
+    else if (p + 1 < raw.size() && raw[p] == '0' &&
+             (raw[p + 1] == 'o' || raw[p + 1] == 'O')) { base = 8; p += 2; }
+    while (p < raw.size()) {
+        char c = raw[p];
+        bool ok = (c >= '0' && c <= '9') || c == '_';
+        if (base == 16) ok = ok || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        else if (base == 2) ok = (c == '0' || c == '1' || c == '_');
+        else if (base == 8) ok = (c >= '0' && c <= '7' || c == '_');
+        if (!ok) break;
+        ++p;
+    }
+    std::string digits = raw.substr(i, p - i);
+    // 剥离内部下划线。
+    for (char& c : digits) if (c == '_') c = ' ';
+    digits.erase(std::remove(digits.begin(), digits.end(), ' '), digits.end());
+
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long mag = std::strtoull(digits.c_str(), &end, base);
+    if (errno == ERANGE) {
+        hadError_ = true;
+        diags_.reportError("integer literal '" + raw + "' is out of range", rangeOf(e));
+        return;
+    }
+    // 以 i64 为基准：有效范围为 [-2^63, 2^63-1]。
+    bool overflow = neg ? (mag > 9223372036854775808ULL)
+                        : (mag > 9223372036854775807ULL);
+    if (overflow) {
+        hadError_ = true;
+        diags_.reportError("integer literal '" + raw + "' is out of range for 'Int'",
+                           rangeOf(e));
+    }
+}
+
 const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
     if (!e) return types_.unknownType();
     switch (e->kind) {
-        case NodeKind::IntLitExpr:  return types_.intType();
+        case NodeKind::IntLitExpr: {
+            checkIntegerLiteral(e);
+            return types_.intType();
+        }
         case NodeKind::FloatLitExpr: return types_.doubleType();
         case NodeKind::CharLitExpr:  return types_.charType();
         case NodeKind::BoolLitExpr:  return types_.boolType();
@@ -2599,10 +2976,30 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             // (member access, tuple indexing, overload choice) consumes semaType
             // rather than re-deriving types from syntax.
             if (const Symbol* s = locals_.lookup(name)) {
+                // 规范 §1.3：不允许在任何路径上读取尚未确定赋值的 let。
+                if (!inAssignmentLhs_ && pendingInit_.count(name)) {
+                    hadError_ = true;
+                    diags_.reportError("constant '" + name +
+                                       "' used before being initialized", rangeOf(e));
+                }
                 id->semaType = s->type ? s->type : types_.unknownType();
                 return id->semaType;
             }
             if (const Symbol* s = globals_.lookup(name)) {
+                // 规范 §10.1：跨模块仅 public/open 可见 —— 被导入模块的
+                // internal/fileprivate/private 声明不构成公开接口。
+                if (!isAccessible(s->module, s->access)) {
+                    hadError_ = true;
+                    diags_.reportError("'" + name + "' is inaccessible: it is not "
+                                       "'public' and belongs to another module",
+                                       rangeOf(e));
+                }
+                // 顶层 `let x: Int` 同样受确定性赋值约束。
+                if (!inAssignmentLhs_ && pendingInit_.count(name)) {
+                    hadError_ = true;
+                    diags_.reportError("constant '" + name +
+                                       "' used before being initialized", rangeOf(e));
+                }
                 id->semaType = s->type ? s->type : types_.unknownType();
                 return id->semaType;
             }
@@ -2846,6 +3243,28 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                 if (const TypeRecord* brec = findType(bn))
                     base = types_.named(brec, bn);
             }
+            // 类型化非托管指针特化（规范 §6.5 / §8.1）：`pointee` 与 `deallocate`
+            // 均非普通成员，由 codegen 特化生成。`UnsafeMutablePointer<T>` /
+            // `UnsafePointer<T>` 的类型名可能带泛型后缀（如 `UnsafeMutablePointer<Int>`），
+            // 故按前缀匹配基础类型名。
+            if (base && base->kind == TypeKind::Named && !base->elements.empty()) {
+                const std::string& pn = base->name;
+                auto hasPrefix = [&](const char* p) {
+                    return pn == p || pn.rfind(std::string(p) + "<", 0) == 0;
+                };
+                if ((hasPrefix("UnsafeMutablePointer") || hasPrefix("UnsafePointer")) &&
+                    m->member == "pointee") {
+                    m->isUnsafePointee = true;
+                    m->isUnsafePointeeMutable = hasPrefix("UnsafeMutablePointer");
+                    m->semaType = base->elements[0];
+                    return m->semaType;
+                }
+                if (hasPrefix("UnsafeMutablePointer") && m->member == "deallocate") {
+                    m->isUnsafeDeallocate = true;
+                    m->semaType = types_.voidType();
+                    return m->semaType;
+                }
+            }
             // Tuple element access `t.0`: the member name is the index.
             if (base && base->kind == TypeKind::Tuple) {
                 size_t idx = 0;
@@ -2893,6 +3312,24 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             for (auto& idx : s->indices) checkExpr(idx.get(), context);
             if (!base) return types_.unknownType();
             if (base->kind == TypeKind::Optional) base = base->element;
+            // 类型化缓冲指针下标（规范 §6.5 / §8.1）：编译器特化。
+            // `Unsafe{Mutable}BufferPointer<T>` 的下标并非运行时调用，而是由
+            // codegen 经 inttoptr(base.raw + idx*stride) + load/store 实现。
+            if (base->kind == TypeKind::Named && !base->elements.empty()) {
+                const std::string& pn = base->name;
+                // 类型名可能带泛型实参后缀（如 `UnsafeMutableBufferPointer<Int>`），
+                // 故按前缀匹配（规范 §6.5 / §8.1）。
+                auto hasPrefix = [&](const char* p) {
+                    return pn == p || pn.rfind(std::string(p) + "<", 0) == 0;
+                };
+                if (hasPrefix("UnsafeMutableBufferPointer") ||
+                    hasPrefix("UnsafeBufferPointer")) {
+                    s->isUnsafeBufferSubscript = true;
+                    s->isUnsafeBufferMutable = hasPrefix("UnsafeMutableBufferPointer");
+                    s->semaType = base->elements[0];
+                    return s->semaType;
+                }
+            }
             if (base->kind == TypeKind::Array) return base->element;
             if (base->kind == TypeKind::Dict) return base->value;
             return types_.unknownType();
@@ -2920,8 +3357,34 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         case NodeKind::AssignmentExpr: {
             auto* a = static_cast<AssignmentExpr*>(e);
+            // 确定性赋值（§1.3）：左值是「写入」而非「读取」，不得触发
+            // 「使用前未初始化」检查，否则 `let v: Int; v = 1` 会误报。
+            const bool savedLhs = inAssignmentLhs_;
+            inAssignmentLhs_ = true;
             const Type* lt = checkExpr(a->lhs.get(), context);
+            inAssignmentLhs_ = savedLhs;
             const Type* rt = checkExpr(a->rhs.get(), context);
+            // 不可变类型化指针禁止写入（规范 §6.5）：UnsafePointer / UnsafeBufferPointer
+            // 的 pointee / 下标仅可读，赋值须改用 UnsafeMutable* 变体。
+            if (a->lhs) {
+                if (a->lhs->kind == NodeKind::MemberExpr) {
+                    auto* pm = static_cast<MemberExpr*>(a->lhs.get());
+                    if (pm->isUnsafePointee && !pm->isUnsafePointeeMutable) {
+                        hadError_ = true;
+                        diags_.reportError(
+                            "cannot assign to immutable 'pointee' of 'UnsafePointer' "
+                            "(use 'UnsafeMutablePointer')", rangeOf(a->lhs.get()));
+                    }
+                } else if (a->lhs->kind == NodeKind::SubscriptExpr) {
+                    auto* ps = static_cast<SubscriptExpr*>(a->lhs.get());
+                    if (ps->isUnsafeBufferSubscript && !ps->isUnsafeBufferMutable) {
+                        hadError_ = true;
+                        diags_.reportError(
+                            "cannot assign to immutable subscript of 'UnsafeBufferPointer' "
+                            "(use 'UnsafeMutableBufferPointer')", rangeOf(a->lhs.get()));
+                    }
+                }
+            }
             if (a->lhs && a->lhs->kind == NodeKind::IdentExpr) {
                 const std::string& nm = static_cast<IdentExpr*>(a->lhs.get())->name;
                 bool isLet = false;
@@ -2943,6 +3406,45 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         case NodeKind::CallExpr: {
             auto* c = static_cast<CallExpr*>(e);
+            // `unsafeBitCast<From, To>(value)`（规范 §6.3 C 互操作）：将 value 的
+            // 位模式按 To 类型重新解释。泛型实参给出源 / 目标类型，单个实参为被
+            // 重解释的值——编译器特化其类型与 codegen 行为，不走常规函数查表。
+            if (c->callee && c->callee->kind == NodeKind::GenericExpr) {
+                auto* g = static_cast<GenericExpr*>(c->callee.get());
+                if (g->base && g->base->kind == NodeKind::IdentExpr &&
+                    static_cast<IdentExpr*>(g->base.get())->name == "unsafeBitCast") {
+                    if (g->args.size() != 2) {
+                        hadError_ = true;
+                        diags_.reportError("unsafeBitCast requires exactly two type "
+                                           "arguments '<From, To>'", rangeOf(c));
+                        return types_.unknownType();
+                    }
+                    const Type* from = resolveTypeRepr(g->args[0].get(), context);
+                    const Type* to   = resolveTypeRepr(g->args[1].get(), context);
+                    if (c->arguments.size() != 1) {
+                        hadError_ = true;
+                        diags_.reportError("unsafeBitCast takes exactly one value "
+                                           "argument", rangeOf(c));
+                        return types_.unknownType();
+                    }
+                    const Type* argT = checkExpr(c->arguments[0].get(), context);
+                    if (from && argT && !isIdentical(from, argT) &&
+                        !isAssignable(from, argT)) {
+                        hadError_ = true;
+                        diags_.reportError("unsafeBitCast: argument of type '" +
+                                               typeToString(argT) +
+                                               "' does not match source '" +
+                                               typeToString(from) + "'",
+                                           rangeOf(c));
+                        return types_.unknownType();
+                    }
+                    c->isUnsafeBitCast = true;
+                    c->bitCastFrom = from;
+                    c->bitCastTo = to;
+                    e->semaType = to;
+                    return to;
+                }
+            }
             // A generic type's constructor (`Box<Int>(value:)`) names the type in a
             // GenericExpr; it yields an instance of the monomorphised type rather
             // than a function's result, so the binding and later member access see
@@ -3007,25 +3509,58 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
             // here and require the payload arity to match the declaration.
             if (c->callee && c->callee->kind == NodeKind::MemberExpr) {
                 auto* m = static_cast<MemberExpr*>(c->callee.get());
+                // 枚举 case 构造：支持 `E.case(...)`（非泛型）与 `E<Int>.case(...)`
+                // （泛型枚举）。泛型时返回单态化实例类型，使 `let b = E<Int>.case(x)`
+                // 的推断类型即实例类型。
+                const TypeRecord* rec = nullptr;
+                const Type* recType = nullptr;
                 if (m->base && m->base->kind == NodeKind::IdentExpr) {
                     const std::string& bn = static_cast<IdentExpr*>(m->base.get())->name;
-                    if (const TypeRecord* rec = findType(bn)) {
-                        if (rec->kind == TypeDeclKind::Enum) {
-                            for (auto& a : c->arguments) checkExpr(a.get(), context);
-                            for (size_t i = 0; i < rec->cases.size(); ++i) {
-                                if (rec->cases[i].name != m->member) continue;
-                                size_t want = rec->cases[i].associated.size();
-                                if (c->arguments.size() != want) {
-                                    hadError_ = true;
-                                    diags_.reportError(
-                                        "enum case '" + rec->name + "." + m->member +
-                                        "' expects " + std::to_string(want) +
-                                        " value(s), got " +
-                                        std::to_string(c->arguments.size()));
-                                }
-                                return types_.named(rec, rec->name);
+                    rec = findType(bn);
+                    if (rec) recType = types_.named(rec, rec->name);
+                } else if (m->base && m->base->kind == NodeKind::GenericExpr) {
+                    auto* g = static_cast<GenericExpr*>(m->base.get());
+                    if (g->base && g->base->kind == NodeKind::IdentExpr) {
+                        const std::string& bn =
+                            static_cast<IdentExpr*>(g->base.get())->name;
+                        const TypeRecord* gr = findType(bn);
+                        if (gr && !gr->genericParams.empty() &&
+                            g->args.size() == gr->genericParams.size()) {
+                            std::vector<const Type*> args;
+                            for (auto& a : g->args)
+                                args.push_back(resolveTypeRepr(a.get(), context));
+                            bool concrete = true;
+                            for (const Type* a : args)
+                                if (!a || a->kind == TypeKind::Unknown)
+                                    { concrete = false; break; }
+                            if (concrete) {
+                                const Type* instTy = monomorphiseGenericType(gr, bn, args);
+                                rec = instTy ? instTy->record : nullptr;
+                                recType = instTy;
                             }
                         }
+                    }
+                }
+                if (rec && rec->kind == TypeDeclKind::Enum) {
+                    // 必须先对基类做类型检查，设置 `m->base->semaType`——
+                    // codegen 的 enumCaseOf 依赖它定位枚举记录与 case（否则构造
+                    // 表达式不会生成）。
+                    checkExpr(m->base.get(), context);
+                    c->callee->semaType = recType;
+                    m->semaType = recType;
+                    for (auto& a : c->arguments) checkExpr(a.get(), context);
+                    for (size_t i = 0; i < rec->cases.size(); ++i) {
+                        if (rec->cases[i].name != m->member) continue;
+                        size_t want = rec->cases[i].associated.size();
+                        if (c->arguments.size() != want) {
+                            hadError_ = true;
+                            diags_.reportError(
+                                "enum case '" + rec->name + "." + m->member +
+                                "' expects " + std::to_string(want) +
+                                " value(s), got " +
+                                std::to_string(c->arguments.size()));
+                        }
+                        return recType;
                     }
                 }
             }
@@ -3075,6 +3610,13 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                         for (const Type* at : argTypes)
                             targs.push_back(typeToString(inferTypeArgument(at)));
                         recordGenericInstance(fname, targs);
+                        // Keep the resolved type arguments on the call so codegen
+                        // can locate the exact monomorphised instance (规范 5.2):
+                        // the symbol built from these strings matches the one the
+                        // monomorphiser emits, which fixes generic functions with
+                        // 2+ type parameters that previously fell back to the first
+                        // instance and crashed.
+                        c->genericTypeArgs = targs;
                         // Resolve the call's result type against this
                         // instantiation, so `let n = f(x)` learns the concrete
                         // type instead of inheriting the opaque one.
@@ -3670,6 +4212,7 @@ void Sema::expandDeclListContainers(Node* n) {
     }
     case NodeKind::GuardStmt: each(static_cast<GuardStmt*>(n)->elseBody); break;
     case NodeKind::WhileStmt: each(static_cast<WhileStmt*>(n)->body); break;
+    case NodeKind::LoopStmt: each(static_cast<LoopStmt*>(n)->body); break;
     case NodeKind::RepeatWhileStmt: each(static_cast<RepeatWhileStmt*>(n)->body); break;
     case NodeKind::ForInStmt: each(static_cast<ForInStmt*>(n)->body); break;
     case NodeKind::DoStmt: each(static_cast<DoStmt*>(n)->body); break;
@@ -3796,6 +4339,8 @@ void Sema::walkChildren(Node* n, std::function<void(NodePtr&)> fn) {
         fn(s->condition); each(s->elseBody); break; }
     case NodeKind::WhileStmt: { auto* s = static_cast<WhileStmt*>(n);
         fn(s->condition); each(s->body); break; }
+    case NodeKind::LoopStmt: { auto* s = static_cast<LoopStmt*>(n);
+        each(s->body); break; }
     case NodeKind::RepeatWhileStmt: { auto* s = static_cast<RepeatWhileStmt*>(n);
         each(s->body); fn(s->condition); break; }
     case NodeKind::ForInStmt: { auto* s = static_cast<ForInStmt*>(n);
@@ -3855,6 +4400,60 @@ void Sema::walkChildren(Node* n, std::function<void(NodePtr&)> fn) {
         break; }
     default:
         break;
+    }
+}
+
+// ─── 裸机属性校验（规范 §8.7）────────────────────────────────────────────────
+// `@panic_handler` 的函数签名须为 `func panic(info: PanicInfo) -> Never`；
+// `@global_allocator` 的类型须遵守 `GlobalAlloc` 协议。两者各至多一个，
+// 校验通过后记录于 panicHandlerFn_ / globalAllocatorDecl_ 供 codegen 取用。
+void Sema::validateBareMetalAttrs(const NodeList& decls) {
+    auto hasAttribute = [](const Node* n, const char* attr) {
+        for (const auto& a : n->attributes) if (a == attr) return true;
+        return false;
+    };
+    for (auto& d : decls) {
+        if (!d) continue;
+        if (d->kind == NodeKind::FunctionDecl) {
+            auto* fn = static_cast<FunctionDecl*>(d.get());
+            if (!hasAttribute(fn, "panic_handler")) continue;
+            bool ok = (fn->params.size() == 1);
+            if (ok) {
+                const Type* pt = fn->params[0].semaType;
+                if (!pt || pt->kind != TypeKind::Named || pt->name != "PanicInfo") ok = false;
+            }
+            // 返回类型现解一次：标注节点的缓存 semaType 在部分路径下仍为
+            // Unknown，直接按类型标注解析可稳定得到 `Never`。
+            const Type* rt =
+                fn->returnType ? resolveTypeRepr(fn->returnType.get(), nullptr) : nullptr;
+            if (!rt || rt->kind != TypeKind::Never) ok = false;
+            if (!ok) {
+                hadError_ = true;
+                diags_.reportError(
+                    "'@panic_handler' requires signature 'func panic(info: PanicInfo) -> Never'",
+                    rangeOf(d.get()));
+            } else if (!panicHandlerFn_) {
+                panicHandlerFn_ = fn;
+            } else {
+                hadError_ = true;
+                diags_.reportError("duplicate '@panic_handler' function", rangeOf(d.get()));
+            }
+        } else if (d->kind == NodeKind::StructDecl || d->kind == NodeKind::ClassDecl ||
+                   d->kind == NodeKind::EnumDecl) {
+            auto* td = static_cast<TypeDecl*>(d.get());
+            if (!hasAttribute(td, "global_allocator")) continue;
+            bool conforms = td->semaType ? typeConformsTo(td->semaType, "GlobalAlloc") : false;
+            if (!conforms) {
+                hadError_ = true;
+                diags_.reportError(
+                    "'@global_allocator' type must conform to 'GlobalAlloc'", rangeOf(d.get()));
+            } else if (!globalAllocatorDecl_) {
+                globalAllocatorDecl_ = td;
+            } else {
+                hadError_ = true;
+                diags_.reportError("duplicate '@global_allocator' type", rangeOf(d.get()));
+            }
+        }
     }
 }
 

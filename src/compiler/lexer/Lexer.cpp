@@ -1,5 +1,9 @@
 #include "compiler/lexer/Lexer.h"
 
+// 规范 §10.3：条件编译的 os()/arch() 谓词需要目标三元组，取自 TargetInfo
+// （该头文件不含 LLVM，可由任意阶段引用）。
+#include "compiler/codegen/TargetInfo.h"
+
 #include <cctype>
 #include <cstdlib>
 #include <unordered_map>
@@ -62,13 +66,45 @@ bool dDefined(const std::unordered_map<std::string, std::string>& macros, const 
     return macros.find(id) != macros.end();
 }
 
-bool dCondOr(const std::vector<Token>&, size_t&, const std::unordered_map<std::string, std::string>&, DiagnosticEngine&);
+// 条件编译求值环境（规范 §10.3）：宏表 + 由目标三元组推导出的 os / arch。
+struct CondEnv {
+    const std::unordered_map<std::string, std::string>* macros = nullptr;
+    std::string os;    // 规范化系统名，如 "Linux"
+    std::string arch;  // 规范化架构名，如 "x86_64"
+};
+
+static std::string toLowerCopy(std::string v) {
+    for (char& c : v) c = (char)std::tolower((unsigned char)c);
+    return v;
+}
+// os()/arch() 的名字比对：忽略大小写，并接受规范 §10.3 取值之外的常见等价写法
+// （如 amd64↔x86_64、aarch64↔arm64、darwin↔macOS）。
+static bool targetNameMatches(const std::string& have, const std::string& want) {
+    std::string a = toLowerCopy(have), b = toLowerCopy(want);
+    if (a == b) return true;
+    if (b == "x86_64" || b == "amd64" || b == "x64") return a == "x86_64";
+    if (b == "arm64" || b == "aarch64") return a == "arm64";
+    if (b == "i386" || b == "i686" || b == "x86" || b == "x86_32") return a == "i386";
+    if (b == "arm" || b == "armv7" || b == "arm32") return a == "arm";
+    if (b == "riscv64" || b == "riscv") return a == "riscv64";
+    if (b == "macos" || b == "darwin" || b == "osx") return a == "macos";
+    if (b == "linux" || b == "gnu" || b == "musl") return a == "linux";
+    if (b == "windows" || b == "win32" || b == "win64") return a == "windows";
+    if (b == "ios" || b == "iphoneos") return a == "ios";
+    return false;
+}
+
+// 规范 §10.3 的 suki(>=X.Y)：与编译器版本比较。取值与 main.cpp 的 kVersion
+// "0.1.0" 保持一致（只取 主版本.次版本 参与比较）。
+static const double kCompilerVersionNum = 0.1;
+
+bool dCondOr(const std::vector<Token>&, size_t&, const CondEnv&, DiagnosticEngine&);
 bool dCondPrimary(const std::vector<Token>& t, size_t& i,
-                  const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+                  const CondEnv& env, DiagnosticEngine& diags) {
     if (i >= t.size()) { diags.reportError("unexpected end of #if condition"); return false; }
     const Token& p = t[i];
     if (p.isPunct(PunctuatorID::LParen)) {
-        ++i; bool v = dCondOr(t, i, macros, diags);
+        ++i; bool v = dCondOr(t, i, env, diags);
         if (i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
         return v;
     }
@@ -82,7 +118,7 @@ bool dCondPrimary(const std::vector<Token>& t, size_t& i,
             }
             std::string id = t[i].text; ++i;
             if (hasParen && i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
-            return dDefined(macros, id);
+            return dDefined(*env.macros, id);
         }
         if (s == "canImport") {
             if (i < t.size() && t[i].isPunct(PunctuatorID::LParen)) ++i;
@@ -90,7 +126,85 @@ bool dCondPrimary(const std::vector<Token>& t, size_t& i,
             if (i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
             return false; // 跳过标准库时 canImport 视为不可用
         }
-        if (dDefined(macros, s)) return true;
+        // 规范 §10.3：os(Linux) / arch(x86_64) —— 与目标三元组推导的取值比对。
+        if (s == "os" || s == "arch") {
+            bool hasParen = i < t.size() && t[i].isPunct(PunctuatorID::LParen);
+            if (hasParen) ++i;
+            if (i >= t.size() || t[i].kind != TokenKind::TK_Identifier) {
+                diags.reportError("expected " + std::string(s == "os" ? "OS" : "architecture") +
+                                  " name inside '" + s + "()' in #if condition");
+                return false;
+            }
+            std::string want = t[i].text; ++i;
+            if (hasParen && i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
+            return targetNameMatches(s == "os" ? env.os : env.arch, want);
+        }
+        // 规范 §10.3：suki(>=1.0) —— 编译器版本比较。
+        if (s == "suki") {
+            bool hasParen = i < t.size() && t[i].isPunct(PunctuatorID::LParen);
+            if (hasParen) ++i;
+            PunctuatorID op = PunctuatorID::GreaterEqual;
+            if (i < t.size() &&
+                (t[i].isPunct(PunctuatorID::GreaterEqual) || t[i].isPunct(PunctuatorID::LessEqual) ||
+                 t[i].isPunct(PunctuatorID::Greater) || t[i].isPunct(PunctuatorID::Less) ||
+                 t[i].isPunct(PunctuatorID::EqualEqual) || t[i].isPunct(PunctuatorID::BangEqual))) {
+                op = t[i].punct; ++i;
+            }
+            double want = 0.0;
+            if (i < t.size() &&
+                (t[i].kind == TokenKind::TK_FloatLiteral || t[i].kind == TokenKind::TK_IntLiteral)) {
+                want = std::strtod(t[i].numberText.c_str(), nullptr); ++i;
+            } else {
+                diags.reportError("expected version number inside 'suki()' in #if condition");
+                return false;
+            }
+            if (hasParen && i < t.size() && t[i].isPunct(PunctuatorID::RParen)) ++i;
+            switch (op) {
+                case PunctuatorID::GreaterEqual: return kCompilerVersionNum >= want;
+                case PunctuatorID::LessEqual:    return kCompilerVersionNum <= want;
+                case PunctuatorID::Greater:      return kCompilerVersionNum >  want;
+                case PunctuatorID::Less:         return kCompilerVersionNum <  want;
+                case PunctuatorID::EqualEqual:   return kCompilerVersionNum == want;
+                case PunctuatorID::BangEqual:    return kCompilerVersionNum != want;
+                default: return false;
+            }
+        }
+        if (dDefined(*env.macros, s)) {
+            // 规范 §10.3：`-D LEVEL=5` 后 `#if LEVEL == 5` 需按宏值的数值比较。
+            // 若宏值是整数且其后紧跟比较运算符，则解析宏值为整数并比较；否则
+            // 仅作「已定义」布尔判定。
+            if (i < t.size() &&
+                (t[i].isPunct(PunctuatorID::EqualEqual) ||
+                 t[i].isPunct(PunctuatorID::BangEqual) ||
+                 t[i].isPunct(PunctuatorID::Less) ||
+                 t[i].isPunct(PunctuatorID::Greater) ||
+                 t[i].isPunct(PunctuatorID::LessEqual) ||
+                 t[i].isPunct(PunctuatorID::GreaterEqual))) {
+                PunctuatorID op = t[i].punct; ++i;
+                long long lhs = 0;
+                auto mvIt = env.macros->find(s);
+                if (mvIt != env.macros->end() && !mvIt->second.empty()) {
+                    char* endp = nullptr;
+                    long long parsed = std::strtoll(mvIt->second.c_str(), &endp, 10);
+                    if (endp != mvIt->second.c_str() && *endp == '\0') lhs = parsed;
+                }
+                long long rhs = 0;
+                if (i < t.size() && t[i].kind == TokenKind::TK_IntLiteral)
+                    rhs = std::strtoll(t[i].numberText.c_str(), nullptr, 10);
+                else { diags.reportError("invalid #if comparison"); return false; }
+                ++i;
+                switch (op) {
+                    case PunctuatorID::EqualEqual:    return lhs == rhs;
+                    case PunctuatorID::BangEqual:     return lhs != rhs;
+                    case PunctuatorID::Less:          return lhs <  rhs;
+                    case PunctuatorID::Greater:       return lhs >  rhs;
+                    case PunctuatorID::LessEqual:     return lhs <= rhs;
+                    case PunctuatorID::GreaterEqual:  return lhs >= rhs;
+                    default: return false;
+                }
+            }
+            return true;
+        }
         if (s == "compilerVersion") return true;
         diags.reportError("use of undeclared identifier '" + s + "' in #if condition");
         return false;
@@ -125,36 +239,55 @@ bool dCondPrimary(const std::vector<Token>& t, size_t& i,
     diags.reportError("invalid #if condition"); ++i; return false;
 }
 bool dCondUnary(const std::vector<Token>& t, size_t& i,
-                const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
-    if (i < t.size() && t[i].isPunct(PunctuatorID::Bang)) { ++i; return !dCondUnary(t, i, macros, diags); }
-    return dCondPrimary(t, i, macros, diags);
+                const CondEnv& env, DiagnosticEngine& diags) {
+    if (i < t.size() && t[i].isPunct(PunctuatorID::Bang)) { ++i; return !dCondUnary(t, i, env, diags); }
+    return dCondPrimary(t, i, env, diags);
 }
 bool dCondAnd(const std::vector<Token>& t, size_t& i,
-              const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
-    bool l = dCondUnary(t, i, macros, diags);
+              const CondEnv& env, DiagnosticEngine& diags) {
+    bool l = dCondUnary(t, i, env, diags);
     while (i < t.size() && t[i].isPunct(PunctuatorID::AmpAmp)) {
-        ++i; bool r = dCondUnary(t, i, macros, diags); l = l && r;
+        ++i; bool r = dCondUnary(t, i, env, diags); l = l && r;
     }
     return l;
 }
 bool dCondOr(const std::vector<Token>& t, size_t& i,
-             const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
-    bool l = dCondAnd(t, i, macros, diags);
+             const CondEnv& env, DiagnosticEngine& diags) {
+    bool l = dCondAnd(t, i, env, diags);
     while (i < t.size() && t[i].isPunct(PunctuatorID::PipePipe)) {
-        ++i; bool r = dCondAnd(t, i, macros, diags); l = l || r;
+        ++i; bool r = dCondAnd(t, i, env, diags); l = l || r;
     }
     return l;
 }
 bool evalDirectiveCond(const std::vector<Token>& t,
-                       const std::unordered_map<std::string, std::string>& macros, DiagnosticEngine& diags) {
+                       const CondEnv& env, DiagnosticEngine& diags) {
     size_t i = 0;
-    return dCondOr(t, i, macros, diags);
+    return dCondOr(t, i, env, diags);
 }
 
-std::vector<Token> preprocess(std::vector<Token> toks, DiagnosticEngine& diags) {
+std::vector<Token> preprocess(std::vector<Token> toks, DiagnosticEngine& diags,
+                              const std::string& targetTriple,
+                              const std::vector<std::string>* userDefines = nullptr) {
     std::vector<Token> out;
     std::unordered_map<std::string, std::string> macros;
     macros["compilerVersion"] = "1"; // 内置宏
+    // 规范 §10.3：注入 `-D NAME[=VALUE]` 提供的自定义宏。
+    if (userDefines) {
+        for (const auto& d : *userDefines) {
+            size_t eq = d.find('=');
+            if (eq == std::string::npos) macros[d] = "";
+            else macros[d.substr(0, eq)] = d.substr(eq + 1);
+        }
+    }
+    // 规范 §10.3：os()/arch() 的取值来自目标三元组；空三元组回退到主机目标。
+    CondEnv env;
+    env.macros = &macros;
+    {
+        TargetInfo ti;
+        if (targetTriple.empty()) ti = hostTarget();
+        else if (!getTargetInfo(targetTriple, ti)) ti = hostTarget();
+        env.os = ti.os; env.arch = ti.arch;
+    }
     struct CondFrame { bool inTakenBranch; bool anyTaken; bool elseSeen; };
     std::vector<CondFrame> stack;
     auto emitNow = [&]() -> bool {
@@ -187,7 +320,7 @@ std::vector<Token> preprocess(std::vector<Token> toks, DiagnosticEngine& diags) 
             bool parentEmit = enclosingEmit();
             if (dname == "if") {
                 auto body = collect(dirLine);
-                bool val = evalDirectiveCond(body, macros, diags);
+                bool val = evalDirectiveCond(body, env, diags);
                 CondFrame f; f.inTakenBranch = parentEmit && val; f.anyTaken = f.inTakenBranch; f.elseSeen = false;
                 stack.push_back(f);
             } else if (dname == "else") {
@@ -197,12 +330,13 @@ std::vector<Token> preprocess(std::vector<Token> toks, DiagnosticEngine& diags) 
                 f.elseSeen = true;
                 bool taken = parentEmit && !f.anyTaken; if (taken) f.anyTaken = true;
                 f.inTakenBranch = taken;
-            } else if (dname == "elif") {
+            // 规范 §10.3 的示例使用 `#elseif`，故与 `#elif` 等价处理。
+            } else if (dname == "elif" || dname == "elseif") {
                 if (stack.empty()) { diags.reportError("#elif without matching #if"); break; }
                 auto body = collect(dirLine);
                 CondFrame& f = stack.back();
                 if (f.elseSeen) diags.reportError("#elif after #else");
-                bool val = evalDirectiveCond(body, macros, diags);
+                bool val = evalDirectiveCond(body, env, diags);
                 bool taken = parentEmit && !f.anyTaken && val; if (taken) f.anyTaken = true;
                 f.inTakenBranch = taken;
             } else if (dname == "endif") {
@@ -256,7 +390,7 @@ std::vector<Token> Lexer::tokenizeAll() {
         toks.push_back(t);
         if (t.kind == TokenKind::TK_EOF) break;
     }
-    return preprocess(std::move(toks), diags_);
+    return preprocess(std::move(toks), diags_, targetTriple_, &userDefines_);
 }
 
 void Lexer::advance() {

@@ -1,0 +1,9 @@
+import memory
+
+// 规范 §10.1 访问控制：`internal` 声明不构成模块的公开接口，
+// 跨模块访问必须被拒绝。期望：`sukic check` 拒绝本文件。
+
+@main
+func main() -> Int {
+    return memoryInternalHelper()
+}

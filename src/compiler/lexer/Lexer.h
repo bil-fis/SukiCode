@@ -19,6 +19,15 @@ class Lexer {
 public:
     Lexer(std::string source, DiagnosticEngine& diags);
 
+    // 设定条件编译（`os(...)` / `arch(...)`，规范 §10.3）所用的目标三元组。
+    // 未显式设定时回退到主机目标，因此默认行为与 `sukic run`（本机执行）一致。
+    void setTargetTriple(std::string triple) { targetTriple_ = std::move(triple); }
+
+    // 规范 §10.3：通过 `-D NAME[=VALUE]` 注入的自定义宏，参与条件编译求值。
+    // 形如 `-D FLAG`（无值）等价于定义为空串；`-D LEVEL=5` 定义为 "5"，
+    // 可在 `#if` 中按数值比较（见 dCondPrimary）。
+    void setDefines(std::vector<std::string> defs) { userDefines_ = std::move(defs); }
+
     // Tokenize the whole input (EOF token included at the end).
     std::vector<Token> tokenizeAll();
 
@@ -48,6 +57,8 @@ private:
     Token stringEndToken();
 
     std::string source_;
+    std::string targetTriple_;     // 条件编译目标（空 = 主机目标）
+    std::vector<std::string> userDefines_; // 规范 §10.3：`-D NAME[=VALUE]` 注入的宏
     size_t pos_   = 0;
     size_t line_  = 1;
     size_t col_   = 1;

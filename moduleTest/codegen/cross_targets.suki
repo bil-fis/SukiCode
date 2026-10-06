@@ -1,0 +1,6 @@
+// 最小可运行程序，用于验证多目标代码生成（ELF/COFF/Mach-O 对象产出）。
+// codegen 测试约定：以 `return 0` 表示成功（非 0 视为断言失败）。
+@main
+func main() -> Int {
+    return 0
+}

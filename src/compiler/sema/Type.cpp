@@ -83,8 +83,10 @@ const Type* TypeContext::tuple(std::vector<const Type*> elems,
     if (t.labels.empty()) return intern(t);
     return alloc(t);
 }
-const Type* TypeContext::function(std::vector<const Type*> params, const Type* ret) {
+const Type* TypeContext::function(std::vector<const Type*> params, const Type* ret,
+                               CallConv cc) {
     Type f; f.kind = TypeKind::Function; f.elements = std::move(params); f.ret = ret;
+    f.callConv = cc;
     return alloc(f);
 }
 const Type* TypeContext::closure(std::vector<const Type*> params, const Type* ret,

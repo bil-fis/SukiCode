@@ -1,0 +1,20 @@
+// 规范 §1.3 确定性赋值：不允许在任何路径上读取尚未赋值的 `let`，
+// 也不允许只在部分分支赋值（所有路径必须恰好赋值一次）。
+// 期望：`sukic check` 拒绝本文件。
+
+func useBeforeInit() -> Int {
+    let v: Int
+    return v          // 读取未赋值
+}
+
+func partialBranch(c: Bool) -> Int {
+    let v: Int
+    if (c) { v = 1 }  // 仅 then 分支赋值，else 路径未赋值
+    return v
+}
+
+func loopOnly(c: Bool) -> Int {
+    let v: Int
+    while (c) { v = 1 }   // 循环体可能执行 0 次
+    return v
+}

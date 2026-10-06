@@ -58,7 +58,11 @@ add_custom_command(
 add_custom_target(suki_runtime_o DEPENDS "${SUKI_RUNTIME_O}")
 add_dependencies(sukic suki_runtime_o)
 target_compile_definitions(sukic PRIVATE
-    SUKI_RUNTIME_OBJECT="${SUKI_RUNTIME_O}")
+    SUKI_RUNTIME_OBJECT="${SUKI_RUNTIME_O}"
+    # 交叉编译目标时，驱动会按 --target 即时编译 runtime.c 作为该目标的运行时
+    # 对象，因此需要 runtime.c 源文件与其包含目录的绝对路径。
+    SUKI_RUNTIME_SOURCE="${CMAKE_SOURCE_DIR}/src/runtime/runtime.c"
+    SUKI_RUNTIME_INCLUDE="${CMAKE_SOURCE_DIR}/src/runtime")
 
 # 标准库：目录 + 模块文件清单，供驱动在编译期按 `import` 解析（见 main.cpp
 # 的 loadImportedStdlib）。文件清单在配置期 glob 得到，新增 .suki 模块后需重跑 cmake。

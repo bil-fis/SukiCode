@@ -32,7 +32,7 @@ enum class NodeKind {
     VarDecl, AccessorDecl, TypealiasDecl, EnumCaseDecl, AssociatedTypeDecl, MacroDecl,
     ActorDecl,
     // Statements
-    BlockStmt, ExprStmt, ReturnStmt, IfStmt, GuardStmt, WhileStmt,
+    BlockStmt, ExprStmt, ReturnStmt, IfStmt, GuardStmt, WhileStmt, LoopStmt,
     RepeatWhileStmt, ForInStmt, SwitchStmt, CaseClause, BreakStmt,
     ContinueStmt, DeferStmt, DoStmt, CatchClause, ThrowStmt, UnsafeStmt,
     // `fallthrough` — 显式落入下一个 case（规范 1.7 保留的关键字）。
@@ -54,6 +54,10 @@ struct Node {
     SourceRange range;
     std::string docComment;
     std::vector<std::string> attributes; // e.g. "main" from @main
+    // 声明所属模块（规范 §10.1 访问控制）：由被 `import` 载入的标准库/其它模块
+    // 的声明会被打上模块名；用户主模块的声明为空串。访问控制据此判断
+    // 「同模块」还是「跨模块」，跨模块仅 public/open 可见。
+    std::string sourceModule;
 
     // Semantic type resolved by Sema and consumed by the code generator. This
     // is the single source of truth for lowering: IRGenerator prefers it and
@@ -161,6 +165,9 @@ struct FunctionDecl : Node {
     NodeList body;           // statements; empty if external (`foreign`)
     bool isForeign = false;
     std::string cdeclName;                         // @_cdecl("name")：外部符号名（P6.3）
+    // @convention(c|stdcall) 声明属性（规范 §6.3）：标记该函数使用 C / Win32
+    // stdcall 调用约定。空串表示默认（目标平台约定）。
+    std::string convention;
     // True for a `func` in a protocol whose body supplies the default
     // implementation (规范 4.5). Such a member is lowered into every conforming
     // type but must not be type-checked again there.
@@ -291,6 +298,12 @@ struct WhileStmt : Node {
     NodeList body;
 };
 
+struct LoopStmt : Node {
+    LoopStmt() : Node(NodeKind::LoopStmt) {}
+    std::string label;   // optional, e.g. `outer: loop { … break outer }` (规范 §1.7)
+    NodeList body;
+};
+
 struct RepeatWhileStmt : Node {
     RepeatWhileStmt() : Node(NodeKind::RepeatWhileStmt) {}
     NodeList body;
@@ -313,6 +326,9 @@ struct SwitchStmt : Node {
     // case pattern is a channel operation rather than a value comparison
     // (规范 7.5). The flag keeps the two apart without a second node kind.
     bool isSelect = false;
+    // 由 Sema 在穷举检查中填写：switch 是否覆盖所有可能（枚举全 case / 有
+    // `default` / 有 `case let v` 兜底），用于 missing-return 判定（规范 1.7）。
+    bool isExhaustive = false;
 };
 
 struct CaseClause : Node {
@@ -452,6 +468,18 @@ struct CallExpr : Node {
     std::vector<std::string> argumentLabels; // "" for positional
     std::vector<NodePtr> arguments;
     bool hasTrailingClosure = false;
+    // `unsafeBitCast<From, To>(value)`（规范 §6.3 C 互操作）：编译器特化，
+    // 将 value 的位模式按 To 类型重新解释。bitCastFrom/To 记录源/目标类型供
+    // codegen 发射 reinterpret（alloca 中转以避免跨尺寸 bitcast 限制）。
+    bool isUnsafeBitCast = false;
+    const Type* bitCastFrom = nullptr;
+    const Type* bitCastTo = nullptr;
+    // When the callee is a generic function, Sema records the resolved type
+    // arguments (the concrete bindings for T, U, ...) here. The code generator
+    // uses these exact strings to build the monomorphised instance symbol, so it
+    // matches the name produced by the monomorphiser and no longer falls back to
+    // the wrong (first) instance for functions with 2+ type parameters.
+    std::vector<std::string> genericTypeArgs;
 };
 
 struct MemberExpr : Node {
@@ -461,12 +489,24 @@ struct MemberExpr : Node {
     bool optionalChain = false; // base?.member
     bool isMemoryLayoutQuery = false;        // MemoryLayout<T>.size/stride/alignment（规范 P4.5）
     const Type* memoryLayoutType = nullptr;  // 关联类型 T（供 codegen 查布局）
+    // 类型化非托管指针的 `pointee` 访问（规范 §6.5 / §8.1）：编译器特化，
+    // 经 inttoptr + load/store 按元素类型 T 读写，而非普通字段/计算属性。
+    bool isUnsafePointee = false;
+    bool isUnsafePointeeMutable = false;     // 仅 UnsafeMutable* 允许写入
+    // `ptr.deallocate()`（规范 §6.5）：编译器特化发射 `suki_ptr_drop(ptr.raw)`，
+    // 因泛型方法体内的 `self` 字段访问在单态化后尚未正确生成（既有限制），
+    // 故此处合成调用，不依赖标准库方法体。
+    bool isUnsafeDeallocate = false;
 };
 
 struct SubscriptExpr : Node {
     SubscriptExpr() : Node(NodeKind::SubscriptExpr) {}
     NodePtr base;
     NodeList indices;
+    // 类型化缓冲指针的下标（规范 §6.5 / §8.1）：编译器特化，按元素类型 T
+    // 经 inttoptr(base.raw + idx*stride) + load/store 实现，非运行时调用。
+    bool isUnsafeBufferSubscript = false;
+    bool isUnsafeBufferMutable = false;      // 仅 UnsafeMutableBuffer* 允许写入
 };
 
 struct OptionalChainExpr : Node {
@@ -625,6 +665,9 @@ struct FuncType : Node {
     FuncType() : Node(NodeKind::FuncType) {}
     std::vector<NodePtr> params;
     NodePtr ret;
+    // @convention(c|stdcall) 类型属性（规范 §6.3）：标记该函数的调用约定。
+    // 空串表示默认（沿用目标平台约定）。
+    std::string convention;
 };
 
 struct RefType : Node {

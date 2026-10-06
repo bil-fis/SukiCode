@@ -76,6 +76,7 @@ private:
     NodePtr parseGuardStmt();
     NodePtr parseWhileStmt();
     NodePtr parseRepeatStmt();
+    NodePtr parseLoopStmt(std::string label = "");
     NodePtr parseForInStmt();
     NodePtr parseSwitchStmt();
     NodePtr parseSelectStmt();
@@ -152,6 +153,8 @@ private:
     std::vector<GenericConstraint> pendingGenericConstraints_;
     // @_cdecl("name") 捕获的外部符号名暂存区（规范 6.3）。
     std::string pendingCdeclName_;
+    // @convention(c|stdcall) 捕获的调用约定暂存区（规范 §6.3）。
+    std::string pendingConvention_;
     // @enum(C) 捕获的 C 兼容枚举标记暂存区（规范 1.5）。
     bool pendingCEnum_ = false;
     // 宏声明属性捕获（规范 5.6）：@freestanding(expression) / @attached(member) 等。

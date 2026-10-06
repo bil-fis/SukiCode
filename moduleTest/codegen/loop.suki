@@ -1,0 +1,78 @@
+// 规范 §1.7：loop 无限循环 + 标签 break / continue。
+// Spec §1.7: infinite `loop` plus labeled `break` / `continue`.
+
+// 普通 loop：靠 break 退出。
+func loopCount() -> Int {
+    var c = 0
+    loop {
+        c += 1
+        if c >= 3 { break }
+    }
+    return c
+}
+
+// 普通 loop：continue 跳到下一轮。
+func loopContinue() -> Int {
+    var s = 0
+    var k = 0
+    loop {
+        k += 1
+        if k > 5 { break }
+        if k % 2 == 0 { continue }
+        s += k
+    }
+    return s
+}
+
+// 嵌套 loop：无标签 break 退出最内层；带标签 break 退出外层。
+func nestedBreak() -> Int {
+    var total = 0
+    outer: loop {
+        var a = 0
+        loop {
+            a += 1
+            if a >= 3 { break }
+        }
+        total += a
+        if total >= 12 { break outer }
+    }
+    return total
+}
+
+// 带标签 loop：break outer 直接退出外层。
+func labeledBreak() -> Int {
+    var n = 0
+    outer: loop {
+        n += 1
+        if n == 5 { break outer }
+    }
+    return n
+}
+
+// 带标签 loop：continue outer 跳到外层下一轮。
+func labeledContinue() -> Int {
+    var count = 0
+    var tick = 0
+    outer: loop {
+        tick += 1
+        if tick > 5 { break outer }
+        var i = 0
+        loop {
+            i += 1
+            if i > 3 { break }
+            if i == 2 { continue outer }
+            count += 1
+        }
+    }
+    return count
+}
+
+@main
+func main() -> Int {
+    if loopCount() != 3 { return 1 }
+    if loopContinue() != 9 { return 2 }
+    if nestedBreak() != 12 { return 3 }
+    if labeledBreak() != 5 { return 4 }
+    if labeledContinue() != 5 { return 5 }
+    return 0
+}

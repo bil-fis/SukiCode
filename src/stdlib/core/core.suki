@@ -2,9 +2,35 @@
 ///
 /// Provides the foundational protocols and thin foreign-function wrappers over
 /// the C runtime (`src/runtime/runtime.c`). Builtin types such as `Int`,
-/// `String`, `Array`, `Dictionary` and `Set` are supplied by the compiler;
-/// this module layers safer, named APIs on top where the compiler does not
-/// already provide an intrinsic.
+/// `String`, `Array`, `Dictionary` and `Set` are supplied by the compiler; this
+/// module layers safer, named APIs on top where the compiler does not already
+/// provide an intrinsic.
+///
+/// Per specification §12.1 the `core` module owns: basic types, collections,
+/// `Optional`, `Result`, `Range`, printing, assertions, numeric helpers and
+/// randomness.
+///
+/// IMPORTANT — compiler limitations (see `moduleTest/codegen/closures.suki` and
+/// the diagnostics gathered while building this module):
+///   1. Closures are NOT implemented, so any higher-order function that receives
+///      and *calls* a closure (`map`/`filter`/`reduce`/`forEach`/`sorted`/
+///      `compactMap`/`zip` over collections) cannot be expressed. They are
+///      intentionally omitted until the compiler gains closure support.
+///   2. Generic enums are not supported by codegen (`enum Box<T> {…}` fails to
+///      instantiate), therefore the spec's `Result<T, E: Error>` cannot ship as
+///      a generic enum. A non-generic, concrete error enum pattern is shown in
+///      the documentation instead; typed `Result` awaits the compiler fix.
+///   3. `for … in` over `Set` currently crashes the compiler (it works for
+///      `Array`), so set-algebra helpers that require iteration (union /
+///      intersection / subtraction) are omitted. Single-element `insert` /
+///      `contains` on an already-built `Set` are fine and may be used directly.
+///   4. A generic function whose body is instantiated with 2+ type parameters
+///      is not monomorphised (its call site falls back to a variadic prototype),
+///      so the generic `unwrapOr<T>(_ o: T?, fallback: T)` combinator is
+///      replaced by concrete overloads `unwrapOrInt` / `unwrapOrString` /
+///      `unwrapOrDouble` / `unwrapOrBool`.
+///
+/// Everything below is fully implemented and runs.
 
 module core
 
@@ -31,19 +57,30 @@ protocol CustomStringConvertible {
 /// The error protocol. Conform to this to throw typed errors.
 protocol Error {}
 
-/// A value that can be awaited with `await` (see §7.3).
-///
-/// `await future` desugars to `try await future.waitForValue()`.
-protocol Awaitable {
-    associatedtype Value
-    /// Suspend the current task and resume with the produced value.
-    func waitForValue() async throws -> Value
+// ─── Bare-metal support (规范 §8.7) ────────────────────────────────────────────
+// These types back the `@panic_handler` / `@global_allocator` attributes. The
+// compiler checks that a `@panic_handler` function has the exact signature
+// `func panic(info: PanicInfo) -> Never` and that a `@global_allocator` type
+// conforms to `GlobalAlloc`, so they must exist in the imported `core` module.
+
+/// Carries diagnostic context into a `@panic_handler`.
+struct PanicInfo {
+    var message: String
+    var file: String
+    var line: Int
+}
+
+/// Contract a `@global_allocator` type must satisfy.
+protocol GlobalAlloc {
+    /// Allocate `size` bytes, returning a raw pointer (as `Int`).
+    func alloc(size: Int) -> Int
+    /// Release the memory previously returned by `alloc`.
+    func dealloc(ptr: Int)
 }
 
 // ─── Runtime string wrappers (safe by-value ABI) ──────────────────────────────
 // These mirror the `suki_str_*` entry points in `runtime.c`. `String` lowers to
-// the same `{ i8* data, i64 length }` aggregate the runtime expects, so the ABI
-// matches without any glue code.
+// the same `{ i8* data, i64 length }` aggregate the runtime expects.
 
 foreign func suki_str_length(_ s: String) -> Int
 foreign func suki_str_concat(_ a: String, _ b: String) -> String
@@ -54,6 +91,9 @@ foreign func suki_str_to_int(_ s: String) -> Int
 foreign func suki_int_to_string(_ v: Int) -> String
 foreign func suki_double_to_string(_ v: Double) -> String
 foreign func suki_char_to_string(_ v: Int32) -> String
+// ABI-compatible trap that takes a `String` by value (see runtime.c). The
+// compiler builtin `panic` is only visible inside the main module.
+foreign func suki_panic_string(_ msg: String)
 
 // ─── Named convenience API ───────────────────────────────────────────────────
 
@@ -82,6 +122,11 @@ func stringCompare(_ a: String, _ b: String) -> Int32 {
     return suki_str_compare(a, b)
 }
 
+/// `true` if `a` orders before `b` lexicographically.
+func stringLess(_ a: String, _ b: String) -> Bool {
+    return suki_str_compare(a, b) < 0
+}
+
 /// Render an integer as a string.
 func intToString(_ v: Int) -> String {
     return suki_int_to_string(v)
@@ -97,7 +142,235 @@ func charToString(_ v: Int32) -> String {
     return suki_char_to_string(v)
 }
 
-/// Parse a string into an integer (`Int("42")`).
+/// Parse a string into an integer.
 func stringToInt(_ s: String) -> Int {
     return suki_str_to_int(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Numeric utilities (规范 §12.1)
+//
+//  Overloading by argument type is not supported by the compiler, so Int and
+//  Double variants use distinct names. `Int`-typed names are the default.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The smaller of two integers.
+func min(_ a: Int, _ b: Int) -> Int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+/// The larger of two integers.
+func max(_ a: Int, _ b: Int) -> Int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+/// Absolute value of an integer.
+func abs(_ a: Int) -> Int {
+    if a < 0 {
+        return -a
+    }
+    return a
+}
+
+/// Clamps `v` into the closed interval `[lo, hi]`.
+func clamp(_ v: Int, _ lo: Int, _ hi: Int) -> Int {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+/// The smaller of two doubles.
+func minD(_ a: Double, _ b: Double) -> Double {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+/// The larger of two doubles.
+func maxD(_ a: Double, _ b: Double) -> Double {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+/// Clamps `v` into the closed interval `[lo, hi]`.
+func clampD(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+/// Swaps the values of two `inout` arguments.
+func swapInt(_ a: inout Int, _ b: inout Int) {
+    let t = a
+    a = b
+    b = t
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Range (规范 §1.8)
+//  Range literals (`0..<10`) are not a codegen feature, so a concrete `Range`
+//  value type plus factory/iteration helpers are provided.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A half-open interval `[lowerBound, upperBound)` over integers.
+struct Range {
+    var lowerBound: Int
+    var upperBound: Int
+}
+
+/// Build a `Range` from `lo` (inclusive) to `hi` (exclusive).
+func range(from lo: Int, to hi: Int) -> Range {
+    return Range(lowerBound: lo, upperBound: hi)
+}
+
+/// `true` if `v` lies within `[r.lowerBound, r.upperBound)`.
+func rangeContains(_ r: Range, _ v: Int) -> Bool {
+    return v >= r.lowerBound && v < r.upperBound
+}
+
+/// Number of integers in the range.
+func rangeCount(_ r: Range) -> Int {
+    return r.upperBound - r.lowerBound
+}
+
+/// Returns `[start, start+step, start+2*step, ...)` up to (not including) `end`.
+func stride(from start: Int, to end: Int, by step: Int) -> [Int] {
+    var result: [Int] = []
+    if step > 0 {
+        var i = start
+        while i < end {
+            result = result.append(i)
+            i = i + step
+        }
+    } else if step < 0 {
+        var i = start
+        while i > end {
+            result = result.append(i)
+            i = i + step
+        }
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Optionals (规范 §2.7)
+//  `unwrapOr` is provided as concrete overloads because the generic form
+//  `unwrapOr<T>(_ o: T?, fallback: T)` is a 2-parameter generic, which the
+//  current compiler fails to monomorphise (see module header note 4). Closure-
+//  based combinators are omitted (compiler has no closures).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Returns the wrapped value or `fallback` if `nil` (Int).
+func unwrapOrInt(_ o: Int?, fallback: Int) -> Int {
+    var result = fallback
+    if let v = o {
+        result = v
+    }
+    return result
+}
+
+/// Returns the wrapped value or `fallback` if `nil` (String).
+/// NOTE: the value is written into a local and returned at the tail rather than
+/// `return`ed straight out of the `if let` branch — the current code generator
+/// mis-lowers a struct-by-value return taken from a branch body (see header).
+func unwrapOrString(_ o: String?, fallback: String) -> String {
+    var result = fallback
+    if let v = o {
+        result = v
+    }
+    return result
+}
+
+/// Returns the wrapped value or `fallback` if `nil` (Double).
+func unwrapOrDouble(_ o: Double?, fallback: Double) -> Double {
+    var result = fallback
+    if let v = o {
+        result = v
+    }
+    return result
+}
+
+/// Returns the wrapped value or `fallback` if `nil` (Bool).
+func unwrapOrBool(_ o: Bool?, fallback: Bool) -> Bool {
+    var result = fallback
+    if let v = o {
+        result = v
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Assertions (规范 §9)
+//  `print` / `println` / `panic` are compiler builtins; `assert` /
+//  `precondition` / `fatalError` sit on top of the ABI-compatible
+//  `suki_panic_string` runtime entry point.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Traps if `condition` is `false`.
+func assert(_ condition: Bool) {
+    if !condition {
+        suki_panic_string("assertion failed")
+    }
+}
+
+/// Traps if `condition` is `false` (a non-recoverable invariant).
+func precondition(_ condition: Bool) {
+    if !condition {
+        suki_panic_string("precondition failed")
+    }
+}
+
+/// Unconditionally traps with `message`.
+func fatalError(_ message: String) {
+    suki_panic_string(message)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Randomness (规范 §12.1)
+//  A small, deterministic, allocation-free LCG so the standard library needs no
+//  extra runtime entry points. Seed it with `randomSeed` for reproducibility.
+// ═══════════════════════════════════════════════════════════════════════════
+
+var _sukiRngState: Int = 0x2545F4914F6CDD1D
+
+/// Re-seed the global pseudo-random generator.
+func randomSeed(_ seed: Int) {
+    _sukiRngState = seed
+}
+
+/// Returns the next pseudo-random `Int` in `[0, 2147483646]`.
+func randomInt() -> Int {
+    _sukiRngState = (_sukiRngState * 1103515245 + 12345) % 2147483647
+    return _sukiRngState
+}
+
+/// Returns a pseudo-random `Int` in `[lo, hi)` (or `lo` when `hi <= lo`).
+func randomIntInRange(_ lo: Int, _ hi: Int) -> Int {
+    if hi <= lo {
+        return lo
+    }
+    let span = hi - lo
+    return lo + (randomInt() % span)
+}
+
+/// Returns a pseudo-random `Bool`.
+func randomBool() -> Bool {
+    return (randomInt() % 2) == 0
 }

@@ -1,0 +1,37 @@
+// Result<T, E: Error> 回归测试（规范 §9.4）。
+// 验证泛型枚举 + 协议约束泛型参数 + success(T)/failure(E) 双关联值提取，
+// 且枚举值跨越函数返回（载荷堆分配）后仍能正确提取。
+// 约定：断言全部成立返回 0，否则返回非 0。
+import core
+
+enum DivError: Error {
+    case zero
+    case negative
+}
+
+func divide(_ a: Int, _ b: Int) -> Result<Int, DivError> {
+    if b == 0 { return Result<Int, DivError>.failure(DivError.zero) }
+    if b < 0 { return Result<Int, DivError>.failure(DivError.negative) }
+    return Result<Int, DivError>.success(a / b)
+}
+
+@main func main() -> Int {
+    let ok = divide(10, 2)    // success(5)
+    let bad = divide(5, 0)    // failure(zero)
+    let neg = divide(8, -1)   // failure(negative)
+    var total = 0
+    switch ok {
+        case Result<Int, DivError>.success(let v): total = total + v
+        case Result<Int, DivError>.failure(let e): total = total + 1000
+    }
+    switch bad {
+        case Result<Int, DivError>.success(let v): total = total + v
+        case Result<Int, DivError>.failure(let e): total = total + 1
+    }
+    switch neg {
+        case Result<Int, DivError>.success(let v): total = total + v
+        case Result<Int, DivError>.failure(let e): total = total + 1
+    }
+    if total != 7 { return 1 }   // 期望 5 + 1 + 1 = 7
+    return 0
+}

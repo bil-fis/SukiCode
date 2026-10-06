@@ -1,0 +1,10 @@
+import memory
+
+// 规范 §10.1 访问控制：`public` 声明构成模块的公开接口，导入后可正常访问。
+// 退出码 0 表示通过。
+
+@main
+func main() -> Int {
+    if (memoryPublicHelper() != 7) { return 1 }
+    return 0
+}

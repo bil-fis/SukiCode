@@ -1,0 +1,62 @@
+import memory
+
+// 验证类型化非托管指针（规范 §6.5 / §8.1）：allocate / pointee / deallocate /
+// 不可变 UnsafePointer 读取 / 缓冲下标。
+// 退出码 0 表示全部断言通过。
+
+func testMutable() -> Int {
+    var total = 0
+    unsafe {
+        let ptr: UnsafeMutablePointer<Int> = allocate(capacity: 1)
+        ptr.pointee = 42
+        if (ptr.pointee != 42) { total = total + 1 }
+        ptr.pointee = ptr.pointee + 8   // 50
+        if (ptr.pointee != 50) { total = total + 1 }
+        ptr.deallocate()
+    }
+    return total
+}
+
+func testImmutable() -> Int {
+    var total = 0
+    unsafe {
+        let ptr: UnsafeMutablePointer<Int> = allocate(capacity: 1)
+        ptr.pointee = 7
+        // 不可变指针：仅可读 pointee，且读数应与原值一致。
+        let r: UnsafePointer<Int> = UnsafePointer<Int>(raw: ptr.raw)
+        if (r.pointee != 7) { total = total + 1 }
+        ptr.deallocate()
+    }
+    return total
+}
+
+func testBuffer() -> Int {
+    var total = 0
+    unsafe {
+        let ptr: UnsafeMutablePointer<Int> = allocate(capacity: 4)
+        let buf = UnsafeMutableBufferPointer<Int>(raw: ptr.raw, count: 4)
+        var i = 0
+        while (i < 4) {
+            buf[i] = (i + 1) * 10   // 10, 20, 30, 40
+            i = i + 1
+        }
+        var j = 0
+        while (j < 4) {
+            if (buf[j] != (j + 1) * 10) { total = total + 1 }
+            j = j + 1
+        }
+        ptr.deallocate()
+    }
+    return total
+}
+
+@main
+func main() -> Int {
+    let a = testMutable()
+    let b = testImmutable()
+    let c = testBuffer()
+    if (a == 0 && b == 0 && c == 0) {
+        return 0
+    }
+    return 1
+}

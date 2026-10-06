@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -238,6 +240,14 @@ void dumpNode(AstPrinter& p, Node* n) {
             dumpNode(p, g->condition.get());
             p.line("else:");
             for (auto& st : g->elseBody) dumpNode(p, st.get());
+            --p.depth;
+            break;
+        }
+        case NodeKind::LoopStmt: {
+            auto* l = static_cast<LoopStmt*>(n);
+            p.line(std::string("Loop") + (l->label.empty() ? "" : " '" + l->label + "'"));
+            ++p.depth;
+            for (auto& st : l->body) dumpNode(p, st.get());
             --p.depth;
             break;
         }
@@ -615,6 +625,7 @@ const char* kindName(NodeKind k) {
         case NodeKind::IfExpr: return "IfExpr";
         case NodeKind::GuardStmt: return "GuardStmt";
         case NodeKind::WhileStmt: return "WhileStmt";
+        case NodeKind::LoopStmt: return "LoopStmt";
         case NodeKind::RepeatWhileStmt: return "RepeatWhileStmt";
         case NodeKind::ForInStmt: return "ForInStmt";
         case NodeKind::SwitchStmt: return "SwitchStmt";
@@ -677,14 +688,62 @@ static void usage(FILE* out) {
         "sukic — SukiCode compiler driver\n"
         "\n"
         "Usage:\n"
-        "  sukic lex    <file>...               dump the token stream\n"
-        "  sukic parse  <file>... [--dump-ast] [--expand-macros]  parse to AST and report diagnostics\n"
+        "  sukic lex    <file>...                 dump the token stream\n"
+        "  sukic parse  <file>... [--emit-ast] [--expand-macros]   parse to AST and report diagnostics\n"
         "  sukic check  <file>... [--expand-macros]  parse and run semantic analysis\n"
-        "  sukic emit-ir <file>... [--target=T]  print textual LLVM IR\n"
-        "  sukic build  <file> -o <out.o>       compile to a target object file\n"
-        "  sukic run    <file> [--target=T]      compile, link and execute\n"
-        "  sukic version                        print version information\n"
-        "  sukic help                           print this help\n");
+        "  sukic emit-ir <file>... [--target=T]   print textual LLVM IR\n"
+        "  sukic build  <file> [-o <out>]         compile to a target object/asm file\n"
+        "  sukic run    <file> [--target=T]       compile, link and execute\n"
+        "  sukic -o <out> <file.suki>             compile + link (no run)\n"
+        "  sukic -c -o <out.o> <file.suki>        compile only (no link)\n"
+        "  sukic --list-targets                   list supported target triples\n"
+        "\n"
+        "Common options (规范 §10.3 / §10.4 / §14.1):\n"
+        "  --target=<triple>          目标三元组 (e.g. x86_64-pc-windows-msvc, aarch64-apple-darwin)\n"
+        "  --sysroot=<path>           交叉链接系统库根目录\n"
+        "  -D NAME[=VALUE]            条件编译自定义宏 (e.g. -D LEVEL=5)\n"
+        "  -O0 / -O1 / -O2 / -O3      优化级别\n"
+        "  -Os                        尺寸优先优化\n"
+        "  -c                         仅编译到对象文件 (不链接)\n"
+        "  -S                         输出汇编文本 (.s)\n"
+        "  -emit-ir / --emit-llvm     输出文本 LLVM IR\n"
+        "  -emit-ast                  输出语法树\n"
+        "  -expand-macros             展开宏后输出\n"
+        "  --incremental              .build/cache 增量编译\n"
+        "  -fuse-ld=lld              使用 lld 链接 (默认)\n"
+        "  --integrated-as / --no-integrated-as  (LLVM 集成汇编器，默认开启)\n"
+        "  --target bare-metal        禁用标准库，仅用 core (裸机，实验性)\n"
+        "  -o <path>                  输出路径\n"
+        "  --version / -v, --help / -h\n");
+}
+
+// 规范驱动层级的编译选项集合：聚合所有 CLI 标志，传给编译管线各阶段。
+struct CompileOptions {
+    std::string triple;             // --target=<triple>（空 = 主机）
+    std::string outPath;           // -o <path>
+    std::vector<std::string> defines; // -D NAME[=VALUE]（规范 §10.3）
+    int  optLevel   = 0;           // -O0..-O3 → LLVM CodeGenOptLevel
+    bool optSize    = false;        // -Os（尺寸优先）
+    bool emitAsm    = false;        // -S（汇编文本而非对象文件）
+    bool compileOnly= false;        // -c（仅编译到 .o/.s，不链接）
+    bool emitIR     = false;        // -emit-ir / --emit-llvm（文本 LLVM IR）
+    bool emitAST    = false;        // -emit-ast（语法树转储）
+    bool expandMacros = false;      // -expand-macros（宏展开后转储）
+    bool incremental = false;       // --incremental（.build/cache 缓存）
+    std::string sysroot;            // --sysroot=<path>（交叉链接系统库根）
+    bool fuseLld    = false;        // -fuse-ld=lld（默认行为，可显式指定）
+    bool integratedAs = true;       // --integrated-as（默认）/--no-integrated-as
+    bool bareMetal  = false;        // --target bare-metal（禁用标准库，仅 core）
+};
+
+// 解析用于代码生成的有效三元组。规范 §8.7：`--target bare-metal` 是禁用
+// 标准库、仅使用 core 模块的约定目标名，映射到 freestanding 三元组。
+static std::string effectiveTriple(const CompileOptions& opts) {
+    if (opts.triple == "bare-metal" || opts.triple == "none") {
+        TargetInfo h = hostTarget();
+        return h.arch + "-unknown-none";
+    }
+    return opts.triple;
 }
 
 static int commandLex(const std::vector<std::string>& files) {
@@ -720,7 +779,7 @@ static int commandLex(const std::vector<std::string>& files) {
 // 前向声明（定义见 loadImportedStdlib，位于本文件下方）。
 static void loadImportedStdlib(NodeList& userDecls);
 
-static int commandParse(const std::vector<std::string>& files, bool dumpAst, bool dumpExpanded = false) {
+static int commandParse(const std::vector<std::string>& files, const CompileOptions& opts) {
     int rc = 0;
     for (const auto& path : files) {
         std::string src;
@@ -731,10 +790,12 @@ static int commandParse(const std::vector<std::string>& files, bool dumpAst, boo
         }
         DiagnosticEngine diags;
         Lexer lexer(src, diags);
+        lexer.setTargetTriple(effectiveTriple(opts));
+        if (!opts.defines.empty()) lexer.setDefines(opts.defines);
         auto toks = lexer.tokenizeAll();
         Parser parser(std::move(toks), diags);
         NodeList decls = parser.parseModule();
-        if (dumpExpanded) {
+        if (opts.expandMacros) {
             size_t uc = decls.size();
             loadImportedStdlib(decls);
             Sema sema(diags);
@@ -743,7 +804,7 @@ static int commandParse(const std::vector<std::string>& files, bool dumpAst, boo
             sema.expandMacros(decls);
             AstPrinter p;
             for (auto& d : decls) dumpNode(p, d.get());
-        } else if (dumpAst) {
+        } else if (opts.emitAST) {
             printf("== %s ==\n", path.c_str());
             AstPrinter p;
             for (auto& d : decls) dumpNode(p, d.get());
@@ -756,7 +817,7 @@ static int commandParse(const std::vector<std::string>& files, bool dumpAst, boo
 // Parse + run semantic analysis, reporting all semantic diagnostics.
 static void loadImportedStdlib(NodeList& userDecls);
 
-static int commandCheck(const std::vector<std::string>& files, bool dumpExpanded = false) {
+static int commandCheck(const std::vector<std::string>& files, const CompileOptions& opts) {
     int rc = 0;
     for (const auto& path : files) {
         std::string src;
@@ -767,18 +828,20 @@ static int commandCheck(const std::vector<std::string>& files, bool dumpExpanded
         }
         DiagnosticEngine diags;
         Lexer lexer(src, diags);
+        lexer.setTargetTriple(effectiveTriple(opts));
+        if (!opts.defines.empty()) lexer.setDefines(opts.defines);
         auto toks = lexer.tokenizeAll();
         Parser parser(std::move(toks), diags);
         NodeList decls = parser.parseModule();
         // Only run Sema if parsing produced a usable tree.
         size_t userDeclCount = decls.size();
-        loadImportedStdlib(decls);
+        if (!opts.bareMetal) loadImportedStdlib(decls);
         if (!diags.hasErrors()) {
             Sema sema(diags);
             sema.setStdlibDeclCount(decls.size() - userDeclCount);
             sema.setSource(&src);
             // `--expand-macros`：仅展开并 dump AST，不做完整语义分析。
-            if (dumpExpanded) {
+            if (opts.expandMacros) {
                 sema.expandMacros(decls);
                 AstPrinter p;
                 for (auto& d : decls) dumpNode(p, d.get());
@@ -793,13 +856,20 @@ static int commandCheck(const std::vector<std::string>& files, bool dumpExpanded
 }
 
 // Parse a source file into declarations (shared by the codegen commands).
-static bool parseFile(const std::string& path, DiagnosticEngine& diags, NodeList& decls) {
+// `triple` 用于条件编译的 os()/arch() 谓词（规范 §10.3）；为空时 Lexer 回退到
+// 主机目标，因此 lex/parse/check 等不涉及交叉编译的命令可保持默认。
+// `defines` 为 `-D NAME[=VALUE]` 注入的自定义宏（规范 §10.3）。
+static bool parseFile(const std::string& path, DiagnosticEngine& diags, NodeList& decls,
+                      const std::string& triple = std::string(),
+                      const std::vector<std::string>& defines = {}) {
     std::string src;
     if (!readFile(path, src)) {
         fprintf(stderr, "sukic: cannot open '%s'\n", path.c_str());
         return false;
     }
     Lexer lexer(src, diags);
+    lexer.setTargetTriple(triple);
+    if (!defines.empty()) lexer.setDefines(defines);
     auto toks = lexer.tokenizeAll();
     Parser parser(std::move(toks), diags);
     decls = parser.parseModule();
@@ -834,28 +904,44 @@ static void loadImportedStdlib(NodeList& userDecls) {
         start = end + 1;
     }
 
-    // Collect paths requested via `import`.
-    std::vector<std::string> toLoad;
+    // Collect (moduleName, path) requested via `import`.
+    std::vector<std::pair<std::string, std::string>> toLoad;
     for (auto& d : userDecls) {
         if (d && d->kind == NodeKind::ImportDecl) {
             auto* imp = static_cast<ImportDecl*>(d.get());
             for (auto& m : mods)
-                if (m.first == imp->moduleName) { toLoad.push_back(m.second); break; }
+                if (m.first == imp->moduleName) { toLoad.push_back(m); break; }
         }
     }
     if (toLoad.empty()) return;
 
-    // De-duplicate and parse + prepend.
-    std::sort(toLoad.begin(), toLoad.end());
-    toLoad.erase(std::unique(toLoad.begin(), toLoad.end()), toLoad.end());
+    // De-duplicate (by path) and parse + prepend.
+    std::sort(toLoad.begin(), toLoad.end(),
+              [](const std::pair<std::string, std::string>& a,
+                 const std::pair<std::string, std::string>& b) {
+                  return a.second < b.second;
+              });
+    toLoad.erase(std::unique(toLoad.begin(), toLoad.end(),
+                             [](const std::pair<std::string, std::string>& a,
+                                const std::pair<std::string, std::string>& b) {
+                                 return a.second == b.second;
+                             }),
+                 toLoad.end());
     NodeList prelude;
-    for (const auto& p : toLoad) {
+    for (const auto& m : toLoad) {
         DiagnosticEngine d;
         NodeList dl;
-        if (parseFile(p, d, dl))
-            for (auto& n : dl) prelude.push_back(std::move(n));
-        else
-            fprintf(stderr, "sukic: warning: stdlib module '%s' failed to parse\n", p.c_str());
+        if (parseFile(m.second, d, dl)) {
+            // 规范 §10.1：给被导入模块的声明打上模块名，访问据此区分
+            // 「同模块」与「跨模块」（跨模块仅 public/open 可见）。
+            for (auto& n : dl) {
+                if (n) n->sourceModule = m.first;
+                prelude.push_back(std::move(n));
+            }
+        } else {
+            fprintf(stderr, "sukic: warning: stdlib module '%s' failed to parse\n",
+                    m.second.c_str());
+        }
     }
     if (!prelude.empty())
         userDecls.insert(userDecls.begin(),
@@ -875,11 +961,14 @@ static TargetInfo resolveTarget(const std::string& triple) {
 #ifndef SUKI_CLANG_DRIVER
 #define SUKI_CLANG_DRIVER "clang"
 #endif
+#ifndef SUKI_RUNTIME_OBJECT
+#define SUKI_RUNTIME_OBJECT "runtime.o"
+#endif
 #ifndef SUKI_RUNTIME_SOURCE
 #define SUKI_RUNTIME_SOURCE "runtime.c"
 #endif
-#ifndef SUKI_RUNTIME_OBJECT
-#define SUKI_RUNTIME_OBJECT "runtime.o"
+#ifndef SUKI_RUNTIME_INCLUDE
+#define SUKI_RUNTIME_INCLUDE "."
 #endif
 #ifndef SUKI_STDLIB_DIR
 #define SUKI_STDLIB_DIR ""
@@ -888,25 +977,60 @@ static TargetInfo resolveTarget(const std::string& triple) {
 #define SUKI_STDLIB_FILES ""
 #endif
 
-// Compile one source file to a target object file: SukiCode -> LLVM IR, then
-// clang (an LLVM frontend) lowers the IR to a native object file.
-static bool compileOne(const std::string& path, const std::string& triple,
-                       const std::string& objPath, std::string& errOut,
-                       std::string* irOut = nullptr) {
-    DiagnosticEngine diags;
-    NodeList decls;
-    if (!parseFile(path, diags, decls)) { diags.emit(stderr); return false; }
-    size_t userDeclCount = decls.size();
-    loadImportedStdlib(decls);
-    Sema sema(diags);
-    sema.setStdlibDeclCount(decls.size() - userDeclCount);
-    // 宏展开需要调用点源码以恢复 unquote 的原始文本（规范 5.6）。
+// 规范 §14.1.2：--incremental，把对象/汇编按「源内容 + 编译选项」哈希缓存到
+// .build/cache，命中时直接复用，避免重复代码生成。返回缓存文件路径。
+static std::string incrementalCachePath(const std::string& path, const CompileOptions& opts,
+                                        const std::string& src) {
+    std::string key = src;
+    key += "\n@@triple@@" + effectiveTriple(opts);
+    key += "\n@@opt@@" + std::to_string(opts.optLevel) + "," +
+           std::to_string(opts.optSize) + "," + std::to_string(opts.emitAsm) +
+           "," + std::to_string(opts.bareMetal);
+    for (const auto& d : opts.defines) key += "\n@@def@@" + d;
+    size_t h = std::hash<std::string>{}(key);
+    return ".build/cache/" + std::to_string(h) + (opts.emitAsm ? ".s" : ".o");
+}
+
+// Compile one source file to a target object/assembly file: SukiCode -> LLVM IR
+// -> native object (或 -S 时的汇编) via the in-process LLVM backend.
+static bool compileOne(const std::string& path, const std::string& objPath,
+                       std::string& errOut, std::string* irOut,
+                       const CompileOptions& opts) {
+    // 宏展开需要调用点源码以恢复 unquote 的原始文本（规范 5.6）；同时用于增量缓存键。
     std::string src;
     readFile(path, src);
+
+    // 增量编译命中：直接复制缓存对象到目标路径。
+    if (opts.incremental) {
+        std::string cachePath = incrementalCachePath(path, opts, src);
+        std::ifstream cf(cachePath, std::ios::binary);
+        if (cf) {
+            std::error_code ec;
+            std::filesystem::copy_file(cachePath, objPath,
+                std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) { fprintf(stderr, "sukic: incremental cache copy failed: %s\n", ec.message().c_str()); }
+            if (irOut) *irOut = "";
+            return !ec;
+        }
+    }
+
+    DiagnosticEngine diags;
+    NodeList decls;
+    if (!parseFile(path, diags, decls, effectiveTriple(opts), opts.defines)) {
+        diags.emit(stderr); return false;
+    }
+    size_t userDeclCount = decls.size();
+    // 裸机模式（规范 §8.7）不加载标准库，仅保留用户声明。
+    if (!opts.bareMetal) loadImportedStdlib(decls);
+    Sema sema(diags);
+    sema.setStdlibDeclCount(decls.size() - userDeclCount);
     sema.setSource(&src);
     sema.analyze(decls);
     if (diags.hasErrors()) { diags.emit(stderr); return false; }
-    IRGenerator gen(resolveTarget(triple));
+    IRGenerator gen(resolveTarget(effectiveTriple(opts)));
+    gen.setOptLevel(opts.optLevel);
+    gen.setOptSize(opts.optSize);
+    gen.setEmitAssembly(opts.emitAsm);
     std::string ir, err;
     // BLK-B: lower SukiCode -> LLVM IR -> native object entirely in-process via
     // LLVM's TargetMachine/MC backend. No external `clang -c` is invoked, so the
@@ -917,76 +1041,141 @@ static bool compileOne(const std::string& path, const std::string& triple,
         return false;
     }
     if (irOut) *irOut = ir;
+    // 写入增量缓存（下次同输入命中）。
+    if (opts.incremental) {
+        std::error_code ec;
+        std::filesystem::create_directories(".build/cache", ec);
+        std::filesystem::copy_file(objPath, incrementalCachePath(path, opts, src),
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) fprintf(stderr, "sukic: warning: cannot write incremental cache: %s\n", ec.message().c_str());
+    }
     return true;
 }
 
-static int commandEmitIR(const std::vector<std::string>& files, const std::string& triple) {
+static int commandEmitIR(const std::vector<std::string>& files, const CompileOptions& opts) {
     int rc = 0;
     for (const auto& path : files) {
         DiagnosticEngine diags;
         NodeList decls;
-        if (!parseFile(path, diags, decls)) { diags.emit(stderr); rc = 1; continue; }
+        if (!parseFile(path, diags, decls, effectiveTriple(opts), opts.defines)) { diags.emit(stderr); rc = 1; continue; }
         size_t userDeclCount = decls.size();
-        loadImportedStdlib(decls);
+        if (!opts.bareMetal) loadImportedStdlib(decls);
         Sema sema(diags);
         sema.setStdlibDeclCount(decls.size() - userDeclCount);
         sema.analyze(decls);
         if (diags.hasErrors()) { diags.emit(stderr); rc = 1; continue; }
-        IRGenerator gen(resolveTarget(triple));
+        IRGenerator gen(resolveTarget(effectiveTriple(opts)));
         std::string ir, err;
         if (!gen.emitIR(decls, sema, ir, err)) { fprintf(stderr, "sukic: %s\n", err.c_str()); rc = 1; continue; }
-        printf("; %s\n%s", path.c_str(), ir.c_str());
+        // 规范 §14.1：`-emit-ir` / `--emit-llvm` 输出文本 LLVM IR；给定 -o 写入文件，否则输出到 stdout。
+        if (!opts.outPath.empty()) {
+            std::ofstream o(opts.outPath, std::ios::binary);
+            if (!o) { fprintf(stderr, "sukic: cannot write IR to '%s'\n", opts.outPath.c_str()); rc = 1; continue; }
+            o << ir;
+        } else {
+            printf("; %s\n%s", path.c_str(), ir.c_str());
+        }
     }
     return rc;
 }
 
-static int commandBuild(const std::vector<std::string>& files, const std::string& out,
-                        const std::string& triple) {
+// 仅编译阶段（规范 §14.1.3 的 `-c` / 默认 build）：产出对象文件或汇编文本，不链接。
+static int commandBuild(const std::vector<std::string>& files, const CompileOptions& opts) {
     if (files.size() != 1) { fprintf(stderr, "sukic: build currently takes one input file\n"); return 2; }
+    std::string out = opts.outPath;
+    if (out.empty()) out = files[0] + (opts.emitAsm ? ".s" : ".o");
     std::string err;
-    if (!compileOne(files[0], triple, out, err)) { fprintf(stderr, "sukic: %s\n", err.c_str()); return 1; }
+    if (!compileOne(files[0], out, err, nullptr, opts)) { fprintf(stderr, "sukic: %s\n", err.c_str()); return 1; }
     return 0;
 }
 
-static int commandRun(const std::vector<std::string>& files, const std::string& triple) {
+// 跨平台 shell 参数引用：POSIX 用单引号，Windows(cmd.exe)用双引号并转义内嵌引号。
+static std::string shellQuote(const std::string& s) {
+#ifdef _WIN32
+    std::string out = "\"";
+    for (char c : s) { if (c == '"') out += "\"\"";
+        else out += c; }
+    out += "\"";
+    return out;
+#else
+    std::string out = "'";
+    for (char c : s) { if (c == '\'') out += "'\\''";
+        else out += c; }
+    out += "'";
+    return out;
+#endif
+}
+
+// 为目标平台选择运行时对象：native（OS+arch 与宿主一致）直接用预编译产物；
+// 交叉编译目标则尝试按 --target 即时编译 runtime.c（需要目标 sysroot/工具链），
+// 失败时返回空串并以 err 说明原因（调用方据此报错，但仍允许 `build` 先产出对象）。
+// 裸机模式（规范 §8.7）不使用 C 运行时对象。
+static std::string selectRuntimeObject(const TargetInfo& tgt, const TargetInfo& host,
+                                       const std::string& objPath, std::string& err,
+                                       const CompileOptions& opts) {
+    if (opts.bareMetal) return "";  // 裸机自管启动/panic，无需链接 C 运行时
+    if (tgt.os == host.os && tgt.arch == host.arch)
+        return SUKI_RUNTIME_OBJECT;
+    std::string tmp = objPath + ".rt.o";
+    std::string cc = std::string(SUKI_CLANG_DRIVER) + " --target=" + tgt.triple +
+                     (opts.sysroot.empty() ? "" : (" --sysroot=" + shellQuote(opts.sysroot))) +
+                     " -c -I " + shellQuote(SUKI_RUNTIME_INCLUDE) + " " +
+                     shellQuote(SUKI_RUNTIME_SOURCE) + " -o " + shellQuote(tmp);
+    if (std::system(cc.c_str()) != 0) {
+        err = "无法为交叉目标 '" + tgt.triple +
+              "' 编译 C 运行时（交叉链接需要对应的目标工具链/sysroot，例如带匹配头文件的 "
+              "clang --target）。对象文件已产出，但可执行文件未能链接。";
+        return "";
+    }
+    return tmp;
+}
+
+// 编译 + 链接成可执行文件；execute=true 时链接后直接运行（规范 §14.1 的 `run`）。
+static int commandLinkAndRun(const std::vector<std::string>& files, const CompileOptions& opts,
+                             bool execute) {
     if (files.size() != 1) { fprintf(stderr, "sukic: run currently takes one input file\n"); return 2; }
     std::string obj = files[0] + ".o";
-    std::string exe = files[0] + ".out";
+    std::string exe = opts.outPath.empty() ? (files[0] + ".out") : opts.outPath;
     std::string err, ir;
-    if (!compileOne(files[0], triple, obj, err, &ir)) { fprintf(stderr, "sukic: %s\n", err.c_str()); return 1; }
+    if (!compileOne(files[0], obj, err, &ir, opts)) { fprintf(stderr, "sukic: %s\n", err.c_str()); return 1; }
     // A translation unit without `@main` compiles fine but cannot be linked
     // into a program. Say so instead of letting the linker report a missing
-    // `main`, which looks like a compiler bug.
-    if (ir.find("define i32 @main") == std::string::npos) {
+    // `main`, which looks like a compiler bug. (增量缓存命中时 ir 为空，跳过此检查。)
+    if (!ir.empty() && ir.find("define i32 @main") == std::string::npos) {
         fprintf(stderr,
                 "sukic: no @main entry in '%s' — it compiles as a module but "
                 "cannot be linked into an executable\n",
                 files[0].c_str());
         return 1;
     }
-    // BLK-B: the object was produced in-process by LLVM; link it with the
-    // precompiled C runtime object. When lld is installed we ask the clang driver
-    // to use it as the linker (`-fuse-ld=lld`), so the actual link is performed
-    // by lld while clang still supplies the correct crt/libc search paths.
-    // Otherwise the default system linker (via the clang driver) is used.
+    // 链接需按*目标*平台（而非宿主）选择链接器标志与运行时对象。原生构建时
+    // 目标 == 宿主，行为与以往一致；交叉编译（--target 指向其它 OS/arch）时按
+    // 目标三元组即时编译运行时并尝试链接，缺失 sysroot 时给出清晰错误。
+    TargetInfo tgt = resolveTarget(effectiveTriple(opts));
+    TargetInfo host = hostTarget();
     std::string linker = std::string(SUKI_CLANG_DRIVER);
-#ifdef SUKI_PREFER_LLD
-    linker += " -fuse-ld=lld";
-#endif
-    // Threading libraries are named per platform: Linux needs an explicit
-    // -lpthread, macOS resolves pthreads from libSystem and Windows needs
-    // nothing, so the link line stays correct on each without extra flags.
+    if (opts.fuseLld) linker += " -fuse-ld=lld";
+    // 始终向 clang 传递目标三元组，使其选择对应对象格式 / crt / 链接器风格
+    // （COFF+MachO 由 lld 处理，ELF 由系统链接器处理）。
+    std::string targetFlag = opts.triple.empty() ? "" : (" --target=" + opts.triple);
+    std::string sysrootFlag = opts.sysroot.empty() ? "" : (" --sysroot=" + shellQuote(opts.sysroot));
+    // 依据*目标* OS 选择线程库：Linux/Android/FreeBSD 需 -lpthread；
+    // Windows / macOS / iOS / WASI 由系统库自带，无需额外标志；裸机不链接任何库。
     std::string linkLibs;
-#if defined(__linux__)
-    linkLibs = " -lpthread";
-#elif defined(__APPLE__)
-    linkLibs = "";
-#elif defined(_WIN32)
-    linkLibs = "";
-#endif
-    std::string link = linker + linkLibs + " '" + obj + "' '" +
-                       SUKI_RUNTIME_OBJECT + "' -o '" + exe + "'";
-    if (std::system(link.c_str()) != 0) { fprintf(stderr, "sukic: link failed\n"); return 1; }
+    if (!opts.bareMetal &&
+        (tgt.os == "Linux" || tgt.os == "Android" || tgt.os == "FreeBSD"))
+        linkLibs = " -lpthread";
+    std::string rtErr;
+    std::string runtimeObj = selectRuntimeObject(tgt, host, obj, rtErr, opts);
+    if (runtimeObj.empty() && !opts.bareMetal) { fprintf(stderr, "sukic: %s\n", rtErr.c_str()); return 1; }
+    std::string link = linker + targetFlag + sysrootFlag + linkLibs + " " +
+                       shellQuote(obj) + (runtimeObj.empty() ? "" : (" " + shellQuote(runtimeObj))) +
+                       " -o " + shellQuote(exe);
+    if (std::system(link.c_str()) != 0) {
+        fprintf(stderr, "sukic: 链接失败（目标 '%s'）\n", opts.triple.c_str());
+        return 1;
+    }
+    if (!execute) return 0;
     // `sh -c "name"` searches PATH, not the current directory, so a relative
     // executable must be invoked as ./name.
     std::string exePath = (exe.empty() || exe[0] == '/') ? exe : ("./" + exe);
@@ -994,6 +1183,16 @@ static int commandRun(const std::vector<std::string>& files, const std::string& 
     // std::system returns a wait status (exit code in the high byte); convert
     // it to the child's actual exit code.
     return (rc >> 8) & 0xFF;
+}
+
+// 规范 §14.1.3 的 `-O` 优化级别解析：`-O0`/`-O`/`-O1`/`-O2`/`-O3` 及 `-Os`（尺寸）。
+static int parseOptLevel(const char* arg, bool& optSize) {
+    if (strcmp(arg, "-O0") == 0) return 0;
+    if (strcmp(arg, "-O") == 0 || strcmp(arg, "-O1") == 0) return 1;
+    if (strcmp(arg, "-O2") == 0) return 2;
+    if (strcmp(arg, "-O3") == 0) return 3;
+    if (strcmp(arg, "-Os") == 0) { optSize = true; return 2; }
+    return -1; // 非 -O* 标志
 }
 
 int main(int argc, char** argv) {
@@ -1008,46 +1207,102 @@ int main(int argc, char** argv) {
         usage(stdout);
         return 0;
     }
-
-    std::vector<std::string> files;
-    bool dumpAst = false;
-    bool dumpExpanded = false;
-    std::string triple, outPath;
-    for (int i = 2; i < argc; ++i) {
-        if (strcmp(argv[i], "--dump-ast") == 0) dumpAst = true;
-        else if (strcmp(argv[i], "--expand-macros") == 0) dumpExpanded = true;
-        else if (strncmp(argv[i], "--target=", 9) == 0) triple = argv[i] + 9;
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outPath = argv[++i];
-        else files.emplace_back(argv[i]);
+    // 规范 §14.1.1：`--list-targets` 列出已知目标三元组。
+    if (cmd == "--list-targets") {
+        for (const auto& t : listKnownTargets())
+            printf("%s\n", t.c_str());
+        return 0;
     }
 
+    // 解析所有通用编译选项（规范 §10.3 / §10.4 / §14.1）。
+    CompileOptions opts;
+#ifdef SUKI_PREFER_LLD
+    opts.fuseLld = true;
+#endif
+    std::vector<std::string> files;
+    bool isSubcommand = (cmd == "lex" || cmd == "parse" || cmd == "check" ||
+                         cmd == "emit-ir" || cmd == "build" || cmd == "run");
+    for (int i = (isSubcommand ? 2 : 1); i < argc; ++i) {
+        const char* a = argv[i];
+        if (strcmp(a, "--target") == 0 && i + 1 < argc) { opts.triple = argv[++i]; }
+        else if (strncmp(a, "--target=", 9) == 0) opts.triple = a + 9;
+        else if (strncmp(a, "--sysroot=", 10) == 0) opts.sysroot = a + 10;
+        else if (strcmp(a, "--sysroot") == 0 && i + 1 < argc) opts.sysroot = argv[++i];
+        else if (strcmp(a, "-o") == 0 && i + 1 < argc) opts.outPath = argv[++i];
+        else if (strcmp(a, "-c") == 0) opts.compileOnly = true;
+        else if (strcmp(a, "-S") == 0) opts.emitAsm = true;
+        else if (strcmp(a, "-emit-ir") == 0 || strcmp(a, "--emit-llvm") == 0) opts.emitIR = true;
+        else if (strcmp(a, "-emit-ast") == 0 || strcmp(a, "--dump-ast") == 0) opts.emitAST = true;
+        else if (strcmp(a, "-expand-macros") == 0) opts.expandMacros = true;
+        else if (strcmp(a, "--incremental") == 0) opts.incremental = true;
+        else if (strcmp(a, "--integrated-as") == 0) opts.integratedAs = true;
+        else if (strcmp(a, "--no-integrated-as") == 0) {
+            // LLVM 后端始终使用集成汇编器（规范 §14.1.3），外部汇编器不可用。
+            opts.integratedAs = false;
+            fprintf(stderr, "sukic: warning: --no-integrated-as is not supported; using LLVM integrated assembler\n");
+        }
+        else if (strncmp(a, "-D", 2) == 0) {
+            // 规范 §10.3：`-D FLAG` 或 `-DFLAG=VALUE`（空格或等号分隔均可）。
+            std::string def = a + 2;
+            if (def.empty() && i + 1 < argc) def = argv[++i];
+            opts.defines.push_back(def);
+        }
+        else if (strncmp(a, "-fuse-ld=", 9) == 0) {
+            opts.fuseLld = (strcmp(a + 9, "lld") == 0);
+        }
+        else if (strncmp(a, "-O", 2) == 0) {
+            int lv = parseOptLevel(a, opts.optSize);
+            if (lv >= 0) opts.optLevel = lv;
+            else {
+                // 未知的 -O* 形式：回退到 O2 并打印提示。
+                opts.optLevel = 2;
+                fprintf(stderr, "sukic: warning: unknown optimization flag '%s', using -O2\n", a);
+            }
+        }
+        else if (a[0] == '-' && a[1] != '\0' && !isSubcommand) {
+            fprintf(stderr, "sukic: unknown flag '%s'\n", a);
+            return 2;
+        }
+        else if (cmd == "lex" && a[0] == '-') {
+            fprintf(stderr, "sukic: unknown flag '%s'\n", a);
+            return 2;
+        }
+        else files.emplace_back(a);
+    }
+    // 规范 §8.7：`--target bare-metal` 映射到 freestanding 并禁用标准库。
+    if (opts.triple == "bare-metal") opts.bareMetal = true;
+
+    // ── 子命令分发 ───────────────────────────────────────────────────────────
     if (cmd == "lex") {
         if (files.empty()) { fprintf(stderr, "sukic: lex requires at least one file\n"); return 2; }
         return commandLex(files);
     }
     if (cmd == "parse") {
         if (files.empty()) { fprintf(stderr, "sukic: parse requires at least one file\n"); return 2; }
-        return commandParse(files, dumpAst, dumpExpanded);
+        return commandParse(files, opts);
     }
     if (cmd == "check") {
         if (files.empty()) { fprintf(stderr, "sukic: check requires at least one file\n"); return 2; }
-        return commandCheck(files, dumpExpanded);
+        return commandCheck(files, opts);
     }
     if (cmd == "emit-ir") {
         if (files.empty()) { fprintf(stderr, "sukic: emit-ir requires at least one file\n"); return 2; }
-        return commandEmitIR(files, triple);
+        return commandEmitIR(files, opts);
     }
     if (cmd == "build") {
         if (files.empty()) { fprintf(stderr, "sukic: build requires one input file\n"); return 2; }
-        if (outPath.empty()) outPath = "a.out.o";
-        return commandBuild(files, outPath, triple);
+        return commandBuild(files, opts);
     }
     if (cmd == "run") {
         if (files.empty()) { fprintf(stderr, "sukic: run requires one input file\n"); return 2; }
-        return commandRun(files, triple);
+        return commandLinkAndRun(files, opts, /*execute=*/true);
     }
 
-    fprintf(stderr, "sukic: unknown command '%s'\n\n", cmd.c_str());
-    usage(stderr);
-    return 2;
+    // ── 直接调用模式（规范 §14.1）：`sukic -o out main.suki` / `sukic -c -o out.o main.suki` ──
+    if (files.empty()) { usage(stderr); return 2; }
+    if (opts.emitAST || opts.expandMacros) return commandParse(files, opts);
+    if (opts.emitIR) return commandEmitIR(files, opts);
+    if (opts.compileOnly || opts.emitAsm) return commandBuild(files, opts);
+    // 默认：编译并链接到 -o（或 a.out），不自动运行（运行请用 `sukic run`）。
+    return commandLinkAndRun(files, opts, /*execute=*/false);
 }

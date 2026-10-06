@@ -41,6 +41,7 @@ struct TypeRecord {
     std::vector<const TypeRecord*> protocols;    // declared conformances
     bool isCEnum = false;                        // @enum(C)：C 兼容整数枚举（规范 1.5）
     bool isStdlib = false;                       // 来自被导入的标准库（受信任，可定义 unsafe 类型）
+    const TypeRecord* origRec = nullptr;         // 泛型实例记录回指原始声明（枚举穷举比较用）
     // Members are keyed by name; a property and a method may share a name only
     // via distinct overloads, which we keep in one list and match by arity.
     struct Member {
@@ -54,6 +55,8 @@ struct TypeRecord {
         // TypeRecord；`private` 成员仅当 currentType_ 等于 owner 时可见。
         AccessLevel access = AccessLevel::Internal;
         const TypeRecord* owner = nullptr;
+        // 声明所属模块（空 = 用户主模块）。跨模块访问仅 public/open 可见。
+        std::string module;
     };
     std::vector<Member> members;
     // Enum cases (name → associated value types).
@@ -89,6 +92,10 @@ struct Symbol {
     Node* decl = nullptr;
     const TypeRecord* record = nullptr;  // for Type / EnumCase symbols
     FunctionDecl* function = nullptr;    // for Function symbols
+    // 访问控制（规范 §10.1）：access 为声明的访问级别，module 为其所属模块
+    // （空 = 用户主模块）。跨模块访问仅 public/open 可见。
+    AccessLevel access = AccessLevel::Internal;
+    std::string module;
 };
 
 // ─── Sema ──────────────────────────────────────────────────────────────────
@@ -148,6 +155,9 @@ private:
     void checkInitRules();
     // 成员访问的访问控制检查（规范 10.1）：`private` 成员仅在本类型内可见。
     void checkMemberAccess(const TypeRecord* owner, const TypeRecord::Member* m, Node* at);
+    // 访问控制（规范 §10.1）：跨模块仅 public/open 可见，同模块 internal/
+    // fileprivate 可见（private 由所属类型另行判定）。
+    bool isAccessible(const std::string& targetModule, AccessLevel access) const;
     // 泛型约束检查（规范 2.1）：依据 bindings(类型形参→实参) 校验约束列表。
     bool typeConformsTo(const Type* t, const std::string& protoName) const;
     void checkGenericConstraints(const std::vector<GenericConstraint>& cs,
@@ -174,6 +184,9 @@ private:
     const Type* checkExpr(Node* expr, const TypeRecord* context);
     // Actual inference body; `checkExpr` wraps it to annotate the node.
     const Type* checkExprInner(Node* expr, const TypeRecord* context);
+    // 整数字面量范围校验（规范 §1.5）：按后缀宽度（i8…u64，默认 Int=i64）检查
+    // 溢出；超界或 ERANGE 时报错，避免静默饱和成错误值（非生产级安全/规范合规）。
+    void checkIntegerLiteral(Node* e);
     const Type* checkExprNoContext(Node* expr) { return checkExpr(expr, nullptr); }
 
     // Helper: require two types compatible; report on mismatch.
@@ -268,6 +281,8 @@ private:
     // Current function context (for return-type checking while walking).
     const Type* currentReturn_ = nullptr;
     const TypeRecord* currentType_ = nullptr;  // enclosing named type (for `self`)
+    // 当前正在分析的声明所属模块（空 = 用户主模块），用于 §10.1 跨模块访问控制。
+    std::string currentModule_;
     bool currentThrows_ = false;
     // While checking a binding/case pattern, bare identifiers are bindings (not
     // value references) and must not be reported as unresolved.
@@ -280,6 +295,9 @@ private:
     // further assignment is an error, and reading it before initialisation is
     // an error too. Keyed by variable name in the current function.
     std::unordered_set<std::string> pendingInit_;
+    // 正在检查赋值表达式的左值：此处是「写入」而非「读取」，确定性赋值分析
+    // （规范 §1.3）不得把左值当作「使用前未初始化」来报错。
+    bool inAssignmentLhs_ = false;
     // Type of the switch subject while its case clauses are being checked, so
     // that `case let v` can bind `v` with the subject's type.
     const Type* switchSubjectType_ = nullptr;
@@ -289,6 +307,17 @@ private:
     bool hadError_ = false;
     // 进入 `unsafe` 块时置位（规范 8.6）：裸指针/非托管类型仅在此上下文可用。
     bool unsafeContext_ = false;
+    // 规范 §8.7 裸机属性（`never` 之外）：校验结果供 codegen 取用。
+    FunctionDecl* panicHandlerFn_ = nullptr;   // @panic_handler 标注的函数
+    TypeDecl* globalAllocatorDecl_ = nullptr;  // @global_allocator 标注的类型
+    void validateBareMetalAttrs(const NodeList& decls);
+
+    // 正在检查受信任标准库声明时为 true。标准库可自由定义/使用 unsafe 类型
+    // （如 memory 模块的 UnsafePointer 系列），故 gating 在 stdlib 上下文跳过，
+    // 仅对用户代码（且不在 unsafe 块内）强制（规范 8.6）。
+    bool checkingStdlib_ = false;
+    // 当前作用域内可见的循环标签（规范 §1.7 `outer: loop { … break outer }`）。
+    std::vector<std::string> loopLabels_;
     // 被导入标准库（prelude）声明的数量。这些声明受信任，可定义 unsafe 类型；
     // 用户代码仍受 unsafe 上下文约束。见 analyze() 中各 pass 的按索引切换。
     size_t stdlibDeclCount_ = 0;

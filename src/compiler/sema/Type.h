@@ -56,6 +56,11 @@ enum class RefKind {
     Owned,     // Owned<T> (unique ownership / move)
 };
 
+// ─── 调用约定（规范 §6.3 C 互操作 / @convention）────────────────────────────
+// 函数（含函数指针）的调用约定，对应 LLVM CallingConv。Default 即目标平台默认
+// 约定（x86_64 上为 C）；C 显式使用 C 调用约定；StdCall 对应 Win32 stdcall。
+enum class CallConv { Default, C, StdCall };
+
 // ─── Type ──────────────────────────────────────────────────────────────────
 struct Type {
     TypeKind kind = TypeKind::Unknown;
@@ -77,6 +82,9 @@ struct Type {
     std::vector<std::string> labels;
     // Function/Closure return.
     const Type* ret = nullptr;
+    // 函数（含函数指针）调用约定（规范 §6.3 / @convention）。Default 表示
+    // 沿用目标平台默认约定；C / StdCall 显式指定 C / Win32 stdcall。
+    CallConv callConv = CallConv::Default;
     // Ref wrapper kind.
     RefKind refKind = RefKind::Shared;
     // Closure capture descriptors (unused for now; reserved).
@@ -111,7 +119,8 @@ public:
     const Type* set(const Type* elem);
     const Type* tuple(std::vector<const Type*> elems,
                       std::vector<std::string> labels = {});
-    const Type* function(std::vector<const Type*> params, const Type* ret);
+    const Type* function(std::vector<const Type*> params, const Type* ret,
+                      CallConv cc = CallConv::Default);
     const Type* closure(std::vector<const Type*> params, const Type* ret,
                         std::vector<std::string> captures = {});
     const Type* ref(RefKind k, const Type* pointee);

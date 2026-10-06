@@ -6,6 +6,9 @@
 #include "compiler/lexer/Token.h" // punctToString
 
 // LLVM headers live ONLY in this file (strict PIMPL).
+#include <cerrno>
+#include <limits>
+#include <unordered_map>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
@@ -1130,6 +1133,14 @@ private:
                 owner_->module_.get());
             // @_cdecl("name"): foreign functions use the given C symbol name.
             if (fn->isForeign && !fn->cdeclName.empty()) f->setName(fn->cdeclName);
+            // @convention(c|stdcall)（规范 §6.3）：为声明（含 foreign）函数设置
+            // 匹配的 LLVM calling convention。显式声明的约定（c/stdcall）优先；未
+            // 声明时 foreign 函数默认采用 C 约定。stdcall 在 32 位 x86 / Windows
+            // 上对应 X86_StdCall，其它目标上由后端按默认 ABI 处理。
+            if (fn->convention == "stdcall")
+                f->setCallingConv(llvm::CallingConv::X86_StdCall);
+            else
+                f->setCallingConv(llvm::CallingConv::C);
             owner_->fns_[symName] = f;
             owner_->fnDecls_[fn->name] = fn;
             owner_->pendingBodies_.emplace_back(fn, symName);
@@ -1248,6 +1259,34 @@ private:
         explicit ExprGen(Impl* o) : owner_(o) {}
         Impl* owner_;
 
+        // ── 类型化非托管指针特化（规范 §6.5 / §8.1）────────────────────────────
+        // 取 base 变量地址 → GEP 到 raw 字段（索引 0）→ load int64 地址位。
+        llvm::Value* genUnsafeRawAddr(const Type* baseTy, Node* baseNode) {
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            llvm::Value* baseAddr = owner_->genAddr(baseNode);
+            if (!baseAddr) return nullptr;
+            llvm::Type* sty = owner_->layout_->lower(baseTy);
+            // 结构体字段 GEP 必须使用 i32 字段索引（CreateStructGEP 已处理）。
+            llvm::Value* gep = owner_->b_->CreateStructGEP(sty, baseAddr, 0, "raw.addr");
+            return owner_->b_->CreateLoad(i64, gep, "rawaddr");
+        }
+        // 计算元素地址：inttoptr(raw + idx*stride, elemTy*)。idx 为空时即 pointee。
+        llvm::Value* genUnsafeElemPtr(const Type* baseTy, Node* baseNode,
+                                      const Type* elemTy, llvm::Value* idx) {
+            llvm::Value* raw = genUnsafeRawAddr(baseTy, baseNode);
+            if (!raw) return nullptr;
+            llvm::Type* et = owner_->layout_->lower(elemTy);
+            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+            if (idx) {
+                uint64_t stride = owner_->sizeOf(et);
+                llvm::Value* off = owner_->b_->CreateMul(
+                    idx, llvm::ConstantInt::get(i64, (uint64_t)stride), "offset");
+                raw = owner_->b_->CreateAdd(raw, off, "addr");
+            }
+            return owner_->b_->CreateIntToPtr(
+                raw, llvm::PointerType::getUnqual(et), "elemptr");
+        }
+
         // 变量声明（含元组解构）的生成。
         void genVarDecl(VarDecl* vd) {
             // 元组解构 `let (a, b) = (1, 2)`：为每个名字建槽，逐分量 extract。
@@ -1336,13 +1375,29 @@ private:
                 case NodeKind::ThrowStmt: owner_->genThrow(static_cast<ThrowStmt*>(s)); return;
                 case NodeKind::DoStmt: owner_->genDoStmt(static_cast<DoStmt*>(s)); return;
                 case NodeKind::BreakStmt: {
-                    // `break` leaves the innermost enclosing loop or switch.
+                    // `break` 跳出最内层循环/switch；带标签时跳到对应循环出口。
+                    auto* b = static_cast<BreakStmt*>(s);
+                    if (!b->label.empty()) {
+                        auto it = owner_->labelTargets_.find(b->label);
+                        if (it != owner_->labelTargets_.end()) {
+                            owner_->b_->CreateBr(it->second.first);
+                            return;
+                        }
+                    }
                     if (!owner_->breakTargets_.empty())
                         owner_->b_->CreateBr(owner_->breakTargets_.back());
                     return;
                 }
                 case NodeKind::ContinueStmt: {
-                    // `continue` jumps to the innermost loop's step block.
+                    // `continue` 跳到最内层循环步进位；带标签时跳到对应循环头。
+                    auto* c = static_cast<ContinueStmt*>(s);
+                    if (!c->label.empty()) {
+                        auto it = owner_->labelTargets_.find(c->label);
+                        if (it != owner_->labelTargets_.end()) {
+                            owner_->b_->CreateBr(it->second.second);
+                            return;
+                        }
+                    }
                     if (!owner_->continueTargets_.empty())
                         owner_->b_->CreateBr(owner_->continueTargets_.back());
                     return;
@@ -1433,6 +1488,29 @@ private:
                     }
                     owner_->b_->SetInsertPoint(fBB);
                     if (binding) owner_->bindOptionalPayload(binding, payload);
+                    return;
+                }
+                case NodeKind::LoopStmt: {
+                    auto* l = static_cast<LoopStmt*>(s);
+                    llvm::Function* f = owner_->b_->GetInsertBlock()->getParent();
+                    llvm::BasicBlock* headBB =
+                        llvm::BasicBlock::Create(*owner_->ctx_, "loop.head", f);
+                    llvm::BasicBlock* exitBB =
+                        llvm::BasicBlock::Create(*owner_->ctx_, "loop.exit", f);
+                    owner_->b_->CreateBr(headBB);
+                    owner_->b_->SetInsertPoint(headBB);
+                    if (!l->label.empty())
+                        owner_->labelTargets_[l->label] = {exitBB, headBB};
+                    owner_->breakTargets_.push_back(exitBB);
+                    owner_->continueTargets_.push_back(headBB);
+                    for (auto& st : l->body) owner_->genStmt(st.get());
+                    owner_->breakTargets_.pop_back();
+                    owner_->continueTargets_.pop_back();
+                    if (!l->label.empty())
+                        owner_->labelTargets_.erase(l->label);
+                    if (!owner_->b_->GetInsertBlock()->getTerminator())
+                        owner_->b_->CreateBr(headBB);
+                    owner_->b_->SetInsertPoint(exitBB);
                     return;
                 }
                 case NodeKind::WhileStmt: {
@@ -1918,6 +1996,16 @@ private:
                 if (u->isTry) return v;
                 if (u->isAwait) {
                     if (!v) return nullptr;
+                    // 规范 §7.4 重入：在 actor 隔离域内，`await` 挂起前先释放隔离，
+                    // 让队列中的其他任务得以进入；await 返回后再重新排队取回。
+                    if (llvm::Value* isoLock = owner_->currentActorIsolationLock()) {
+                        llvm::PointerType* i64p = llvm::PointerType::getUnqual(
+                            llvm::Type::getInt64Ty(*owner_->ctx_));
+                        owner_->b_->CreateCall(
+                            owner_->declareExternalSig("suki_actor_leave", { i64p },
+                                llvm::Type::getVoidTy(*owner_->ctx_)),
+                            { owner_->b_->CreateBitCast(isoLock, i64p) });
+                    }
                     llvm::Type* voidTy = llvm::Type::getVoidTy(*owner_->ctx_);
                     llvm::PointerType* i8p = llvm::PointerType::get(*owner_->ctx_, 0);
                     llvm::Function* awaitFn = owner_->declareExternalSig(
@@ -1932,6 +2020,15 @@ private:
                         llvm::Value* tmp = owner_->b_->CreateAlloca(
                             llvm::Type::getInt64Ty(*owner_->ctx_), nullptr, "await.void");
                         owner_->b_->CreateCall(awaitFn, { v, owner_->b_->CreateBitCast(tmp, i8p) });
+                        // 重入：await 完成，重新获取 actor 隔离。
+                        if (llvm::Value* isoLock = owner_->currentActorIsolationLock()) {
+                            llvm::PointerType* i64p = llvm::PointerType::getUnqual(
+                                llvm::Type::getInt64Ty(*owner_->ctx_));
+                            owner_->b_->CreateCall(
+                                owner_->declareExternalSig("suki_actor_enter", { i64p },
+                                    llvm::Type::getVoidTy(*owner_->ctx_)),
+                                { owner_->b_->CreateBitCast(isoLock, i64p) });
+                        }
                         owner_->b_->CreateCall(freeFn, { v });
                         return llvm::Constant::getNullValue(
                             llvm::Type::getInt32Ty(*owner_->ctx_));
@@ -1940,6 +2037,15 @@ private:
                     if (!rty) return nullptr;
                     llvm::Value* out = owner_->b_->CreateAlloca(rty, nullptr, "awaited");
                     owner_->b_->CreateCall(awaitFn, { v, owner_->b_->CreateBitCast(out, i8p) });
+                    // 重入：await 完成，重新获取 actor 隔离。
+                    if (llvm::Value* isoLock = owner_->currentActorIsolationLock()) {
+                        llvm::PointerType* i64p = llvm::PointerType::getUnqual(
+                            llvm::Type::getInt64Ty(*owner_->ctx_));
+                        owner_->b_->CreateCall(
+                            owner_->declareExternalSig("suki_actor_enter", { i64p },
+                                llvm::Type::getVoidTy(*owner_->ctx_)),
+                            { owner_->b_->CreateBitCast(isoLock, i64p) });
+                    }
                     owner_->b_->CreateCall(freeFn, { v });
                     return owner_->b_->CreateLoad(rty, out);
                 }
@@ -2001,6 +2107,27 @@ private:
             case NodeKind::ClosureExpr:
                 return owner_->emitClosure(static_cast<ClosureExpr*>(e));
             case NodeKind::CallExpr: {
+                // `unsafeBitCast<From, To>(value)`（规范 §6.3 C 互操作）：将 value
+                // 的位模式按 To 类型重新解释。通过 alloca 中转（以 From 存入、以
+                // To 读出）对任意同尺寸类型（含聚合 / 指针）都安全，避免 LLVM
+                // bitcast 对尺寸不等类型的限制。
+                if (auto* ub = static_cast<CallExpr*>(e); ub->isUnsafeBitCast) {
+                    if (llvm::Value* v = genExpr(ub->arguments[0].get())) {
+                        llvm::Type* dst = owner_->layout_->lower(ub->bitCastTo);
+                        if (dst) {
+                            llvm::Type* src = owner_->layout_->lower(ub->bitCastFrom);
+                            if (src) {
+                                llvm::Value* slot = owner_->b_->CreateAlloca(src);
+                                owner_->b_->CreateStore(v, slot);
+                                llvm::Value* p = owner_->b_->CreateBitCast(
+                                    slot, llvm::PointerType::get(dst, 0));
+                                return owner_->b_->CreateLoad(dst, p);
+                            }
+                            return owner_->b_->CreateBitCast(v, dst);
+                        }
+                    }
+                    return nullptr;
+                }
                 // A built-in scalar type in callee position is a conversion:
                 // `Int(x)`, `Double(n)`, `Char("A")`. Sema has already typed the
                 // expression as the target type; here it becomes the actual cast.
@@ -2030,6 +2157,25 @@ private:
                         return owner_->coerceForCast(v, target, e->semaType);
                     }
                 }
+                // 类型化非托管指针 `ptr.deallocate()`（规范 §6.5 / §8.1）：编译器特化
+                // 发射 `suki_ptr_drop(ptr.raw)`。泛型方法体内的 `self` 字段访问在单态化
+                // 后尚未正确生成，故此处合成调用，不依赖标准库方法体。
+                if (auto* c = static_cast<CallExpr*>(e);
+                    c->callee && c->callee->kind == NodeKind::MemberExpr) {
+                    auto* m = static_cast<MemberExpr*>(c->callee.get());
+                    if (m->isUnsafeDeallocate && m->base) {
+                        const Type* bt = m->base->semaType;
+                        if (bt && bt->kind == TypeKind::Named) {
+                            llvm::Type* i64 = llvm::Type::getInt64Ty(*owner_->ctx_);
+                            if (llvm::Value* raw = genUnsafeRawAddr(bt, m->base.get())) {
+                                llvm::FunctionCallee drop = owner_->declareExternalSig(
+                                    "suki_ptr_drop", {i64}, i64);
+                                owner_->b_->CreateCall(drop, {raw});
+                            }
+                            return nullptr; // void
+                        }
+                    }
+                }
                 // `Enum.case(payload...)` builds a tagged union: a tag plus a
                 // heap box holding the case's payload fields.
                 if (auto* c = static_cast<CallExpr*>(e);
@@ -2044,10 +2190,28 @@ private:
                             auto eit = owner_->enumTypes_.find(bn);
                             if (eit != owner_->enumTypes_.end()) et = eit->second;
                         }
+                        // 泛型枚举构造 `Box<Int>.value(42)`：基类是 GenericExpr，
+                        // 取其 semaType（实例化类型）以获得正确的 {i64,i8*} 类型。
+                        if (!et && m->base && m->base->semaType)
+                            et = m->base->semaType;
                         llvm::Type* ety = et ? owner_->layout_->lower(et) : llvm::Type::getInt64Ty(*owner_->ctx_);
                         llvm::Value* boxed = nullptr;
-                        if (llvm::StructType* pt = owner_->casePayloadType(rec, (size_t)tag)) {
-                            llvm::Value* buf = owner_->b_->CreateAlloca(pt, nullptr, "payload");
+                        if (llvm::StructType* pt = owner_->casePayloadType(
+                                rec, (size_t)tag, e->semaType)) {
+                            // 载荷盒子必须堆分配：枚举值持有其指针，若用栈 alloca
+                            // 会在构造所在栈帧结束后悬垂（枚举值被函数返回/存入变量
+                            // 时取到垃圾）。改为 suki_alloc 使其在枚举值生命周期内存活。
+                            llvm::Value* sz = llvm::ConstantInt::get(
+                                llvm::Type::getInt64Ty(*owner_->ctx_),
+                                (uint64_t)owner_->sizeOf(pt));
+                            llvm::Value* raw = owner_->b_->CreateCall(
+                                owner_->declareExternalSig(
+                                    "suki_alloc",
+                                    { llvm::Type::getInt64Ty(*owner_->ctx_) },
+                                    llvm::PointerType::get(*owner_->ctx_, 0)),
+                                { sz }, "payload.heap");
+                            llvm::Value* buf = owner_->b_->CreateBitCast(
+                                raw, llvm::PointerType::get(pt, 0));
                             for (size_t i = 0; i < c->arguments.size(); ++i) {
                                 llvm::Value* av = genExpr(c->arguments[i].get());
                                 if (!av) continue;
@@ -2056,8 +2220,7 @@ private:
                                 owner_->b_->CreateStore(av, owner_->b_->CreateStructGEP(
                                     pt, buf, fi));
                             }
-                            boxed = owner_->b_->CreateBitCast(
-                                buf, llvm::PointerType::get(*owner_->ctx_, 0));
+                            boxed = raw;
                         }
                         llvm::Value* v = llvm::UndefValue::get(ety);
                         v = owner_->b_->CreateInsertValue(v, owner_->tagConstant(tag), {0});
@@ -2243,6 +2406,17 @@ private:
                 if (!recv) return nullptr;
                 llvm::Value* idx = genExpr(sx->indices[0].get());
                 if (!idx) return nullptr;
+                // 类型化缓冲指针下标读取（规范 §6.5 / §8.1）：
+                // inttoptr(base.raw + idx*stride, T*) 后 load。
+                if (sx->isUnsafeBufferSubscript) {
+                    const Type* et = sx->semaType;
+                    if (bt && bt->kind == TypeKind::Named && et) {
+                        if (llvm::Value* ep = genUnsafeElemPtr(bt, sx->base.get(), et, idx))
+                            return owner_->b_->CreateLoad(
+                                owner_->layout_->lower(et), ep, "buf.elem");
+                    }
+                    return nullptr;
+                }
                 if (bt && bt->kind == TypeKind::Array) {
                     llvm::Type* aty = owner_->layout_->lower(bt);
                     const Type* et = bt->element;
@@ -2379,6 +2553,18 @@ private:
                         uint64_t v = (m->member == "alignment") ? al : sz; // size/stride 均含尾部填充
                         return owner_->tagConstant((int64_t)v);
                     }
+                }
+                // 类型化非托管指针 pointee 读取（规范 §6.5 / §8.1）：
+                // inttoptr(base.raw, T*) 后 load。base.raw 为保存地址的 int64 字段。
+                if (m->isUnsafePointee) {
+                    const Type* bt = m->base ? m->base->semaType : nullptr;
+                    const Type* et = m->semaType;
+                    if (bt && bt->kind == TypeKind::Named && et) {
+                        if (llvm::Value* ep = genUnsafeElemPtr(bt, m->base.get(), et, nullptr))
+                            return owner_->b_->CreateLoad(
+                                owner_->layout_->lower(et), ep, "pointee");
+                    }
+                    return nullptr;
                 }
                 // A labelled tuple element (`pair.code`) is indexed by the label's
                 // position, not looked up as a field. Sema records the element
@@ -2537,6 +2723,21 @@ private:
                 // the aggregate's value semantics (write in place, no copy).
                 if (a->lhs && a->lhs->kind == NodeKind::MemberExpr) {
                     auto* m = static_cast<MemberExpr*>(a->lhs.get());
+                    // 类型化非托管指针 pointee 写入（规范 §6.5 / §8.1）。
+                    if (m->isUnsafePointee) {
+                        const Type* bt = m->base ? m->base->semaType : nullptr;
+                        const Type* et = m->semaType;
+                        llvm::Value* v = genExpr(a->rhs.get());
+                        if (bt && bt->kind == TypeKind::Named && et && v) {
+                            if (llvm::Value* ep =
+                                    genUnsafeElemPtr(bt, m->base.get(), et, nullptr)) {
+                                owner_->b_->CreateStore(
+                                    owner_->coerce(v, owner_->layout_->lower(et)), ep);
+                                return v;
+                            }
+                        }
+                        return v ? v : nullptr;
+                    }
                     if (llvm::GEPOperator* fp = owner_->genFieldPtr(m)) {
                         llvm::Value* v = genExpr(a->rhs.get());
                         if (v) {
@@ -2715,6 +2916,19 @@ private:
                                                          : genExpr(sx->indices[0].get());
                     llvm::Value* val = genExpr(a->rhs.get());
                     if (!recv || !idx || !val) return genExpr(a->rhs.get());
+                    // 类型化缓冲指针下标写入（规范 §6.5 / §8.1）。
+                    if (sx->isUnsafeBufferSubscript) {
+                        const Type* et = sx->semaType;
+                        if (bt && bt->kind == TypeKind::Named && et) {
+                            if (llvm::Value* ep =
+                                    genUnsafeElemPtr(bt, sx->base.get(), et, idx)) {
+                                owner_->b_->CreateStore(
+                                    owner_->coerce(val, owner_->layout_->lower(et)), ep);
+                                return val;
+                            }
+                        }
+                        return val;
+                    }
                     if (bt->kind == TypeKind::Array) {
                         llvm::Type* aty = owner_->layout_->lower(bt);
                         const Type* et = bt->element;
@@ -2910,6 +3124,9 @@ private:
         llvm::Function* f = fns_[symName];
         if (!f || !f->empty()) return;
         isMain_ = isMainFns_[symName];
+        // 自由函数体不在 actor 隔离域内：清空标记，避免上一次 actor 方法生成
+        // 时设置的值残留并错误地释放他人的隔离（规范 §7.4）。
+        actorIsolationOwner_ = nullptr;
         // 不透明返回类型（规范 5.5）：仅当返回类型为 `some P` 时才优先使用 Sema
         // 推断出的底层具体类型（fn->semaType->ret）；泛型等仍走 fn->returnType->semaType，
         // 避免泛型实例化的克隆 fn->semaType 携带泛型 ret 导致签名不匹配。
@@ -3042,14 +3259,42 @@ private:
         return typeReg_.lowerDeclType(sema, typeRepr);
     }
 
+    // 把枚举泛型参数按具体实例化类型替换成实参类型（如 `Box<Int>` 的 `T`→`Int`）。
+    std::vector<const Type*> resolveAssociated(const TypeRecord* rec,
+                                                size_t caseIdx,
+                                                const Type* enumType) {
+        std::vector<const Type*> out;
+        if (caseIdx >= rec->cases.size()) return out;
+        const auto& assoc = rec->cases[caseIdx].associated;
+        out.reserve(assoc.size());
+        std::vector<std::pair<std::string, const Type*>> map;
+        if (enumType && enumType->kind == TypeKind::Named) {
+            for (size_t i = 0;
+                 i < rec->genericParams.size() && i < enumType->elements.size(); ++i)
+                map.emplace_back(rec->genericParams[i], enumType->elements[i]);
+        }
+        for (const Type* at : assoc) {
+            const Type* resolved = at;
+            if (at && at->kind == TypeKind::Named) {
+                for (auto& kv : map)
+                    if (at->name == kv.first) { resolved = kv.second; break; }
+            }
+            out.push_back(resolved);
+        }
+        return out;
+    }
+
     // LLVM struct type holding one case's payload fields, created on demand.
-    llvm::StructType* casePayloadType(const TypeRecord* rec, size_t caseIdx) {
+    // 传入 enumType 时按实例化实参替换泛型关联类型（支持泛型枚举 `Box<Int>` 等）。
+    llvm::StructType* casePayloadType(const TypeRecord* rec, size_t caseIdx,
+                                      const Type* enumType = nullptr) {
         if (caseIdx >= rec->cases.size()) return nullptr;
         const auto& assoc = rec->cases[caseIdx].associated;
         if (assoc.empty()) return nullptr;
+        auto concrete = resolveAssociated(rec, caseIdx, enumType);
         std::vector<llvm::Type*> fields;
-        fields.reserve(assoc.size());
-        for (const Type* at : assoc) fields.push_back(layout_->lower(at));
+        fields.reserve(concrete.size());
+        for (const Type* at : concrete) fields.push_back(layout_->lower(at));
         return llvm::StructType::get(*ctx_, fields);
     }
 
@@ -3136,12 +3381,20 @@ private:
     }
 
     // Integer literal text (`42`, `0xFF`, `42i8`) as an int64. The type suffix
-    // that the lexer keeps in the text is stripped first.
+    // that the lexer keeps in the text is stripped first. Overflow (ERANGE) is
+    // clamped defensively: Sema already reports the out-of-range error and the
+    // driver stops before code generation, but this guards any path that reaches
+    // here (e.g. malformed input that slipped past analysis) from feeding an
+    // out-of-range value into an LLVM constant.
     static int64_t parseIntLiteral(const std::string& in) {
         std::string t = in;
         while (!t.empty() && (std::isalpha((unsigned char)t.back()) || t.back() == '_'))
             t.pop_back();
-        return static_cast<int64_t>(std::strtoull(t.c_str(), nullptr, 0));
+        errno = 0;
+        unsigned long long v = std::strtoull(t.c_str(), nullptr, 0);
+        if (errno == ERANGE)
+            return std::numeric_limits<int64_t>::max();
+        return static_cast<int64_t>(v);
     }
 
     // The Unicode scalar behind a one-character string literal. ASCII folds to
@@ -3227,7 +3480,8 @@ private:
         int64_t ptag = -1;
         const TypeRecord* prec = enumCaseOf(pm, &ptag);
         if (!prec) return;
-        llvm::StructType* pt = casePayloadType(prec, (size_t)ptag);
+        const Type* baseType = (pm->base ? pm->base->semaType : nullptr);
+        llvm::StructType* pt = casePayloadType(prec, (size_t)ptag, baseType);
         if (!pt) return;
         llvm::Value* p = b_->CreateExtractValue(subject, {1}, "payload.ptr");
         llvm::Value* buf = b_->CreateBitCast(p, llvm::PointerType::getUnqual(pt));
@@ -4380,7 +4634,16 @@ private:
         llvm::Value* fp = b_->CreatePointerCast(fn, fty->getPointerTo());
         std::vector<llvm::Value*> callArgs{ ctxv };
         for (llvm::Value* a : args) callArgs.push_back(a);
-        return b_->CreateCall(fty, fp, callArgs);
+        llvm::CallInst* call = b_->CreateCall(fty, fp, callArgs);
+        // @convention(c|stdcall)：被调用方为带显式调用约定的函数指针时，间接
+        // 调用指令必须携带匹配的 LLVM calling convention（规范 §6.3）。
+        if (ct && ct->kind == TypeKind::Function) {
+            if (ct->callConv == CallConv::C)
+                call->setCallingConv(llvm::CallingConv::C);
+            else if (ct->callConv == CallConv::StdCall)
+                call->setCallingConv(llvm::CallingConv::X86_StdCall);
+        }
+        return call;
     }
 
     // ─── async / Future lowering (real threads) ────────────────────────────────
@@ -4677,9 +4940,11 @@ private:
                     // (and non-class receivers) keep the static call above, which
                     // is what lets an override extend rather than replace.
                     // Actor isolation (规范 7.4): a call into an actor crosses an
-                    // isolation boundary, so it is asynchronous — and the actor's
-                    // own lock is held for the duration of the call, which is what
-                    // keeps its mutable state free of data races.
+                    // isolation boundary, so it is asynchronous. 执行权由 actor 的
+                    // **串行执行器队列**授予：suki_actor_enter 取票并等待轮到自己
+                    // （FIFO，不会饥饿/乱序），suki_actor_leave 把执行权交给队列中
+                    // 的下一个任务。这既保证了可变状态无数据竞争，也满足规范要求的
+                    // 串行队列语义。
                     const bool isActorCall = bt->record &&
                         bt->record->kind == TypeDeclKind::Actor;
                     llvm::Value* actorLockPtr = nullptr;
@@ -4690,7 +4955,7 @@ private:
                                                                "actor.lock");
                             llvm::PointerType* i64p = llvm::PointerType::getUnqual(
                                 llvm::Type::getInt64Ty(*ctx_));
-                            b_->CreateCall(declareExternalSig("suki_spin_lock",
+                            b_->CreateCall(declareExternalSig("suki_actor_enter",
                                 { i64p }, llvm::Type::getVoidTy(*ctx_)),
                                 { b_->CreateBitCast(actorLockPtr, i64p) });
                         }
@@ -4725,7 +4990,7 @@ private:
                     if (isActorCall && actorLockPtr) {
                         llvm::PointerType* i64p = llvm::PointerType::getUnqual(
                             llvm::Type::getInt64Ty(*ctx_));
-                        b_->CreateCall(declareExternalSig("suki_spin_unlock",
+                        b_->CreateCall(declareExternalSig("suki_actor_leave",
                             { i64p }, llvm::Type::getVoidTy(*ctx_)),
                             { b_->CreateBitCast(actorLockPtr, i64p) });
                         // The call itself completed synchronously under the lock, so
@@ -4897,12 +5162,21 @@ private:
         // arguments, so an exact match on the printed types is what selects it.
         auto mit = monoNames_.find(n);
         if (mit != monoNames_.end() && !mit->second.empty()) {
-            std::string want = n + "<";
-            for (size_t i = 0; i < argTypeNames.size(); ++i) {
-                if (i) want += ",";
-                want += argTypeNames[i];
+            std::string want;
+            if (!e->genericTypeArgs.empty()) {
+                // Use the exact type arguments Sema resolved for this call. They are
+                // identical to the strings the monomorphiser used to name the
+                // instance, so the lookup is exact even for 2+ type parameters
+                // (which the argument-type reconstruction below got wrong).
+                want = monoSymbol(n, e->genericTypeArgs);
+            } else {
+                want = n + "<";
+                for (size_t i = 0; i < argTypeNames.size(); ++i) {
+                    if (i) want += ",";
+                    want += argTypeNames[i];
+                }
+                want += ">";
             }
-            want += ">";
             auto fit = std::find(mit->second.begin(), mit->second.end(), want);
             if (fit == mit->second.end()) fit = mit->second.begin();
             llvm::Function* inst = fns_.count(*fit) ? fns_[*fit] : nullptr;
@@ -5041,7 +5315,10 @@ public:
                     if (!mem.isFunction || !mem.decl ||
                         mem.decl->kind != NodeKind::FunctionDecl) continue;
                     auto* mf = static_cast<FunctionDecl*>(mem.decl);
-                    declareMethod(td->name + "." + mf->name, mf, td->semaType);
+                    // 规范 §8.7：@no_mangle 保留给定符号名，不改写成 "Type.method"。
+                    std::string nmSym = mf->name;
+                    declareMethod(td->name + "." + mf->name, mf, td->semaType,
+                                  hasAttr(mf, "no_mangle") ? &nmSym : nullptr);
                     methodOrder_.emplace_back(mf, td->semaType);
                 }
                 for (const auto& mem : td->semaType->record->members) {
@@ -5102,7 +5379,10 @@ public:
                 if (!mem.isFunction || !mem.decl ||
                     mem.decl->kind != NodeKind::FunctionDecl) continue;
                 auto* mf = static_cast<FunctionDecl*>(mem.decl);
-                declareMethod(td->name + "." + mf->name, mf, td->semaType);
+                // 规范 §8.7：@no_mangle 保留给定符号名，不改写成 "Type.method"。
+                std::string nmSym = mf->name;
+                declareMethod(td->name + "." + mf->name, mf, td->semaType,
+                              hasAttr(mf, "no_mangle") ? &nmSym : nullptr);
                 methodOrder_.emplace_back(mf, td->semaType);
             }
         }
@@ -5271,11 +5551,13 @@ public:
     // LLVM's TargetMachine + MC/AsmPrinter. Replaces the old `clang -c`
     // shell-out so the driver is fully self-contained for code generation.
     bool emitObject(const NodeList& decls, const std::string& objPath,
-                    std::string* irOut, std::string& errOut) {
+                    std::string* irOut, std::string& errOut,
+                    int optLevel, bool optSize, bool emitAsm) {
         if (!generate(decls, errOut)) return false;
         if (irOut) *irOut = irText();
 
         std::string err;
+        llvm::TargetOptions opts;
         const llvm::Target* target =
             llvm::TargetRegistry::lookupTarget(target_.triple, err);
         if (!target) {
@@ -5283,14 +5565,27 @@ public:
                      "': " + err;
             return false;
         }
-        llvm::TargetOptions opts;
+        // 规范 §10.4 / §14.1.3：把 `-O*` / `-Os` 映射到 LLVM 优化级别。
+        // 0=None(O0)，1=Less(O1)，2=Default(O2)，3=Aggressive(O3)；
+        // optSize 对应 `-Os`（尺寸优先，通过 TargetOptions.OptimizeSize 启用）。
+        llvm::CodeGenOptLevel ol = llvm::CodeGenOptLevel::None;
+        if (optLevel >= 3) ol = llvm::CodeGenOptLevel::Aggressive;
+        else if (optLevel == 2) ol = llvm::CodeGenOptLevel::Default;
+        else if (optLevel == 1) ol = llvm::CodeGenOptLevel::Less;
+        if (optSize) {
+            // 规范 §10.4 / §14.1.3：`-Os` 尺寸优先。LLVM 没有独立的 size 优化级别，
+            // 改为给所有函数附加 OptimizeForSize 属性，促使后端按尺寸取舍。
+            for (auto& F : *module_)
+                F.addFnAttr(llvm::Attribute::OptimizeForSize);
+        }
+
         // Emit position-independent code: the system linker builds a PIE
         // executable by default, so absolute (R_X86_64_32) relocations would be
         // rejected. PIC relocations (R_X86_64_PC32, RIP-relative) match what the
         // precompiled runtime object uses and link cleanly into a PIE.
         std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
             target_.triple, "generic", "", opts, llvm::Reloc::PIC_,
-            std::nullopt, llvm::CodeGenOptLevel::None));
+            std::nullopt, ol));
         if (!tm) {
             errOut = "cannot create target machine for '" + target_.triple + "'";
             return false;
@@ -5307,10 +5602,14 @@ public:
         }
 
         llvm::legacy::PassManager pm;
-        if (tm->addPassesToEmitFile(pm, dest, /*DwoOut=*/nullptr,
-                                    llvm::CodeGenFileType::ObjectFile)) {
+        // 规范 §14.1.3：`-S` 输出汇编文本，否则输出对象文件。
+        llvm::CodeGenFileType ft = emitAsm ? llvm::CodeGenFileType::AssemblyFile
+                                           : llvm::CodeGenFileType::ObjectFile;
+        if (tm->addPassesToEmitFile(pm, dest, /*DwoOut=*/nullptr, ft)) {
             errOut = "target '" + target_.triple +
-                     "' does not support object-file emission";
+                     "' does not support " +
+                     (emitAsm ? std::string("assembly") : std::string("object-file")) +
+                     " emission";
             return false;
         }
         pm.run(*module_);
@@ -5332,10 +5631,31 @@ public:
     std::unordered_set<std::string> inoutLocals_;
     llvm::Type* currentRet_ = nullptr;
     bool isMain_ = false;
+    // 规范 §7.4 重入：当前方法体所属 actor 的类型（空 = 不在 actor 隔离域内）。
+    const Type* actorIsolationOwner_ = nullptr;
+    // 惰性生成 actor 隔离锁指针（对象头 index 3）。必须惰性：方法体入口处
+    // 插入点尚未建立，提前发射 GEP 会把指令落到上一个基本块末尾，
+    // IR 验证会报 "Basic Block does not have terminator"。
+    llvm::Value* currentActorIsolationLock() {
+        if (!actorIsolationOwner_ || !actorIsolationOwner_->record ||
+            actorIsolationOwner_->record->kind != TypeDeclKind::Actor)
+            return nullptr;
+        auto it = locals_.find("self");
+        if (it == locals_.end()) return nullptr;
+        llvm::StructType* ost = layout_->objectType(actorIsolationOwner_->record);
+        if (!ost) return nullptr;
+        llvm::Value* obj = b_->CreateLoad(llvm::PointerType::getUnqual(*ctx_),
+                                          it->second, "self.obj");
+        return b_->CreateStructGEP(ost, obj, 3, "actor.iso");
+    }
     // Declare a value-type instance method. The receiver is an implicit first
     // parameter: a `mutating` method receives it as a pointer (so writes hit the
     // caller's copy in place, preserving value semantics), otherwise by value.
-    void declareMethod(const std::string& key, FunctionDecl* fn, const Type* ownerTy) {
+    // `symbolOverride` 非空时以该名字作为 LLVM 符号（规范 §8.7 `@no_mangle`），
+    // 而 `key` 仍为分派用的改写名，二者解耦：调用方按 "Type.method" 查找，
+    // 链接器看到的是未改写的给定符号名。
+    void declareMethod(const std::string& key, FunctionDecl* fn, const Type* ownerTy,
+                       const std::string* symbolOverride = nullptr) {
         // A generic type's methods are emitted once per monomorphised instance
         // (`Box<Int>.get`), never for the uninstantiated generic: its members still
         // mention the type parameter, so its signature cannot be lowered.
@@ -5362,7 +5682,8 @@ public:
         methodThrows_[key] = fn->isThrows;
         llvm::Function* f = llvm::Function::Create(
             llvm::FunctionType::get(ret, params, /*isVarArg=*/false),
-            llvm::GlobalValue::ExternalLinkage, key, module_.get());
+            llvm::GlobalValue::ExternalLinkage,
+            symbolOverride ? *symbolOverride : key, module_.get());
         methodFns_[key] = f;
     }
 
@@ -5666,6 +5987,9 @@ public:
     // nested loop cannot capture its parent's target.
     std::vector<llvm::BasicBlock*> breakTargets_;
     std::vector<llvm::BasicBlock*> continueTargets_;
+    // 带标签循环的断点映射（规范 §1.7 `outer: loop { … break outer }`）：
+    // 标签名 -> (break 目标块, continue 目标块)。
+    std::unordered_map<std::string, std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> labelTargets_;
     // Mark of the enclosing function body; a `return` releases down to it.
     size_t currentScopeMark_ = 0;
 
@@ -5693,6 +6017,11 @@ public:
         if (!f || !f->empty()) return;
         isMain_ = false;
         currentOwner_ = ownerTy;
+        // 规范 §7.4：标记本方法体处于 actor 隔离域，await 挂起点据此做重入。
+        // 锁指针本身由 currentActorIsolationLock() 惰性生成。
+        actorIsolationOwner_ = (ownerTy && ownerTy->record &&
+                                ownerTy->record->kind == TypeDeclKind::Actor)
+                                   ? ownerTy : nullptr;
         const Type* mrt =
             (fn->returnType && fn->returnType->kind == NodeKind::OptionalType &&
              static_cast<OptionalType*>(fn->returnType.get())->isOpaque &&
@@ -6041,7 +6370,8 @@ bool IRGenerator::emitObject(const NodeList& decls, Sema& sema,
                             const std::string& objPath, std::string* irOut,
                             std::string& errOut) {
     impl_->sema_ = &sema;
-    return impl_->emitObject(decls, objPath, irOut, errOut);
+    return impl_->emitObject(decls, objPath, irOut, errOut,
+                             optLevel_, optSize_, emitAsm_);
 }
 
 } // namespace suki

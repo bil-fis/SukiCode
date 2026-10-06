@@ -1,11 +1,13 @@
 module memory
 
+// 底层内存原语：地址以 Int 保存（LP64 下与指针同宽）。
 foreign func suki_ptr_alloc(_ n: Int) -> Int
 foreign func suki_ptr_drop(_ p: Int) -> Int
 foreign func suki_ptr_read_int(_ p: Int) -> Int
 foreign func suki_ptr_write_int(_ p: Int, _ v: Int) -> Int
 
-// 裸指针封装：地址以 Int 保存（LP64 下与指针同宽），不携带元素类型信息，
+// ─── 裸指针封装（非泛型，兼容旧用例）──────────────────────────────────────────
+// 地址以 Int 保存（LP64 下与指针同宽），不携带元素类型信息，
 // 因此本实现为非泛型；pointee 固定为 Int，与运行时的 suki_ptr_read/write_int 对应。
 struct RawPtr {
     var raw: Int
@@ -17,8 +19,49 @@ struct RawPtr {
     func deallocate() { suki_ptr_drop(self.raw) }
 }
 
-func allocate(capacity n: Int) -> RawPtr {
-    let bytes = n * 8
-    let addr = suki_ptr_alloc(bytes)
-    return RawPtr(raw: addr)
+// ─── 类型化非托管指针（规范 §6.5 / §8.1）──────────────────────────────────────
+// 语义类似 Swift：`UnsafeMutablePointer<T>` 持有一个类型化地址，`pointee` 与
+// 缓冲下标经编译器特化（inttoptr + load/store），按元素类型 T 做类型化读写；
+// `deallocate()` 亦由编译器特化（发射 `suki_ptr_drop(raw)`）。
+//
+// 注意：`pointee` / `subscript` / `deallocate` 不在此声明——它们由编译器特化
+// 生成，故此处仅为类型标记，实际读写逻辑在 IR 层按 T 的元素布局完成。
+
+struct UnsafeMutablePointer<T> {
+    var raw: Int
+    init(raw addr: Int) { self.raw = addr }
 }
+
+struct UnsafePointer<T> {
+    var raw: Int
+    init(raw addr: Int) { self.raw = addr }
+}
+
+struct UnsafeMutableBufferPointer<T> {
+    var raw: Int
+    var count: Int
+    init(raw addr: Int, count n: Int) { self.raw = addr; self.count = n }
+}
+
+struct UnsafeBufferPointer<T> {
+    var raw: Int
+    var count: Int
+    init(raw addr: Int, count n: Int) { self.raw = addr; self.count = n }
+}
+
+// 分配 `n` 个 `T` 的未初始化内存，返回类型化指针（规范 §6.5）。
+// `T` 由实参位置推断（单泛型参数 + 单 Int 实参 → T = Int）。
+//
+// 注意：此处刻意不使用局部 `let` 绑定。泛型函数体内的局部变量在单态化后会被
+// “装箱”（变量退化为指向值的指针），直接取用会把栈地址误当作堆地址传给
+// `suki_ptr_drop`，导致 `free` 崩溃（既有的单态化限制）。故直接把调用结果
+// 作为实参传给构造器，绕开该装箱路径。
+func allocate<T>(capacity n: Int) -> UnsafeMutablePointer<T> {
+    return UnsafeMutablePointer<T>(raw: suki_ptr_alloc(n * MemoryLayout<T>.stride))
+}
+
+// ─── 访问控制对照（规范 §10.1）───────────────────────────────────────────────
+// `public` 构成模块的公开接口，导入方可访问；`internal` 仅供本模块内部使用，
+// 导入方访问应被拒绝。供 moduleTest 的访问控制用例对照验证。
+public func memoryPublicHelper() -> Int { return 7 }
+internal func memoryInternalHelper() -> Int { return 8 }

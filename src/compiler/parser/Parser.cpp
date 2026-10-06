@@ -214,7 +214,7 @@ NodeList Parser::parseModule() {
             } else synchronize();
             continue;
         }
-        NodePtr d = parseDecl();
+    NodePtr d = parseDecl();
         if (d) decls.push_back(std::move(d));
         else synchronize();
     }
@@ -248,9 +248,10 @@ NodePtr Parser::parseMacroDecl() {
 }
 
 NodePtr Parser::parseDecl() {
-    RecGuard _rg(this);
+RecGuard _rg(this);
     std::vector<std::string> attrs;
     pendingCdeclName_.clear();
+    pendingConvention_.clear();
     pendingCEnum_ = false;
     pendingMacroRole_.clear();
     pendingMacroKind_.clear();
@@ -260,11 +261,24 @@ NodePtr Parser::parseDecl() {
             std::string an = cur().text;
             attrs.push_back(an);
             advance();
+            // @convention(c|stdcall)：捕获函数调用约定（规范 §6.3 C 互操作）。
+            if (an == "convention" && checkPunct(PunctuatorID::LParen)) {
+                advance();
+                if (check(TokenKind::TK_Identifier)) { pendingConvention_ = cur().text; advance(); }
+                if (checkPunct(PunctuatorID::RParen)) advance();
+                continue;
+            }
             // @_cdecl("name")：捕获外部符号名（规范 6.3），不走通用 (...) 跳过。
             if (an == "_cdecl" && checkPunct(PunctuatorID::LParen)) {
                 advance();
-                if (check(TokenKind::TK_StringLiteral)) { pendingCdeclName_ = cur().text; advance(); }
-                else if (check(TokenKind::TK_Identifier)) { pendingCdeclName_ = cur().text; advance(); }
+                if (check(TokenKind::TK_StringLiteral)) {
+                    std::string s = cur().text;
+                    // 词法器保留字面量两端的引号，导出 C 符号名时须剥除。
+                    if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
+                        s = s.substr(1, s.size() - 2);
+                    pendingCdeclName_ = s;
+                    advance();
+                } else if (check(TokenKind::TK_Identifier)) { pendingCdeclName_ = cur().text; advance(); }
                 if (checkPunct(PunctuatorID::RParen)) advance();
                 continue;
             }
@@ -394,6 +408,7 @@ NodePtr Parser::parseFunctionDecl(std::vector<std::string> modifiers) {
     if (matchKw(KeywordID::Where)) parseWhereConstraints();
     fn->genericConstraints = std::move(pendingGenericConstraints_);
     fn->cdeclName = std::move(pendingCdeclName_);
+    fn->convention = std::move(pendingConvention_);
     if (std::find(modifiers.begin(), modifiers.end(), "async") != modifiers.end()) fn->isAsync = true;
     if (std::find(modifiers.begin(), modifiers.end(), "mutating") != modifiers.end()) fn->isMutating = true;
     if (std::find(modifiers.begin(), modifiers.end(), "foreign") != modifiers.end() ||
@@ -551,6 +566,8 @@ NodePtr Parser::parseTypeDecl(NodeKind kind, std::vector<std::string> modifiers)
     pendingCEnum_ = false;
     expectPunct(PunctuatorID::LBrace, "expected '{'");
     while (!checkPunct(PunctuatorID::RBrace) && !atEnd()) {
+        // 成员之间允许用 `;` 分隔（与语句级 / 顶层一致），跳过前导分号。
+        while (checkPunct(PunctuatorID::Semicolon)) advance();
         // member declarations
         std::vector<std::string> memberAttrs;
         while (checkPunct(PunctuatorID::At)) {
@@ -836,6 +853,23 @@ NodePtr Parser::parseStatement() {
     if (checkKw(KeywordID::Return)) return parseReturnStmt();
     if (checkKw(KeywordID::If)) return parseIfStmt();
     if (checkKw(KeywordID::Guard)) return parseGuardStmt();
+    // `name: loop { … }` 带标签循环（规范 §1.7）：标签在 `loop` 关键字之前。
+    if (check(TokenKind::TK_Identifier) && peek().isPunct(PunctuatorID::Colon) &&
+        peek(2).isKeyword(KeywordID::Loop)) {
+        std::string label = cur().text;
+        advance();   // 标签名
+        advance();   // ':'
+        return parseLoopStmt(label);
+    }
+    // `name: loop { … }` 带标签循环（规范 §1.7）：标签在 `loop` 关键字之前。
+    if (check(TokenKind::TK_Identifier) && peek().isPunct(PunctuatorID::Colon) &&
+        peek(2).isKeyword(KeywordID::Loop)) {
+        std::string label = cur().text;
+        advance();   // 标签名
+        advance();   // ':'
+        return parseLoopStmt(label);
+    }
+    if (checkKw(KeywordID::Loop)) return parseLoopStmt("");
     if (checkKw(KeywordID::While)) return parseWhileStmt();
     if (checkKw(KeywordID::Repeat)) return parseRepeatStmt();
     if (checkKw(KeywordID::For)) return parseForInStmt();
@@ -939,6 +973,14 @@ NodePtr Parser::parseRepeatStmt() {
     if (checkPunct(PunctuatorID::LParen)) { advance(); r->condition = parseExpr(); expectPunct(PunctuatorID::RParen, "expected ')'"); }
     else r->condition = parseExpr();
     return r;
+}
+
+NodePtr Parser::parseLoopStmt(std::string label) {
+    advance(); // `loop`
+    auto l = std::make_unique<LoopStmt>();
+    l->label = std::move(label);
+    l->body = parseBlockStatements();
+    return l;
 }
 
 NodePtr Parser::parseForInStmt() {
@@ -2127,6 +2169,19 @@ NodePtr Parser::parseClosure(bool arrowSyntax) {
 NodePtr Parser::parseType() {
     RecGuard _rg(this);
     NodePtr base;
+    // @convention(c|stdcall) 类型属性（规范 §6.3 C 互操作）：仅当 "@convention(...)"
+    // 后紧跟 "("（即函数类型前缀 `@convention(c) (Int) -> Int`）时才在此消费，
+    // 以免贪婪地吞掉下一个声明的 @ 属性（如 @_cdecl）。否则不动词法流。
+    std::string conv;
+    if (checkPunct(PunctuatorID::At) &&
+        peek(1).kind == TokenKind::TK_Identifier && peek(1).text == "convention" &&
+        peek(2).kind == TokenKind::TK_Punctuator && peek(2).punct == PunctuatorID::LParen) {
+        advance(); // @
+        advance(); // convention
+        advance(); // (
+        if (check(TokenKind::TK_Identifier)) { conv = cur().text; advance(); }
+        if (checkPunct(PunctuatorID::RParen)) advance();
+    }
     if (checkKw(KeywordID::Some)) {
         // 不透明返回类型 `some P`（规范 5.5）：前缀修饰符，复用 OptionalType 标记
         // isOpaque，底层具体类型由 Sema 在函数体分析后推断。
@@ -2226,6 +2281,12 @@ NodePtr Parser::parseType() {
         base = std::make_unique<NamedType>();
         static_cast<NamedType*>(base.get())->name = "<<error>>";
     }
+    if (!conv.empty()) {
+        if (base && base->kind == NodeKind::FuncType)
+            static_cast<FuncType*>(base.get())->convention = conv;
+        else
+            errorAt(cur(), "convention attribute can only apply to a function type");
+    }
     return parseTypePostfix(std::move(base));
 }
 
@@ -2315,12 +2376,16 @@ NodePtr Parser::parseTypePostfix(NodePtr base) {
             r->pointee = parseType();
             base = std::move(r);
         } else if (checkPunct(PunctuatorID::At)) {
-            // 类型属性：`@Sendable () -> Void`、`@escaping (Int) -> Int`。
-            // 必须看到 `@` + 属性名 + `(`/`{`/`->` 才认定，否则会吞掉紧跟在
-            // 声明之后的 `@main`（例如 `typealias Num = Int` 后换行的属性）。
+            // 类型属性：`@Sendable () -> Void`、`@escaping (Int) -> Int`（规范 3.3）。
+            // 必须是已知类型属性名 + `(`/`{`/`->` 才认定，否则会吞掉紧跟在声明
+            // 之后的声明属性（如 `@_cdecl(...)`、`@main`、`@convention(...)`）。
+            // 注意：未知 `@name` 在此必须停止，交还给声明层处理。
+            const std::string& attrName = peek(1).text;
             const Token& afterName = peek(2);
+            bool knownTypeAttr = (attrName == "Sendable" || attrName == "escaping");
             bool attributeForm =
                 peek(1).kind == TokenKind::TK_Identifier &&
+                knownTypeAttr &&
                 afterName.kind == TokenKind::TK_Punctuator &&
                 (afterName.punct == PunctuatorID::LParen ||
                  afterName.punct == PunctuatorID::LBrace ||

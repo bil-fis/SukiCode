@@ -23,6 +23,11 @@ enum class ObjectFormat { MachO, ELF, COFF, Wasm };
 
 struct TargetInfo {
     std::string triple;            // e.g. "x86_64-unknown-linux-gnu"
+    // 规范 §10.3 条件编译取值：`os(Linux)` / `arch(x86_64)` 等谓词按这两个
+    // 规范化名字比对，名字集合取自规范列出的取值（由三元组推导，见
+    // getTargetInfo）。未知三元组回退为主机取值，保证前端仍可推进。
+    std::string os;                // Linux / macOS / Windows / iOS / Android / FreeBSD / WASI
+    std::string arch;              // x86_64 / arm64 / arm / riscv64 / i386 / wasm32 ...
     unsigned pointerWidth = 64;    // bits
     unsigned pointerAlign = 8;     // bytes
     Endian endian = Endian::Little;
@@ -37,6 +42,11 @@ bool getTargetInfo(const std::string& triple, TargetInfo& out);
 // The host target (derived from the build). Always succeeds for the
 // platforms the toolchain itself runs on.
 TargetInfo hostTarget();
+
+// 规范 §14.1.1：返回 `sukic --list-targets` 展示的已知目标三元组列表
+// （桌面 / 移动 / 嵌入式 / 裸机 / RTOS / WebAssembly）。该列表为规范表列的
+// 代表性集合；实际可用性仍取决于 LLVM 后端与 `--sysroot` 提供的系统库。
+std::vector<std::string> listKnownTargets();
 
 // Well-known triples for the MVP and the cross-platform extension targets.
 namespace triples {

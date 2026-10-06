@@ -28,7 +28,7 @@ enum class KeywordID {
     Module, Import, Let, Var, Func, Struct, Enum, Class, Protocol, Extension,
     Typealias, Associatedtype, Init, Deinit, Subscript,
     // control flow
-    If, Else, Guard, Switch, Case, Default, For, In, While, Repeat,
+    If, Else, Guard, Switch, Case, Default, For, In, While, Repeat, Loop,
     Break, Continue, Fallthrough, Return,
     // patterns / literals / self
     Where, As, Is, Nil, True, False, Self, Super,
@@ -101,7 +101,8 @@ inline KeywordID keywordFromString(const std::string& s) {
         {"if", KeywordID::If}, {"else", KeywordID::Else}, {"guard", KeywordID::Guard},
         {"switch", KeywordID::Switch}, {"case", KeywordID::Case}, {"default", KeywordID::Default},
         {"for", KeywordID::For}, {"in", KeywordID::In}, {"while", KeywordID::While},
-        {"repeat", KeywordID::Repeat}, {"break", KeywordID::Break}, {"continue", KeywordID::Continue},
+        {"repeat", KeywordID::Repeat}, {"loop", KeywordID::Loop},
+        {"break", KeywordID::Break}, {"continue", KeywordID::Continue},
         {"fallthrough", KeywordID::Fallthrough}, {"return", KeywordID::Return},
         {"where", KeywordID::Where}, {"as", KeywordID::As}, {"is", KeywordID::Is},
         {"nil", KeywordID::Nil}, {"true", KeywordID::True}, {"false", KeywordID::False},
@@ -163,6 +164,7 @@ inline const char* keywordToString(KeywordID k) {
         case KeywordID::In: return "in";
         case KeywordID::While: return "while";
         case KeywordID::Repeat: return "repeat";
+        case KeywordID::Loop: return "loop";
         case KeywordID::Break: return "break";
         case KeywordID::Continue: return "continue";
         case KeywordID::Fallthrough: return "fallthrough";
