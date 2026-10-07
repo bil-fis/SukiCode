@@ -1,0 +1,10 @@
+.vscode/**
+.vscode-test/**
+src/**
+node_modules/**
+gen_grammar.js
+test_grammar.js
+**/*.ts
+**/*.map
+tsconfig.json
+.gitignore

@@ -1,0 +1,102 @@
+{
+  "name": "sukicode",
+  "displayName": "SukiCode",
+  "description": "SukiCode 语言支持：语法高亮（已启用），语言服务器 LSP（接口预留，待接入）。",
+  "version": "0.0.1",
+  "publisher": "sukicode",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "suki",
+    "sukicode",
+    "syntax",
+    "highlight"
+  ],
+  "activationEvents": [
+    "onLanguage:suki"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "suki",
+        "aliases": [
+          "SukiCode",
+          "suki"
+        ],
+        "extensions": [
+          ".suki"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "suki",
+        "scopeName": "source.suki",
+        "path": "./syntaxes/suki.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "suki.restartLanguageServer",
+        "title": "SukiCode: 重启语言服务器"
+      }
+    ],
+    "configuration": {
+      "title": "SukiCode",
+      "properties": {
+        "suki.lsp.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "启用 SukiCode 语言服务器（LSP）。当前未实现，仅预留接口，语法高亮不受此影响。"
+        },
+        "suki.lsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "LSP 服务器可执行文件路径；留空则默认使用 'sukic lsp'。"
+        },
+        "suki.lsp.serverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "启动 LSP 服务器时的额外参数。"
+        },
+        "suki.lsp.trace": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "LSP 通信追踪级别。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pack": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vsce": "^2.15.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bil-fis/SukiCode",
+    "directory": "idePlugins/vscode"
+  }
+}
