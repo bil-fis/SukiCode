@@ -75,24 +75,15 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          # runner 镜像可能已预装 LLVM；winget 默认走"升级"分支会因目标不比已装版本新而放弃，
-          # 因此用 --force 强制安装为锁定的 18.1.8（自动选用正确 MSI/NSIS 静默开关）。
-          winget install -e --id LLVM.LLVM --version 18.1.8 --scope machine --force --silent --accept-package-agreements --accept-source-agreements
-          # ── 诊断：定位 LLVM 实际安装位置 ──
-          Write-Host "ProgramFiles=$env:ProgramFiles  LOCALAPPDATA=$env:LOCALAPPDATA"
-          foreach ($r in @("$env:ProgramFiles\LLVM", "$env:LOCALAPPDATA\Programs\LLVM", "C:\Program Files\LLVM", "C:\Program Files (x86)\LLVM")) {
-            if (Test-Path $r) {
-              Write-Host "DIR $r =>"
-              Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "   $($_.Name)" }
-            }
+          # 用 chocolatey 锁定安装 LLVM 18.1.8（LLVM 官方推荐的 Windows 包管理；
+          # choco 自动处理官方安装器静默开关，固定安装到 Program Files\LLVM）。
+          # -f 强制：即使镜像已预装其它 LLVM 版本，也覆盖为 18.1.8。
+          choco install llvm --version=18.1.8 -y -f --no-progress
+          $llvmBin = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$llvmBin\llvm-config.exe")) {
+            throw "LLVM 18.1.8 未安装成功：$llvmBin 下未找到 llvm-config.exe"
           }
-          $hit = Get-ChildItem "C:\Program Files","C:\Program Files (x86)","$env:LOCALAPPDATA\Programs" -Recurse -Filter llvm-config.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          Write-Host "llvm-config.exe found => $($hit.FullName)"
-          if ($hit) {
-            echo (Split-Path $hit.FullName) | Out-File -Append -FilePath $env:GITHUB_PATH
-          } else {
-            throw "LLVM 18.1.8 未安装成功：未找到 llvm-config.exe"
-          }
+          echo "$llvmBin" | Out-File -Append -FilePath $env:GITHUB_PATH
 
       - name: (Linux) Configure & build
         if: matrix.os == 'ubuntu-latest'
@@ -104,7 +95,8 @@ jobs:
       - name: (Windows) Configure & build
         if: matrix.os == 'windows-latest'
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          # windows-latest 已迁移到 Visual Studio 2026，生成器名相应为 "Visual Studio 18 2026"
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
                 -DCMAKE_BUILD_TYPE=Release -DSUKICODE_BUILD_TESTS=OFF
           cmake --build build --config Release
 
