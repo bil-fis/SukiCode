@@ -30,6 +30,20 @@ option(SUKICODE_USE_SYSTEM_LLVM "Use system LLVM installation" ON)
 # ─── Find LLVM ─────────────────────────────────────────────────────────────
 # LLVM is the sole cross-platform code-generation backend.
 if(SUKICODE_USE_SYSTEM_LLVM)
+    if(WIN32)
+        # Windows 官方二进制包不含 llvm-config.exe，改用包自带的 LLVMConfig.cmake。
+        # find_package(LLVM CONFIG) 提供 LLVM_LINK_TARGETS / LLVM_INCLUDE_DIRS /
+        # LLVM_ENABLE_RTTI 等，供 src/compiler 链接。CI 通过 CMAKE_PREFIX_PATH
+        # 或 LLVM_DIR 指向 LLVM 安装前缀。
+        find_package(LLVM CONFIG QUIET)
+        if(LLVM_FOUND)
+            message(STATUS "Found LLVM via find_package: ${LLVM_VERSION} (LLVM_DIR=${LLVM_DIR})")
+        else()
+            message(WARNING
+                "LLVM not found. The compiler backend will not be built.\n"
+                "Install LLVM 15+ or set LLVM_DIR to your LLVM installation.")
+        endif()
+    else()
     # Drive everything from llvm-config. It supplies the include/lib paths and
     # the exact RTTI setting without importing LLVM's exported CMake targets.
     # Importing those targets aborts configuration on distro LLVM packages
@@ -72,6 +86,7 @@ if(SUKICODE_USE_SYSTEM_LLVM)
         message(WARNING
             "LLVM not found. The compiler backend will not be built.\n"
             "Install LLVM 15+ or set LLVM_DIR to your LLVM installation.")
+    endif()
     endif()
 endif()
 
