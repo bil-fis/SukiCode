@@ -52,46 +52,54 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 步骤由 matrix.windows 驱动，而不是由 os 字符串驱动：将来更换
+          # Windows 镜像标签时只需改动下面这一行，无需再改各步骤的 if 条件。
           - os: ubuntu-latest
             artifact: sukicode-linux-x86_64
-          - os: windows-latest
+            windows: false
+          # windows-latest / windows-2025 自 2026-06 起已迁移到 VS2026 环境，
+          # 因此不再存在 "Visual Studio 17 2022" 生成器。这里显式钉住 x64 的
+          # VS2026 镜像，并使用与之匹配的生成器（工具集 v145）。
+          - os: windows-2025-vs2026
             artifact: sukicode-windows-x86_64
+            windows: true
+            vs_generator: "Visual Studio 18 2026"
     steps:
       - uses: actions/checkout@v4
 
       - name: (Linux) Install dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !matrix.windows }}
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
 
       - name: (Windows) Install LLVM
-        if: matrix.os == 'windows-latest'
+        if: ${{ matrix.windows }}
         run: |
           curl -L -o llvm-installer.exe https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe
           Start-Process -Wait -FilePath .\llvm-installer.exe -ArgumentList '/S'
           echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH
 
       - name: (Linux) Configure & build
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !matrix.windows }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                 -DSUKICODE_BUILD_TESTS=OFF -DSUKICODE_BUILD_TOOLS=OFF
           cmake --build build --parallel
 
       - name: (Windows) Configure & build
-        if: matrix.os == 'windows-latest'
+        if: ${{ matrix.windows }}
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -S . -B build -G "${{ matrix.vs_generator }}" -A x64 `
                 -DCMAKE_BUILD_TYPE=Release -DSUKICODE_BUILD_TESTS=OFF
           cmake --build build --config Release
 
       - name: (Linux) Package standalone zip
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !matrix.windows }}
         run: bash .github/scripts/package_linux.sh "${{ matrix.artifact }}"
 
       - name: (Windows) Package standalone zip
-        if: matrix.os == 'windows-latest'
+        if: ${{ matrix.windows }}
         shell: pwsh
         run: .github/scripts/package_windows.ps1 "${{ matrix.artifact }}"
 
