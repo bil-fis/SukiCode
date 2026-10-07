@@ -71,19 +71,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev clang libclang-18-dev cmake ninja-build
 
-      - name: (Windows) Install LLVM 18.1.8
+      - name: (Windows) Install LLVM 18.1.8 (diagnose)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          # 用 chocolatey 锁定安装 LLVM 18.1.8（LLVM 官方推荐的 Windows 包管理；
-          # choco 自动处理官方安装器静默开关，固定安装到 Program Files\LLVM）。
-          # -f 强制：即使镜像已预装其它 LLVM 版本，也覆盖为 18.1.8。
-          choco install llvm --version=18.1.8 -y -f --no-progress
-          $llvmBin = "$env:ProgramFiles\LLVM\bin"
-          if (-not (Test-Path "$llvmBin\llvm-config.exe")) {
-            throw "LLVM 18.1.8 未安装成功：$llvmBin 下未找到 llvm-config.exe"
-          }
-          echo "$llvmBin" | Out-File -Append -FilePath $env:GITHUB_PATH
+          choco install llvm --version=18.1.8 -y -f --no-progress 2>&1 | Out-String | Write-Host
+          Write-Host "=== where clang / llvm-config ==="
+          where.exe clang 2>&1; where.exe llvm-config 2>&1
+          Write-Host "=== C:\Program Files\LLVM (tree) ==="
+          Get-ChildItem "C:\Program Files\LLVM" -Recurse -Depth 2 -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          Write-Host "=== LOCALAPPDATA\Programs\LLVM (tree) ==="
+          Get-ChildItem "$env:LOCALAPPDATA\Programs\LLVM" -Recurse -Depth 2 -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          Write-Host "=== Get-Command llvm-config ==="
+          (Get-Command llvm-config.exe -ErrorAction SilentlyContinue).Source
+          exit 0
 
       - name: (Linux) Configure & build
         if: matrix.os == 'ubuntu-latest'
