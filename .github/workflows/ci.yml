@@ -1,31 +1,153 @@
 name: CI
 
+# 触发：
+#   - 任意分支推送 / PR：执行 run_all_tests.sh 做全套检查
+#   - 推送带 `v*` 标签（如 v0.0.0-alpha.0）：在检查通过后，发布完整编译产物
+#       · ide 插件的 .vsix
+#       · Linux 版编译器独立压缩包（开箱即用）
+#       · Windows 版编译器独立压缩包（开箱即用）
+#
+# 依赖说明：本仓库当前不使用任何 find_package 第三方依赖（无 abseil/re2/
+# nlohmann-json/curl，测试也不使用 gtest），因此 CI 只需 LLVM + clang 即可构建。
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   pull_request:
 
+permissions:
+  contents: write   # 供 softprops/action-gh-release 创建 Release
+
 jobs:
-  build:
-    name: Build & Smoke Test
+  # ───────────────────────────────────────────────────────────────────────────
+  # 普通推送 / PR：运行完整测试套件
+  #   （宿主单元测试 + .suki 正例运行 + 负例诊断 + 待实现用例 + 解析健全性）
+  # ───────────────────────────────────────────────────────────────────────────
+  test:
+    name: Build & Test (run_all_tests.sh)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install dependencies (LLVM + clang + cmake)
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
 
-      - name: Configure
-        run: cmake -S . -B build -G Ninja \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DSUKICODE_BUILD_TESTS=OFF \
-          -DSUKICODE_BUILD_TOOLS=OFF \
-          -DSUKICODE_BUILD_SUKIPM=OFF
+      - name: Run test suite
+        run: ./run_all_tests.sh
 
-      - name: Build
-        run: cmake --build build --parallel
+  # ───────────────────────────────────────────────────────────────────────────
+  # 仅标签推送：构建并打包 Linux / Windows 编译器独立压缩包
+  # ───────────────────────────────────────────────────────────────────────────
+  release:
+    name: Package standalone toolchain (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: sukicode-linux-x86_64
+          - os: windows-latest
+            artifact: sukicode-windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Smoke test (compiler lib builds)
-        run: cmake --build build --target sukicompiler
+      - name: (Linux) Install dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
+
+      - name: (Windows) Install LLVM
+        if: matrix.os == 'windows-latest'
+        run: |
+          curl -L -o llvm-installer.exe https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe
+          Start-Process -Wait -FilePath .\llvm-installer.exe -ArgumentList '/S'
+          echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH
+
+      - name: (Linux) Configure & build
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DSUKICODE_BUILD_TESTS=OFF -DSUKICODE_BUILD_TOOLS=OFF
+          cmake --build build --parallel
+
+      - name: (Windows) Configure & build
+        if: matrix.os == 'windows-latest'
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_BUILD_TYPE=Release -DSUKICODE_BUILD_TESTS=OFF
+          cmake --build build --config Release
+
+      - name: (Linux) Package standalone zip
+        if: matrix.os == 'ubuntu-latest'
+        run: bash .github/scripts/package_linux.sh "${{ matrix.artifact }}"
+
+      - name: (Windows) Package standalone zip
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: .github/scripts/package_windows.ps1 "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 仅标签推送：构建并打包 VS Code 扩展 (.vsix)
+  # ───────────────────────────────────────────────────────────────────────────
+  vscode:
+    name: Build VS Code extension (.vsix)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install, compile & package extension
+        run: |
+          cd idePlugins/vscode
+          npm install
+          npx @vscode/vsce package --no-yarn
+
+      - name: Rename vsix to tag version
+        run: |
+          cd idePlugins/vscode
+          VER="${GITHUB_REF_NAME#v}"
+          mv *.vsix "sukicode-vscode-${VER}.vsix"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sukicode-vscode
+          path: idePlugins/vscode/*.vsix
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 仅标签推送：将三个产物合并为一个 GitHub Release
+  # ───────────────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release, vscode]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

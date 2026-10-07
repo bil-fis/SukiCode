@@ -1,6 +1,9 @@
 # Build directories
 build/
 out/
+dist/
+*.zip
+*.vsix
 cmake-build-*/
 .cache/
 
@@ -49,3 +52,6 @@ Package.resolved
 # OS
 .DS_Store
 Thumbs.db
+
+*.visx
+node_modules/

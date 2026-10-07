@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -885,9 +886,38 @@ static bool parseFile(const std::string& path, DiagnosticEngine& diags, NodeList
 // each other (e.g. `core` <-> `system`) do not loop forever. Loading stays
 // opt-in: files that do not `import` any stdlib module compile exactly as
 // before, so the existing test suite is unaffected.
+// ── 重定位支持 ───────────────────────────────────────────────────────────────
+// 允许通过环境变量覆盖编译期写死的绝对路径，使编译器可被打包为独立目录
+// （开箱即用）。未设置环境变量时回退到 CMake 写入的默认路径，原有行为不变。
+static std::string relocEnv(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::string(v) : std::string(fallback);
+}
+
+// 递归收集 dir 下所有 *.suki 标准库源文件，用 '|' 连接（与 SUKI_STDLIB_FILES 一致）。
+static std::string globStdlibFiles(const std::string& dir) {
+    std::string out;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return out;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+         it != std::filesystem::recursive_directory_iterator(); ++it) {
+        const auto& p = it->path();
+        if (p.extension() == ".suki") {
+            if (!out.empty()) out += '|';
+            out += p.string();
+        }
+    }
+    return out;
+}
+
 static void loadImportedStdlib(NodeList& userDecls) {
-    std::string dir = SUKI_STDLIB_DIR;
-    std::string files = SUKI_STDLIB_FILES;
+    // 若设置了 SUKICODE_STDLIB_DIR，则从该目录重新发现标准库（支持重定位打包）；
+    // 否则使用 CMake 编译期写入的默认文件清单。
+    const char* envStdlib = std::getenv("SUKICODE_STDLIB_DIR");
+    std::string dir = relocEnv("SUKICODE_STDLIB_DIR", SUKI_STDLIB_DIR);
+    std::string files = envStdlib && *envStdlib
+                            ? globStdlibFiles(dir)
+                            : std::string(SUKI_STDLIB_FILES);
     if (dir.empty() || files.empty()) return;
 
     // Build moduleName -> absolute path from the CMake-provided file list.
@@ -1133,12 +1163,15 @@ static std::string selectRuntimeObject(const TargetInfo& tgt, const TargetInfo& 
                                        const CompileOptions& opts) {
     if (opts.bareMetal) return "";  // 裸机自管启动/panic，无需链接 C 运行时
     if (tgt.os == host.os && tgt.arch == host.arch)
-        return SUKI_RUNTIME_OBJECT;
+        return relocEnv("SUKICODE_RUNTIME_OBJECT", SUKI_RUNTIME_OBJECT);
+    std::string rtSrc = relocEnv("SUKICODE_RUNTIME_SOURCE", SUKI_RUNTIME_SOURCE);
+    std::string rtInc = relocEnv("SUKICODE_RUNTIME_INCLUDE", SUKI_RUNTIME_INCLUDE);
     std::string tmp = objPath + ".rt.o";
-    std::string cc = std::string(SUKI_CLANG_DRIVER) + " --target=" + tgt.triple +
+    std::string cc = std::string(relocEnv("SUKICODE_CLANG_DRIVER", SUKI_CLANG_DRIVER)) +
+                     " --target=" + tgt.triple +
                      (opts.sysroot.empty() ? "" : (" --sysroot=" + shellQuote(opts.sysroot))) +
-                     " -c -I " + shellQuote(SUKI_RUNTIME_INCLUDE) + " " +
-                     shellQuote(SUKI_RUNTIME_SOURCE) + " -o " + shellQuote(tmp);
+                     " -c -I " + shellQuote(rtInc) + " " +
+                     shellQuote(rtSrc) + " -o " + shellQuote(tmp);
     if (std::system(cc.c_str()) != 0) {
         err = "无法为交叉目标 '" + tgt.triple +
               "' 编译 C 运行时（交叉链接需要对应的目标工具链/sysroot，例如带匹配头文件的 "
@@ -1171,7 +1204,7 @@ static int commandLinkAndRun(const std::vector<std::string>& files, const Compil
     // 目标三元组即时编译运行时并尝试链接，缺失 sysroot 时给出清晰错误。
     TargetInfo tgt = resolveTarget(effectiveTriple(opts));
     TargetInfo host = hostTarget();
-    std::string linker = std::string(SUKI_CLANG_DRIVER);
+    std::string linker = relocEnv("SUKICODE_CLANG_DRIVER", SUKI_CLANG_DRIVER);
     if (opts.fuseLld) linker += " -fuse-ld=lld";
     // 始终向 clang 传递目标三元组，使其选择对应对象格式 / crt / 链接器风格
     // （COFF+MachO 由 lld 处理，ELF 由系统链接器处理）。
