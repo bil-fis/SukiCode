@@ -82,10 +82,15 @@ jobs:
           curl.exe -L --retry 5 --retry-delay 5 -o $installer $url
           Start-Process -FilePath $installer -ArgumentList '/S' -Wait
           Start-Sleep -Seconds 3
-          # 诊断：确认官方 Windows 包是否含 LLVM 开发文件（LLVMConfig.cmake / 头文件 / 静态库）
-          Write-Host "LLVMConfig.cmake exists: $([IO.File]::Exists('C:\Program Files\LLVM\lib\cmake\llvm\LLVMConfig.cmake'))"
-          Write-Host "DataLayout.h      exists: $([IO.File]::Exists('C:\Program Files\LLVM\include\llvm\IR\DataLayout.h'))"
-          Write-Host "LLVMSupport.lib   exists: $([IO.File]::Exists('C:\Program Files\LLVM\lib\LLVMSupport.lib'))"
+          # 精确诊断：官方 win64.exe 安装后的真实结构
+          Write-Host "=== C:\Program Files\LLVM top ==="
+          Get-ChildItem "C:\Program Files\LLVM" -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+          Write-Host "=== include top ==="
+          Get-ChildItem "C:\Program Files\LLVM\include" -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+          Write-Host "=== lib top ==="
+          Get-ChildItem "C:\Program Files\LLVM\lib" -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+          Write-Host "=== LLVMConfig.cmake search (Program Files, depth 4) ==="
+          Get-ChildItem "C:\Program Files" -Recurse -Depth 4 -Filter LLVMConfig.cmake -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
           $llvmBin = "$env:ProgramFiles\LLVM\bin"
           # Windows 官方包不含 llvm-config.exe，以 clang.exe 作为安装成功标志。
           if (-not (Test-Path "$llvmBin\clang.exe")) {
