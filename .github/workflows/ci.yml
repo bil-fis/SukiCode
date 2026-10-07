@@ -78,16 +78,21 @@ jobs:
           # runner 镜像可能已预装 LLVM；winget 默认走"升级"分支会因目标不比已装版本新而放弃，
           # 因此用 --force 强制安装为锁定的 18.1.8（自动选用正确 MSI/NSIS 静默开关）。
           winget install -e --id LLVM.LLVM --version 18.1.8 --scope machine --force --silent --accept-package-agreements --accept-source-agreements
-          # 统一探测安装路径后写入 PATH
-          $candidates = @("$env:ProgramFiles\LLVM\bin", "$env:LOCALAPPDATA\Programs\LLVM\bin")
-          $llvmBin = $candidates | Where-Object { Test-Path (Join-Path $_ 'llvm-config.exe') } | Select-Object -First 1
-          # 回退：在 PATH 中查找已存在的 llvm-config.exe（可能预装于 VS LLVM 工具集）
-          if (-not $llvmBin) {
-            $cmd = Get-Command llvm-config.exe -ErrorAction SilentlyContinue
-            if ($cmd) { $llvmBin = Split-Path -Parent $cmd.Source }
+          # ── 诊断：定位 LLVM 实际安装位置 ──
+          Write-Host "ProgramFiles=$env:ProgramFiles  LOCALAPPDATA=$env:LOCALAPPDATA"
+          foreach ($r in @("$env:ProgramFiles\LLVM", "$env:LOCALAPPDATA\Programs\LLVM", "C:\Program Files\LLVM", "C:\Program Files (x86)\LLVM")) {
+            if (Test-Path $r) {
+              Write-Host "DIR $r =>"
+              Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "   $($_.Name)" }
+            }
           }
-          if (-not $llvmBin) { throw "LLVM 18.1.8 未安装成功：未找到 llvm-config.exe" }
-          echo "$llvmBin" | Out-File -Append -FilePath $env:GITHUB_PATH
+          $hit = Get-ChildItem "C:\Program Files","C:\Program Files (x86)","$env:LOCALAPPDATA\Programs" -Recurse -Filter llvm-config.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "llvm-config.exe found => $($hit.FullName)"
+          if ($hit) {
+            echo (Split-Path $hit.FullName) | Out-File -Append -FilePath $env:GITHUB_PATH
+          } else {
+            throw "LLVM 18.1.8 未安装成功：未找到 llvm-config.exe"
+          }
 
       - name: (Linux) Configure & build
         if: matrix.os == 'ubuntu-latest'
