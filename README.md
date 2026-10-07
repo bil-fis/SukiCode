@@ -1,199 +1,223 @@
-> ***<span style="color:red">Warning:</span>*** **This language is under developement and co-worked with Xiaomi MiMo V2.5-pro**  
-> Now it currently not work properly, and i cannot fix it now XD  
-> So that's it.
+> **⚠️ Pre-release / Alpha — v0.0.0-alpha.0.20261007**
+>
+> SukiCode is in **public alpha**. The compiler, runtime, and core standard
+> library are functional and covered by an automated test suite (**92 passing
+> tests**; **110** `.suki` files parsing cleanly). However, **many features in
+> the language specification are not implemented yet.** This README describes
+> **what actually works today**, not the entire specification.
+>
+> Before relying on a feature, check [Known Limitations](#known-limitations)
+> and [CHANGELOG.md](CHANGELOG.md). For the full design, see
+> [SukiCode_Specification.md](SukiCode_Specification.md).
 
 # SukiCode
 
-A modern systems programming language that fuses Swift, TypeScript, and Objective-C syntax, with AOT compilation via LLVM, deterministic ARC memory management, and built-in async/await concurrency.
+A modern systems programming language that fuses Swift-, TypeScript-, and
+Objective-C-inspired syntax, with **AOT compilation via LLVM**, **deterministic
+ARC** memory management, and **built-in async/await concurrency**.
 
-## Features
-
-### Core Language
-- **Swift-influenced syntax**: Clean, expressive, and safe
-- **AOT compilation** via LLVM backend — no external assembler/linker needed
-- **Deterministic ARC** memory management with Pool/Collection resource abstractions
-- **Built-in async/await**, Actor, Channel, and structured concurrency
-- **Move semantics** via `Owned<T>` for performance-critical code
-- **C/Objective-C interop** via `extern` declarations
-- **Cross-platform**: Windows, Linux, macOS, Android, iOS, bare-metal (ARM/RISC-V), WebAssembly
-
-### Type System
-- Value types: `struct`, `enum` (stack/inline, copied on assignment)
-- Reference types: `class`, `actor` (heap, ARC managed)
-- Optional types `Type?` with nil, optional chaining `?.`, force unwrap `!`, nil coalescing `??`
-- Generic functions and types with protocol constraints
-- Protocols with required properties, methods, subscripts, initializers
-- Extensions for adding methods, computed properties, subscripts
-- Type aliases with generic parameters
-
-### Control Flow
-- `if`/`else if`/`else`, `guard`, `switch` with pattern matching
-- `for-in` loops over arrays and dictionaries (tuple destructuring)
-- `while`, `repeat-while`, `defer`, `do-catch` error handling
-- `select` statement for channel multiplexing
-
-### Functions and Closures
-- External/internal parameter labels, default values, `inout` parameters
-- Swift-style closures `{ (params) -> ReturnType in statements }`
-- Arrow-style closures `(params) => expression`
-- Capture lists `[weak self]`, `[unowned self]`
-- Trailing closure syntax, `@autoclosure`
-
-### Memory Management
-- ARC for all class and actor instances
-- `weak` references (auto-nil on deallocation)
-- `unowned` references (non-optional, no auto-nil)
-- Pool/Collection resource lifecycle management
-- `Owned<T>` for unique ownership with move semantics
-
-### Concurrency
-- `ThreadPool` with work-stealing scheduling
-- `async`/`await` with LLVM coroutine intrinsics
-- `TaskGroup` for structured concurrency
-- `Channel<T>` with bounded/unbounded, 4 backpressure policies
-- `select` statement for channel multiplexing
-- `Atomic<T>`, `Mutex`, `RWLock`, `Semaphore`, `Condition`
-- `DispatchQueue` (serial/parallel)
-
-### System Programming
-- Inline assembly via `asm(...)` keyword
-- `MMapRegion` for memory-mapped files
-- `DynamicLibrary` for runtime `.so`/`.dylib`/`.dll` loading
-- `sys` module for OS primitives (fork, exec, socket, signal, etc.)
-- `MemoryLayout<T>` for querying size, alignment, stride
-- `unsafe` blocks for raw pointer operations
-
-### Error Handling
-- `throws` function modifier, `do`-`catch` blocks
-- `try?` (converts to nil), `try!` (crashes on error)
-- `Error` protocol with `localizedDescription`
-- `Result<T, E>` for non-throwing async scenarios
-
-### Macros
-- `@macro` for compile-time metaprogramming
-- `@freestanding` and `@attached` macro kinds
-- Sandboxed execution (no file I/O, network, process, syscall)
-- Hygienic symbol generation with `#unique("base")`
-
-### C/Objective-C Interop
-- `extern "C" func` for individual function declarations
-- `extern "C" { }` blocks for multiple declarations
-- Variadic parameters with `...`
-- Calling conventions: `"C"` (default), `"stdcall"`
-- ObjC runtime functions auto-pre-declared (`objc_msgSend`, `sel_registerName`, etc.)
-- `@_cdecl("name")` attribute to export functions to C
-
-## Quick Start
-
-### Prerequisites
-
-- CMake ≥ 3.20
-- C++20 compiler (MSVC 2022, GCC 12+, Clang 15+)
-- LLVM ≥ 15.0 (with development headers)
-
-#### Installing LLVM
-
-**Ubuntu/Debian:**
-```bash
-sudo apt install llvm-dev clang-dev lld
-```
-
-**macOS (Homebrew):**
-```bash
-brew install llvm
-```
-
-**Windows:**
-Download from [releases.llvm.org](https://releases.llvm.org/) or use vcpkg:
-```bash
-vcpkg install llvm
-```
-
-### Building
-
-```bash
-# Clone
-git clone https://github.com/your-org/SukiCode.git
-cd SukiCode
-
-# Configure
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-
-# Build
-cmake --build build
-
-# Run tests
-cd build && ctest
-```
-
-### Using the compiler
-
-```bash
-# Compile a SukiCode file
-./build/bin/sukic -o hello examples/hello_world.suki
-
-# Emit LLVM IR
-./build/bin/sukic --emit-llvm examples/hello_world.suki
-
-# Dump AST
-./build/bin/sukic --emit-ast examples/hello_world.suki
-```
-
-## Project Structure
-
-```
-SukiCode/
-├── CMakeLists.txt          # Top-level CMake configuration
-├── src/
-│   ├── compiler/           # Compiler (sukic)
-│   │   ├── lexer/          # Tokenizer
-│   │   ├── parser/         # Recursive descent parser
-│   │   ├── ast/            # Abstract Syntax Tree
-│   │   ├── sema/           # Semantic analysis
-│   │   ├── codegen/        # LLVM IR generation
-│   │   ├── macro/          # Macro expansion engine
-│   │   └── diag/           # Diagnostics
-│   ├── runtime/            # Runtime library
-│   │   ├── arc/            # ARC memory management
-│   │   ├── pool/           # Pool/Collection
-│   │   └── concurrency/    # Thread pool, channels, coroutines
-│   └── stdlib/             # Standard library (C++ headers)
-│       ├── core/           # Array, Dictionary, Set, String, Optional, etc.
-│       ├── system/         # Process, File, Path, Date, MemoryLayout, etc.
-│       ├── concurrency/    # DispatchQueue, TaskGroup
-│       ├── network/        # URL, URLSession, Socket, JSON
-│       ├── crypto/         # SHA256, MD5, HMAC, AES, ChaCha20, RSA, Ed25519
-│       ├── data/           # Data, Base64, Hex, GZip, Zlib, XML, CSV, MessagePack
-│       ├── i18n/           # Localization, number/date/currency formatting
-│       ├── test/           # TestFramework
-│       └── cli/            # ArgumentParser
-├── tests/
-│   ├── unit/               # C++ unit tests
-│   └── CMakeLists.txt      # Test configuration
-├── moduleTest/             # SukiCode integration tests
-│   ├── lexer/              # Lexer tests
-│   ├── parser/             # Parser tests
-│   ├── codegen/            # Codegen tests
-│   ├── integration/        # Integration tests (compile + run)
-│   └── run_tests.bat/sh    # Test runner scripts
-├── tools/
-│   ├── suki-fmt/           # Code formatter
-│   ├── suki-lsp/           # Language server
-│   ├── sukipm/             # Package manager
-│   └── suki-doc/           # Documentation generator
-├── examples/               # Example SukiCode programs
-└── docs/                   # Documentation
-```
-
-## Language Overview
-
-### Hello World
 ```swift
 @main
 func main() {
     print("Hello, SukiCode!")
 }
 ```
+
+---
+
+## Features (implemented in alpha.0)
+
+### Core Language
+- Swift/TypeScript/Objective-C-inspired syntax
+- **AOT compilation** via the LLVM backend (no external assembler/linker required)
+- **Deterministic ARC** memory management with `weak` / `unowned` references
+- **Move semantics** via `Owned<T>` for performance-critical code
+- Built-in **async/await**, **Actor**, **Channel**, and structured concurrency
+- **C interop** via `extern` / `foreign` declarations
+- Cross-compilation via `--target` (host + selected foreign targets)
+- Printing (spec §12.1): `print` appends a trailing newline, `printsl`
+  ("single-line") does not
+
+### Type System
+- Value types: `struct`, `enum` (copied on assignment)
+- Reference types: `class`, `actor` (heap, ARC-managed)
+- Optional types `T?` with optional chaining `?.`, force unwrap `!`, nil coalescing `??`
+- Generic functions and types with `where` constraints, `associatedtype`, `some`
+- Protocols (properties, methods, subscripts, initializers)
+- Extensions (methods, computed properties, subscripts), `typealias`
+
+### Control Flow
+- `if` / `else if` / `else`, `guard`, `switch` with pattern matching
+- `for-in` over arrays and dictionaries (tuple destructuring)
+- `while`, `repeat-while`
+- `select` statement for channel multiplexing
+- `do-catch` error handling; `try` / `try?` / `try!`
+
+> **Note:** `defer` is parsed but **not yet code-generated** — see
+> [Known Limitations](#known-limitations).
+
+### Functions and Closures
+- External/internal parameter labels, default values, `inout` parameters
+- Swift-style closures `{ (params) -> ReturnType in statements }`
+- Arrow-style closures `(params) => expression`
+- Capture lists `[weak self]`, `[unowned self]`
+- Trailing closure syntax
+
+> **Note:** `@autoclosure` is accepted by the parser but has no semantic or
+> code-generation support yet.
+
+### Memory Management
+- ARC for all `class` and `actor` instances
+- `weak` references (auto-nil on deallocation)
+- `unowned` references (non-optional, no auto-nil)
+- `Owned<T>` for unique ownership with move semantics
+- `unsafe` blocks and `UnsafePointer` / `UnsafeMutablePointer` for raw memory
+
+### Concurrency (most complete subsystem)
+- `async` / `await` backed by LLVM coroutine intrinsics
+- `Task`, `TaskGroup` (`withTaskGroup`), `Channel<T>` (bounded/unbounded, `for await`)
+- `select` statement; `actor` isolation (serialized message passing)
+- `Atomic<T>`, `Mutex`, `Semaphore`, `Condition`, `Future` / `Promise`
+
+### Error Handling
+- `throws` function modifier, `do`-`catch` blocks
+- `try?` (→ `nil`), `try!` (crash on error)
+- `Error` protocol, `Result<T, E>`
+
+> **Note:** `Error.localizedDescription` is **not** provided yet.
+
+### Macros (partial)
+- `@freestanding(expression)` / `@freestanding(declaration)`
+- `@attached(member)`
+- `#makeExpr` / `#makeDecl` templates with `\(arg)` unquoting
+- Hygienic symbol generation via `#unique("base")`
+- Sandboxed expansion (no file I/O, network, process, or syscalls)
+
+> **Note:** `@attached(peer/access/conformance/extension)` roles are **not**
+> implemented yet.
+
+### C / Foreign Interop
+- `extern "C" func ...` and `extern "C" { ... }` blocks
+- Variadic parameters with `...`
+- Calling conventions: `"C"` (default), `"stdcall"`
+- `@_cdecl("name")` to export functions to C
+
+> **Note:** Objective-C interop exists only as the `protocol ObjCObject {}`
+> marker; the ObjC runtime bridge (`objc_msgSend`, `#selector`, etc.) is **not**
+> implemented.
+
+### Tooling
+- **`sukic`** — the compiler: multi-backend emit (`--emit-llvm` / `--emit-ast`
+  / object / executable), `--target`, `--incremental`, `-expand-macros`
+- **`suki-lsp`** — language server (completion, diagnostics)
+- **`suki-doc`** — documentation generator
+- **`suki-fmt`** — code formatter (**placeholder**: currently a no-op pass-through)
+- **`sukipm`** — package manager: `init` / `build` / `test` work; `publish` / `add`
+  are **not** implemented yet
+
+### Standard Library (implemented)
+| Module      | Highlights |
+|-------------|-----------|
+| `core`      | `Array`, `Dictionary`, `Set`, `String`, `Optional` bridging, numeric & string utilities, randomness |
+| `system`    | `File`, `Path`, `Date`, `Clock`, `OS`, process & environment access |
+| `concurrency` | `Task`, `TaskGroup`, `Channel`, atomics, locks, `Future`/`Promise` |
+| `data`      | `Data` byte buffer, `Base64`, `Hex`, … |
+| `memory`    | `Owned<T>`, `MemoryPool<T>`, unsafe pointer helpers |
+| `test`      | `TestFramework` for `sukipm test` |
+
+> **Not yet present:** `network`, `crypto`, `i18n`, `cli`, `SukiUI` modules
+> described in the specification.
+
+---
+
+## Quick Start
+
+### Option A — Download a prebuilt toolchain (recommended)
+
+Every tagged release publishes ready-to-use artifacts on the
+[GitHub Releases page](https://github.com/bil-fis/SukiCode/releases):
+
+| Artifact | Contents |
+|----------|----------|
+| `sukicode-linux-x86_64.zip` | `bin/sukic` + `bin/suki` launcher, prebuilt runtime object, standard-library sources, bundled `libLLVM` |
+| `sukicode-windows-x86_64.zip` | Same layout with `bin/sukic.exe` + `bin/suki.bat` (LLVM is linked statically) |
+| `sukicode-vscode-<version>.vsix` | VS Code extension — syntax highlighting (LSP client wiring is prepared but not yet active) |
+
+```bash
+unzip sukicode-linux-x86_64.zip
+cd sukicode-linux-x86_64
+./bin/suki run ~/hello.suki
+```
+
+The `suki` launcher points the compiler at the bundled runtime and standard
+library, so the archive works from **any** extraction directory. The only
+external requirement is **`clang` on `PATH`** (used for the link stage).
+
+For VS Code: *Extensions → Install from VSIX…* and pick the `.vsix` file.
+
+### Option B — Build from source
+
+#### Prerequisites
+- CMake ≥ 3.20
+- C++20 compiler (MSVC 2022, GCC 12+, or Clang 15+)
+- LLVM ≥ 15.0 with development headers (provides `llvm-config`)
+- `clang` on `PATH` — the `sukic` driver invokes it for the link stage
+
+No third-party C++ libraries are linked today: the tree contains **no
+`find_package` dependency**, so **vcpkg is not required** to build
+(`vcpkg.json` exists, but no dependency declared there is currently consumed).
+
+**Installing LLVM**
+
+- Ubuntu/Debian: `sudo apt install llvm-dev clang lld`
+- macOS (Homebrew): `brew install llvm`
+- Windows: download the release installer from
+  [llvm/llvm-project releases](https://github.com/llvm/llvm-project/releases)
+  (install to the default `C:\Program Files\LLVM`)
+
+### Building
+
+```bash
+git clone https://github.com/SukiCode/SukiCode.git
+cd SukiCode
+
+# Configure
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+# Build the compiler and tools
+cmake --build build -j
+```
+
+### Running the tests
+
+```bash
+# Builds (if needed) then runs the full suite
+./run_all_tests.sh
+# Expected: 92 passing tests, 0 failures,
+#           110 .suki files parse successfully.
+```
+
+### Using the compiler
+
+```bash
+# Compile and run
+./build/bin/sukic run examples/hello_world.suki
+
+# Compile to an executable
+./build/bin/sukic -o hello examples/hello_world.suki
+./hello
+
+# Inspect intermediate representations
+./build/bin/sukic --emit-llvm examples/hello_world.suki
+./build/bin/sukic --emit-ast  examples/hello_world.suki
+
+# Run the concurrency example
+./build/bin/sukic run examples/concurrency.suki
+```
+
+---
+
+## Language Overview (verified examples)
 
 ### Variables and Types
 ```swift
@@ -213,19 +237,12 @@ func greet(person name: String, from city: String = "Unknown") -> String {
 func identity<T>(_ value: T) -> T {
     return value
 }
-
-// Async function
-async func fetchData() throws -> Data {
-    let data = await httpClient.get(url)
-    return data
-}
 ```
 
-### Structs and Classes
+### Structs, Classes, Enums, Protocols
 ```swift
 struct Point {
     var x, y: Double
-    
     var magnitude: Double {
         get { return (x * x + y * y).squareRoot() }
     }
@@ -234,43 +251,54 @@ struct Point {
 class Animal {
     var name: String
     init(name: String) { self.name = name }
-    func speak() -> String { "..." }
+    func speak() -> String { return "..." }
     deinit { /* cleanup */ }
 }
-```
 
-### Enums
-```swift
+enum Direction { case north, south, east, west }
+
 enum Result<T, E: Error> {
     case success(T)
     case failure(E)
 }
 
-enum Direction {
-    case north, south, east, west
-}
-```
-
-### Protocols
-```swift
 protocol Drawable {
     func draw()
     var color: String { get set }
 }
-
-struct Circle: Drawable {
-    var color: String
-    func draw() { /* ... */ }
-}
 ```
 
-### Async/Await and Channels
+### Optional Chaining
 ```swift
-async func processData() throws -> Result {
+let name: String? = "Suki"
+let upper = name?.uppercased()       // Optional chaining
+let safe  = name ?? "default"        // Nil coalescing
+```
+
+### Concurrency
+```swift
+import concurrency
+
+// Channel + Task + for-await
+async func producerConsumer() {
     let ch = Channel<Int>(capacity: 10)
-    await ch.send(42)
-    let value = await ch.receive()
-    return value
+    Task {
+        await ch.send(1)
+        await ch.close()
+    }
+    for await value in ch {
+        print("got \(value)")
+    }
+}
+
+// Structured concurrency with TaskGroup
+async func fanOut() {
+    await withTaskGroup { group in
+        group.addTask { return 42 }
+        for await r in group {
+            print("result \(r)")
+        }
+    }
 }
 
 actor Counter {
@@ -282,14 +310,9 @@ actor Counter {
 
 ### Error Handling
 ```swift
-enum MyError: Error {
-    case notFound
-    case permissionDenied
-}
+enum MyError: Error { case notFound }
 
-func risky() throws -> Int {
-    throw MyError.notFound
-}
+func risky() throws -> Int { throw MyError.notFound }
 
 do {
     let result = try risky()
@@ -298,40 +321,113 @@ do {
 }
 ```
 
-### C/ObjC Interop
+### C Interop
 ```swift
-// C function declarations
 extern "C" {
-    func printf(fmt: UnsafePointer<Int8>, ...) -> Int32
-    func malloc(size: UInt64) -> UnsafeMutablePointer<Void>
+    func printf(_ fmt: UnsafePointer<Int8>, _ args: UnsafePointer<Void>...) -> Int32
 }
 
-// Usage
-let result = printf("Hello %s\n", "World")
+let rc = printf("Hello %s\n", "World")
 ```
 
 ### Macros
 ```swift
-@macro @freestanding func log(message: String) {
-    print("[LOG] \(message)")
+@freestanding(expression)
+macro doubleValue(x: Int) -> Int {
+    return #makeExpr("(\(x) * 2)")
 }
 
-#log(message: "Hello, Macro!")
+let doubled = #doubleValue(x: 21)   // expands to (21 * 2)
 ```
+
+---
+
+## Project Structure
+
+```
+SukiCode/
+├── CMakeLists.txt          # Top-level CMake configuration
+├── CMakePresets.json
+├── vcpkg.json              # Dependency manifest (kept for future use; nothing is consumed today)
+├── .github/
+│   ├── workflows/ci.yml    # GitHub Actions: push → tests, v* tag → release artifacts
+│   └── scripts/            # package_linux.sh / package_windows.ps1 (standalone archives)
+├── idePlugins/vscode/      # VS Code extension (syntax highlighting; LSP wiring pending)
+├── src/
+│   ├── compiler/           # Compiler (sukic)
+│   │   ├── lexer/          #   Tokenizer
+│   │   ├── parser/         #   Recursive-descent parser
+│   │   ├── ast/            #   Abstract syntax tree
+│   │   ├── sema/           #   Semantic analysis
+│   │   ├── codegen/        #   LLVM IR generation
+│   │   ├── macro/          #   Macro expansion engine
+│   │   └── diag/           #   Diagnostics
+│   ├── runtime/            # Runtime library (ARC, coroutines, concurrency, pool)
+│   └── stdlib/             # Standard library (SukiCode sources)
+│       ├── core/           #   Array, Dictionary, Set, String, utilities
+│       ├── system/         #   File, Path, Date, Clock, OS, process
+│       ├── concurrency/    #   Task, TaskGroup, Channel, atomics, locks
+│       ├── data/           #   Data, Base64, Hex
+│       ├── memory/         #   Owned<T>, MemoryPool, unsafe helpers
+│       └── test/           #   TestFramework
+├── tools/
+│   ├── suki-fmt/           # Code formatter (placeholder)
+│   ├── suki-lsp/           # Language server
+│   ├── sukipm/             # Package manager (init/build/test)
+│   └── suki-doc/           # Documentation generator
+├── moduleTest/             # SukiCode integration tests (98 .suki files)
+├── examples/               # Example programs (plus the hellosuki.suki showcase)
+├── tests/                  # C++ unit tests
+├── run_all_tests.sh        # Test runner
+├── SukiCode_Specification.md
+├── CHANGELOG.md
+├── NOTICE
+├── CONTRIBUTING.md
+└── LICENSE / LICENSES/
+```
+
+---
+
+## Known Limitations
+
+The following are **explicitly not implemented** in `v0.0.0-alpha.0.20261007`
+and should not be relied upon:
+
+- **`defer`** — parsed but the body is not emitted (statements are dropped).
+- **`#if os(...)` / `#if arch(...)` / `-D` conditional compilation** — not implemented.
+- **`@autoclosure`** — parsed only; no semantic/codegen support.
+- **`@attached(peer|access|conformance|extension)`** macros — only `member` works.
+- **`Error.localizedDescription`** — not provided.
+- **System programming** — `MMapRegion`, `DynamicLibrary`, and a `sys` module
+  (fork/exec/socket/signal) are **not** present; `asm(...)` and `MemoryLayout<T>`
+  are implemented.
+- **Named `ThreadPool` type** — the underlying thread APIs exist, but there is no
+  `ThreadPool` / `DispatchQueue` type. Use `Task` / `TaskGroup` instead.
+- **Objective-C runtime bridge** — only the `ObjCObject` marker protocol exists.
+- **Standard library** — `network`, `crypto`, `i18n`, `cli`, `SukiUI` modules are
+  **not** present.
+- **`suki-fmt`** — implemented as a pass-through placeholder (does not reformat).
+- **SukiPM `publish` / `add`** — not implemented.
+
+---
 
 ## License
 
 SukiCode uses multiple licenses for different components:
 
-- **Compiler, Runtime, Standard Library**: Apache 2.0 + Runtime Library Exception
-- **Tools** (sukipm, suki-lsp, suki-fmt, suki-doc): MIT
+- **Compiler, Runtime, Standard Library**: Apache-2.0 **WITH** Runtime Library Exception
+- **Tools** (`sukipm`, `suki-lsp`, `suki-fmt`, `suki-doc`): MIT
 - **Language Specification**: CC BY 4.0
 - **Examples and Tests**: MIT
 
-**Programs written in SukiCode can use any license, including proprietary and closed-source licenses.**
+**Programs written in SukiCode can use any license, including proprietary and
+closed-source licenses** (the Runtime Library Exception removes copyleft
+obligation from compiled programs).
 
-See [LICENSE](LICENSE) and [LICENSES/](LICENSES/) for details.
+See [LICENSE](LICENSE), [LICENSES/](LICENSES/), [NOTICE](NOTICE), and
+[README_LICENSE.md](README_LICENSE.md) for details.
 
 ---
 
-*Designed by 林晚晚ss, 2026*
+*Designed by 林晚晚ss, 2026. SukiCode is a pre-release project; APIs may change
+before the 1.0 stable release.*

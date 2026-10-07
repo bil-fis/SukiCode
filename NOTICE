@@ -1,0 +1,47 @@
+SukiCode
+Copyright (c) 2026 林晚晚ss and SukiCode contributors.
+
+This product includes software developed as part of the SukiCode project
+(https://github.com/SukiCode/SukiCode).
+
+================================================================================
+THIRD-PARTY DEPENDENCIES
+================================================================================
+
+SukiCode depends on the following third-party components (declared in
+vcpkg.json and resolved via vcpkg). Their full license texts are available
+from the respective upstream projects.
+
+  - LLVM            https://llvm.org/                     Apache-2.0 WITH LLVM Exceptions
+                   (used as the AOT code-generation backend)
+
+  - GoogleTest      https://github.com/google/googletest  BSD-3-Clause
+  - Abseil          https://abseil.io/                    Apache-2.0
+  - RE2             https://github.com/google/re2         BSD-3-Clause
+  - curl            https://curl.se/                      curl License (MIT/X derivative)
+  - nlohmann-json   https://github.com/nlohmann/json      MIT License
+
+================================================================================
+SUKICODE COMPONENT LICENSES
+================================================================================
+
+SukiCode is distributed under multiple licenses. See LICENSE and LICENSES/ for
+the full texts:
+
+  - Compiler, Runtime, Standard Library : Apache-2.0 WITH Runtime Library Exception
+  - Tools (sukipm, suki-lsp, suki-fmt, suki-doc) : MIT
+  - Language Specification (SukiCode_Specification.md) : CC BY 4.0
+  - Examples and Tests : MIT
+
+Programs compiled with the SukiCode toolchain may be distributed under any
+license, including proprietary and closed-source licenses, per the Runtime
+Library Exception. The exception ensures that linking against the SukiCode
+runtime does not impose copyleft obligations on your compiled program.
+
+================================================================================
+TRADEMARK / ATTRIBUTION NOTE
+================================================================================
+
+SukiCode's design is inspired by the syntax and ergonomics of Swift,
+TypeScript, and Objective-C. This project is not affiliated with, nor endorsed
+by, the owners of those languages.
