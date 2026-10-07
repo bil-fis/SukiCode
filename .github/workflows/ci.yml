@@ -75,14 +75,13 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          # 锁定与 Linux 主版本一致的 LLVM 18.1.8；/S 静默安装到默认目录（管理员 runner 下为 Program Files）
-          curl.exe -L -o llvm-installer.exe https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe
-          Start-Process -Wait -FilePath .\llvm-installer.exe -ArgumentList '/S'
-          # 安装路径可能为 Program Files（管理员）或 LOCALAPPDATA，统一探测后写入 PATH
+          # 用 winget 锁定安装 LLVM 18.1.8（自动选用正确的 MSI/NSIS 静默开关，避免直接 /S 静默安装不生效）
+          winget install -e --id LLVM.LLVM --version 18.1.8 --scope machine --silent --accept-package-agreements --accept-source-agreements
+          # 统一探测安装路径后写入 PATH
           $candidates = @("$env:ProgramFiles\LLVM\bin", "$env:LOCALAPPDATA\Programs\LLVM\bin")
           $llvmBin = $candidates | Where-Object { Test-Path (Join-Path $_ 'llvm-config.exe') } | Select-Object -First 1
           if (-not $llvmBin) {
-            throw "LLVM 未安装成功：未在 $($candidates -join ', ') 下找到 llvm-config.exe"
+            throw "LLVM 18.1.8 未安装成功：未在 $($candidates -join ', ') 下找到 llvm-config.exe"
           }
           echo "$llvmBin" | Out-File -Append -FilePath $env:GITHUB_PATH
 
