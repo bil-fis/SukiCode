@@ -103,16 +103,16 @@ jobs:
               Write-Host "srcRoot dirs:"; Get-ChildItem $srcRoot -Directory | ForEach-Object { $_.FullName }
               throw "LLVM 源码目录未找到：$llvmSrc"
             }
-            cmake -S $llvmSrc -B "$srcRoot\build" -G Ninja `
-              -DCMAKE_BUILD_TYPE=Release `
+            cmake -S $llvmSrc -B "$srcRoot\build" -G "Visual Studio 18 2026" -A x64 `
+              -DCMAKE_CONFIGURATION_TYPES=Release `
               -DLLVM_TARGETS_TO_BUILD=X86 `
-              -DCMAKE_INSTALL_PREFIX=$llvmRoot `
+              -DCMAKE_INSTALL_PREFIX="D:/llvm-dev" `
               -DLLVM_ENABLE_PROJECTS="" -DLLVM_ENABLE_RUNTIMES="" `
               -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF `
               -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF `
               -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_TERMINFO=OFF
-            cmake --build "$srcRoot\build" --parallel
-            cmake --install "$srcRoot\build"
+            cmake --build "$srcRoot\build" --config Release --parallel
+            cmake --install "$srcRoot\build" --config Release
           } else {
             Write-Host "Cache hit — 复用已构建的 LLVM 18.1.8"
           }
