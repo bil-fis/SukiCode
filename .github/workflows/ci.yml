@@ -35,7 +35,10 @@ jobs:
           sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
 
       - name: Run test suite
-        run: ./run_all_tests.sh
+        # `bash <file>` 而非 ./<file>：不依赖脚本在 git 中的可执行位
+        # （该位很容易在归档/导出时丢失，且在某些开发环境下检查不出来），
+        # 脚本本身的 mode 仍已按 100755 记录，供本地 `./run_all_tests.sh` 使用。
+        run: bash ./run_all_tests.sh
 
   # ───────────────────────────────────────────────────────────────────────────
   # 仅标签推送：构建并打包 Linux / Windows 编译器独立压缩包
