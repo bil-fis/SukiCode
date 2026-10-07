@@ -79,6 +79,10 @@ jobs:
           # 自动处理官方安装器静默开关，固定安装到 Program Files\LLVM）。
           # -f 强制：即使镜像已预装其它 LLVM 版本，也覆盖为 18.1.8。
           choco install llvm --version=18.1.8 -y -f --no-progress
+          # 诊断：确认官方 Windows 包是否含 LLVM 开发文件（LLVMConfig.cmake / 头文件 / 静态库）
+          Write-Host "LLVMConfig.cmake exists: $([IO.File]::Exists('C:\Program Files\LLVM\lib\cmake\llvm\LLVMConfig.cmake'))"
+          Write-Host "DataLayout.h      exists: $([IO.File]::Exists('C:\Program Files\LLVM\include\llvm\IR\DataLayout.h'))"
+          Write-Host "LLVMSupport.lib   exists: $([IO.File]::Exists('C:\Program Files\LLVM\lib\LLVMSupport.lib'))"
           $llvmBin = "$env:ProgramFiles\LLVM\bin"
           # Windows 官方包不含 llvm-config.exe，以 clang.exe 作为安装成功标志。
           if (-not (Test-Path "$llvmBin\clang.exe")) {
@@ -100,7 +104,8 @@ jobs:
           # CMAKE_PREFIX_PATH 指向 LLVM 安装前缀，供顶层 CMakeLists 的 find_package(LLVM CONFIG) 定位
           cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
                 -DCMAKE_BUILD_TYPE=Release -DSUKICODE_BUILD_TESTS=OFF `
-                -DCMAKE_PREFIX_PATH="C:/Program Files/LLVM"
+                -DCMAKE_PREFIX_PATH="C:/Program Files/LLVM" `
+                -DLLVM_DIR="C:/Program Files/LLVM/lib/cmake/llvm"
           cmake --build build --config Release
 
       - name: (Linux) Package standalone zip
