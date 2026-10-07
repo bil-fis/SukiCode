@@ -1,0 +1,27 @@
+// 协议存在类型（existential）端到端验证：把具体类型作为协议类型实参传递，
+// 经 witness 表分派调用协议方法。回归测试锁定编译器修复（协议形参 IR 类型不匹配）。
+protocol Named {
+    func len() -> Int
+}
+
+struct Alpha: Named {
+    func len() -> Int { return 5 }
+}
+
+struct Beta: Named {
+    func len() -> Int { return 4 }
+}
+
+// 接收协议存在类型：调用处把 Alpha/Beta 装箱，分派走 witness 表而非静态绑定。
+func describe(_ n: Named) -> Int {
+    return n.len()
+}
+
+@main func main() -> Int {
+    let a = Alpha()
+    let b = Beta()
+    let x = describe(a)   // 期望 5
+    let y = describe(b)   // 期望 4
+    // 返回 (x+y)-9：仅当分派正确得到 5+4=9 时退出码为 0。
+    return (x + y) - 9
+}

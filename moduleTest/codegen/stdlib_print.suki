@@ -1,0 +1,19 @@
+// 打印函数回归测试：print / printsl。
+// 行为约定（规范 12.1）：
+//   * print(x)    —— 默认换行
+//   * printsl(x)  —— 不换行（single-line），用于不换行打印
+// 不换行行为已用 `sukic run ... | cat -A` 人工核验（多段 printsl 紧贴、print 末行带 $ 换行符）。
+import core
+
+@main func main() -> Int {
+    // 这些调用必须编译并运行（不触发 IR 验证错误）；返回值仅用于回归判定。
+    printsl("a")
+    printsl("b")
+    print("c")          // 期望输出：abc\n
+    printsl(1)
+    printsl(2)
+    print(3)           // 期望输出：123\n
+    printsl(true)
+    print(false)       // 期望输出：truefalse\n
+    return 0
+}

@@ -1,0 +1,38 @@
+// Regression test for the coroutine-frame / loop-variable scope bug.
+//
+// A `for await` loop variable must be dropped from `locals_` when the loop ends.
+// Before the fix, the variable lingered in `locals_`, so a later `Task { ... }`
+// closure implicitly captured it; the captured slot's `alloca` lived inside the
+// loop body block but was referenced from the exit block it did not dominate,
+// failing LLVM IR verification with:
+//   "Instruction does not dominate all uses! %x = alloca ..."
+//
+// The patterns below (mix of `for await` loops and `withTaskGroup` in one
+// `async func`) previously triggered that error; they must compile and run.
+
+import concurrency
+
+@main func main() async -> Int {
+    // Pattern 1: two `for await` loops over channels in the same function.
+    let ch1 = Channel<Int>(capacity: 1)
+    Task { await ch1.send(1); await ch1.close() }
+    for await a in ch1 { print("\(a)") }
+
+    let ch2 = Channel<Int>(capacity: 1)
+    Task { await ch2.send(2); await ch2.close() }
+    for await b in ch2 { print("\(b)") }
+
+    // Pattern 2: `for await` over a channel followed by `withTaskGroup`.
+    let ch3 = Channel<Int>(capacity: 1)
+    Task { await ch3.send(3); await ch3.close() }
+    for await c in ch3 { print("\(c)") }
+    await withTaskGroup { group in
+        group.addTask { return 9 }
+        for await r in group { print("\(r)") }
+    }
+
+    // The loop variables (a/b/c) must NOT be visible here — referencing them
+    // outside their loops is a semantic error the compiler should reject; the
+    // point of this test is that the *closure capture* no longer mis-captures them.
+    return 0
+}

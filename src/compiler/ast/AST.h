@@ -497,6 +497,10 @@ struct MemberExpr : Node {
     // 因泛型方法体内的 `self` 字段访问在单态化后尚未正确生成（既有限制），
     // 故此处合成调用，不依赖标准库方法体。
     bool isUnsafeDeallocate = false;
+    // 模块限定访问（`Module.name`）：由 Sema 在解析到 `base` 为已导入模块名时置位，
+    // 使 codegen 按成员名直接调用全局函数 / 类型构造器，不绑定接收者 self。
+    bool isModuleQualified = false;       // 成员为函数 / 全局变量
+    bool isModuleQualifiedType = false;   // 成员为类型（用作类型引用或构造器）
 };
 
 struct SubscriptExpr : Node {

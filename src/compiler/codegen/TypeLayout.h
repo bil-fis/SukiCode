@@ -76,6 +76,8 @@ public:
     // Convenience handles on the shared runtime aggregates.
     llvm::Type* i8Ptr() const { return llvm::PointerType::get(ctx_, 0); }
     llvm::Type* stringTy();
+    // 协议存在类型下沉为装箱结构 { i8* data; i8* witness }。
+    llvm::Type* protocolBoxTy();
     llvm::Type* arrayTy(llvm::Type* elem);
     llvm::Type* dictTy(llvm::Type* key, llvm::Type* value);
     llvm::Type* closureTy(llvm::Type* fnTy);

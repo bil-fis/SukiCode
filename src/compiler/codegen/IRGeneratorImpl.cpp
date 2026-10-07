@@ -132,6 +132,16 @@ private:
             for (auto& p : fn->params)
                 ptys.push_back(p.semaType ? owner_->layout_->lower(p.semaType) : i64);
 
+            // A throwing async function's body carries the hidden error-slot
+            // pointer (the same ABI `declareAs` appends for any `throws`
+            // function). The spawn wrapper must forward the *caller's* error slot
+            // across the thread boundary: the worker writes the raised error into
+            // that shared slot, and the caller's `try`/`catch` consults it after
+            // awaiting completion. So the context block and both the spawn and
+            // trampoline signatures gain an extra `i8*` error slot when `throws`.
+            const bool throws = fn->isThrows;
+            llvm::PointerType* errTy = llvm::PointerType::get(*owner_->ctx_, 0);
+
             const Type* rt = fn->returnType ? fn->returnType->semaType : nullptr;
             const bool isVoid = !rt || rt->kind == TypeKind::Void ||
                                 rt->kind == TypeKind::Unknown;
@@ -139,9 +149,11 @@ private:
             const int64_t rsize = isVoid ? 0 : (int64_t)owner_->sizeOf(rty);
 
             std::vector<llvm::Type*> ctys = ptys;
+            const unsigned errIdx = (unsigned)ptys.size();
+            if (throws) ctys.push_back(errTy);
             ctys.push_back(i8p);
             llvm::StructType* ctxTy = llvm::StructType::get(*owner_->ctx_, ctys, false);
-            const unsigned futIdx = (unsigned)ptys.size();
+            const unsigned futIdx = (unsigned)ctys.size() - 1;
 
             llvm::Function* bodyFn = owner_->fns_[fn->name];
             if (!bodyFn) bodyFn = owner_->declareAs(fn, fn->name);
@@ -167,6 +179,13 @@ private:
                                                                   "arg.addr");
                     callArgs.push_back(owner_->b_->CreateLoad(ptys[i], fp));
                 }
+                // For a throwing async function the body expects a trailing error
+                // slot pointer; forward the caller-provided slot so the error it
+                // raises reaches the caller's `try`/`catch` after awaiting.
+                if (throws) {
+                    llvm::Value* ep = owner_->b_->CreateStructGEP(ctxTy, cp, errIdx, "err.addr");
+                    callArgs.push_back(owner_->b_->CreateLoad(errTy, ep, "err.slot"));
+                }
                 llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
                 llvm::Value* fut = owner_->b_->CreateLoad(i8p, futAddr, "fut");
                 if (!isVoid) {
@@ -182,7 +201,12 @@ private:
                 owner_->b_->CreateRet(llvm::ConstantPointerNull::get(i8p));
             }
 
-            llvm::FunctionType* sft = llvm::FunctionType::get(i8p, ptys, false);
+            // The spawn wrapper takes the function's parameters plus (when the
+            // function throws) the caller's error slot, which it records in the
+            // context block for the worker to forward to the body.
+            std::vector<llvm::Type*> sptys = ptys;
+            if (throws) sptys.push_back(errTy);
+            llvm::FunctionType* sft = llvm::FunctionType::get(i8p, sptys, false);
             llvm::Function* spawnFn = llvm::Function::Create(
                 sft, llvm::GlobalValue::InternalLinkage, spawnSym, owner_->module_.get());
             {
@@ -198,6 +222,10 @@ private:
                     llvm::Value* fp = owner_->b_->CreateStructGEP(ctxTy, cp, (unsigned)i,
                                                                   "arg.addr");
                     owner_->b_->CreateStore(spawnFn->getArg((unsigned)i), fp);
+                }
+                if (throws) {
+                    llvm::Value* ep = owner_->b_->CreateStructGEP(ctxTy, cp, errIdx, "err.addr");
+                    owner_->b_->CreateStore(spawnFn->getArg((unsigned)ptys.size()), ep);
                 }
                 llvm::Value* futAddr = owner_->b_->CreateStructGEP(ctxTy, cp, futIdx, "fut.addr");
                 owner_->b_->CreateStore(fut, futAddr);
@@ -469,6 +497,10 @@ private:
             }
             owner_->b_->CreateBr(headBB);
             owner_->b_->SetInsertPoint(exitBB);
+            // The loop variable leaves scope here: drop it so an outer closure
+            // created after the loop does not capture a stale (out-of-scope) slot.
+            if (!vname.empty())
+                owner_->dropLocal(vname, pat && pat->semaType ? pat->semaType : nullptr);
         }
 
         // 已完成的 Future，供运行时支撑的 async 成员使用。
@@ -1030,9 +1062,22 @@ private:
             for (auto& st : d->body) owner_->genStmt(st.get());
             owner_->catchTargets_.pop_back();
             owner_->currentErrorSlot_ = savedSlot;
-            if (!owner_->b_->GetInsertBlock()->getTerminator()) owner_->b_->CreateBr(done);
+            // The body's normal fall-through (no statement threw) must still reach
+            // the dispatch block so a thrown error is observed; on success the slot
+            // stays null and dispatch skips straight to the continuation.
+            if (!owner_->b_->GetInsertBlock()->getTerminator())
+                owner_->b_->CreateBr(dispatch);
             owner_->b_->SetInsertPoint(dispatch);
             llvm::Value* err = owner_->b_->CreateLoad(i8p, slot, "err");
+            // A successful fall-through leaves the error slot null: branch straight
+            // to the continuation without entering any catch clause (otherwise an
+            // unconditional `catch {}` would fire even on success).
+            llvm::BasicBlock* matchBB =
+                llvm::BasicBlock::Create(*owner_->ctx_, "catch.match", f);
+            owner_->b_->CreateCondBr(
+                owner_->b_->CreateICmpEQ(err, llvm::ConstantPointerNull::get(i8p)),
+                done, matchBB);
+            owner_->b_->SetInsertPoint(matchBB);
             for (auto& c : d->catches) {
                 auto* cc = static_cast<CatchClause*>(c.get());
                 llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*owner_->ctx_, "catch.body", f);
@@ -1724,6 +1769,11 @@ private:
                     owner_->b_->CreateStore(next, idx);
                     owner_->b_->CreateBr(headBB);
                     owner_->b_->SetInsertPoint(exitBB);
+                    // Loop variables leave scope here: drop them so an outer closure
+                    // created after the loop does not capture a stale (out-of-scope) slot.
+                    for (const auto& n : names)
+                        if (!n.empty())
+                            owner_->dropLocal(n, pat && pat->semaType ? pat->semaType : nullptr);
                     return;
                 }
                 case NodeKind::SwitchStmt: {
@@ -3153,7 +3203,7 @@ private:
         llvm::Function* f = nullptr;
         // Runtime primitives have a fixed C signature; anything else is treated
         // as a printf-like variadic returning int.
-        if (name == "print" || name == "println" || name == "panic" ||
+        if (name == "print" || name == "printsl" || name == "panic" ||
             name == "suki_alloc" || name == "suki_free") {
             f = llvm::Function::Create(
                 llvm::FunctionType::get(llvm::Type::getVoidTy(*ctx_), {p}, false),
@@ -3376,11 +3426,34 @@ private:
             if (at && at->kind == TypeKind::Named) {
                 for (auto& kv : map)
                     if (at->name == kv.first) { resolved = kv.second; break; }
-            } else if (at && at->kind == TypeKind::Unknown && !map.empty() &&
-                       ai < map.size()) {
-                // 声明期泛型参数（如 `T`）被解析为 Unknown；按位置映射到对应
-                // 泛型实参（第 ai 个关联值 ⇔ 第 ai 个泛型参数 ⇔ elements[ai]）。
-                resolved = enumType->elements[ai];
+            } else if (at && at->kind == TypeKind::Unknown && !map.empty()) {
+                // 声明期泛型参数（如 `T`/`E`）被解析为 Unknown。按关联类型在原始
+                // case 声明里的参数名，而非位置下标，映射到对应泛型实参：第 ai 个
+                // 关联值未必对应第 ai 个泛型参数（如 `Result<Int,String>.err(E)` 的
+                // E 是第 2 个泛型参数，却只是该 case 的第 0 个载荷字段；原位置映射会
+                // 错把 E 绑成 elements[0]=Int，导致 16 字节 String 载荷被截断成 8
+                // 字节并读取乱码）。
+                std::string paramName;
+                if (rec->decl && rec->decl->kind == NodeKind::EnumDecl) {
+                    auto* ed = static_cast<EnumDecl*>(rec->decl);
+                    size_t ci = 0;
+                    for (auto& mnode : ed->members) {
+                        if (!mnode || mnode->kind != NodeKind::EnumCaseDecl) continue;
+                        if (ci++ != caseIdx) continue;
+                        auto* ec = static_cast<EnumCaseDecl*>(mnode.get());
+                        if (ai < ec->associatedTypes.size() && ec->associatedTypes[ai] &&
+                            ec->associatedTypes[ai]->kind == NodeKind::NamedType)
+                            paramName = static_cast<NamedType*>(
+                                ec->associatedTypes[ai].get())->name;
+                        break;
+                    }
+                }
+                if (!paramName.empty()) {
+                    for (auto& kv : map)
+                        if (kv.first == paramName) { resolved = kv.second; break; }
+                } else if (ai < map.size()) {
+                    resolved = enumType->elements[ai];
+                }
             }
             out.push_back(resolved);
         }
@@ -3500,12 +3573,29 @@ private:
     // driver stops before code generation, but this guards any path that reaches
     // here (e.g. malformed input that slipped past analysis) from feeding an
     // out-of-range value into an LLVM constant.
+    // Integer literal text (`42`, `0xFF`, `0b1010`, `0o17`, `42i8`) as an int64.
+    // The lexer keeps the text verbatim (prefix + digits + optional type suffix).
+    // We must NOT blindly strip trailing letters as a "type suffix" — for hex that
+    // would eat the `x`/`D`/`E` and turn `0xDE` into `0`. Instead, detect the base
+    // prefix ourselves, drop it, and let `strtoull` stop at any leftover suffix
+    // letter (which codegen intentionally ignores, per the comment below).
     static int64_t parseIntLiteral(const std::string& in) {
-        std::string t = in;
-        while (!t.empty() && (std::isalpha((unsigned char)t.back()) || t.back() == '_'))
-            t.pop_back();
+        int base = 10;
+        size_t start = 0;
+        if (in.size() >= 2 && in[0] == '0' && (in[1] == 'x' || in[1] == 'X')) {
+            base = 16; start = 2;
+        } else if (in.size() >= 2 && in[0] == '0' && (in[1] == 'b' || in[1] == 'B')) {
+            base = 2; start = 2;
+        } else if (in.size() >= 2 && in[0] == '0' && (in[1] == 'o' || in[1] == 'O')) {
+            base = 8; start = 2;
+        }
+        std::string digits = in.substr(start);
         errno = 0;
-        unsigned long long v = std::strtoull(t.c_str(), nullptr, 0);
+        unsigned long long v = std::strtoull(digits.c_str(), nullptr, base);
+        // Overflow (ERANGE) is clamped defensively: Sema already reports the
+        // out-of-range error and the driver stops before code generation, but this
+        // guards any path that reaches here (e.g. malformed input that slipped
+        // past analysis) from feeding an out-of-range value into an LLVM constant.
         if (errno == ERANGE)
             return std::numeric_limits<int64_t>::max();
         return static_cast<int64_t>(v);
@@ -4476,7 +4566,7 @@ private:
         }
     }
 
-    // `print` / `println` write to standard output and are thread-safe
+    // `print` / `printsl` write to standard output and are thread-safe
     // (spec 12.1). A String is written as-is; every other printable value is
     // formatted through the runtime first, which is what makes `print(i)` work
     // for an Int rather than demanding manual conversion at each call site.
@@ -5005,6 +5095,146 @@ private:
     // withTaskGroup 运行时辅助已迁移至 ConcurrencyLowerer，此处为转发桩。
     void genWithTaskGroupSpawn() { conc_.genWithTaskGroupSpawn(); }
 
+    // ── Protocol existential support ───────────────────────────────────────────
+    // A protocol-typed value is an existential box: { i8* data; i8* witness }.
+    // `data` points at the concrete value (a heap copy for value types, or the
+    // object pointer for reference types) and `witness` at the per-(protocol,
+    // conformer) witness table of requirement thunks.
+
+    // Build (lazily) the witness table for `conf` conforming to `proto`: a
+    // constant array of i8* thunk function pointers, one per requirement.
+    llvm::Value* witnessTableFor(const TypeRecord* proto, const TypeRecord* conf) {
+        std::string gname = proto->name + "_" + conf->name;
+        auto it = witnessTables_.find(gname);
+        if (it != witnessTables_.end()) return it->second;
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        std::vector<llvm::Constant*> entries;
+        for (auto& req : proto->requirements) {
+            if (!req.isFunction) continue;
+            llvm::Function* implFn = nullptr;
+            auto fit = methodFns_.find(conf->name + "." + req.name);
+            if (fit != methodFns_.end()) implFn = fit->second;
+            entries.push_back(
+                llvm::ConstantExpr::getBitCast(buildWitnessThunk(proto, conf, req, implFn), i8p));
+        }
+        llvm::ArrayType* arrTy = llvm::ArrayType::get(i8p, entries.size());
+        auto* gv = new llvm::GlobalVariable(*module_, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, llvm::ConstantArray::get(arrTy, entries),
+            "__witness_" + gname);
+        llvm::Value* ptr = llvm::ConstantExpr::getBitCast(gv, i8p);
+        witnessTables_[gname] = ptr;
+        return ptr;
+    }
+
+    // Build a thunk `(i8* self, explicitArgs...) -> ret` that adapts a protocol
+    // requirement to the conformer's real method, casting `self` back to the
+    // concrete type before forwarding the call.
+    llvm::Function* buildWitnessThunk(const TypeRecord* proto, const TypeRecord* conf,
+                                      const TypeRecord::Member& req,
+                                      llvm::Function* implFn) {
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        const Type* ftySem = req.type;
+        std::vector<llvm::Type*> ptys = { i8p };
+        if (ftySem)
+            for (auto* p : ftySem->elements) ptys.push_back(layout_->lower(p));
+        llvm::Type* rty = (ftySem && ftySem->ret) ? layout_->lower(ftySem->ret)
+                                                  : llvm::Type::getVoidTy(*ctx_);
+        llvm::FunctionType* tfty = llvm::FunctionType::get(rty, ptys, /*isVarArg=*/false);
+        std::string tname = "__thunk_" + proto->name + "_" + conf->name + "_" + req.name;
+        llvm::Function* thunk = llvm::Function::Create(tfty, llvm::GlobalValue::InternalLinkage,
+                                                       tname, module_.get());
+        llvm::BasicBlock* bb = llvm::BasicBlock::Create(*ctx_, "entry", thunk);
+        llvm::IRBuilder<> tb(bb);
+        llvm::Value* selfArg = &thunk->arg_begin()[0];
+        // self representation: a value-type conformer was heap-copied, so load the
+        // value out of the i8* pointer; a reference conformer's i8* *is* the
+        // object pointer.
+        llvm::Type* selfLl = implFn ? implFn->getFunctionType()->getParamType(0) : i8p;
+        bool selfByPointer = selfLl->isPointerTy();
+        std::vector<llvm::Value*> callArgs;
+        if (selfByPointer) {
+            callArgs.push_back(tb.CreateBitCast(selfArg, selfLl));
+        } else {
+            llvm::Value* sp = tb.CreateBitCast(selfArg, llvm::PointerType::getUnqual(selfLl));
+            callArgs.push_back(tb.CreateLoad(selfLl, sp));
+        }
+        for (unsigned i = 1; i < tfty->getNumParams(); ++i)
+            callArgs.push_back(&thunk->arg_begin()[i]);
+        tb.CreateRet(tb.CreateCall(implFn, callArgs));
+        return thunk;
+    }
+
+    // Box a concrete value `val` (of concrete type `valTy`) into the protocol
+    // existential `protoTy`.
+    llvm::Value* boxIntoProtocol(llvm::Value* val, const Type* valTy, const Type* protoTy) {
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        llvm::Type* boxTy = layout_->lower(protoTy);
+        const TypeRecord* protoRec = protoTy->record;
+        const TypeRecord* confRec =
+            (valTy && valTy->kind == TypeKind::Named) ? valTy->record : nullptr;
+        if (!confRec) return llvm::ConstantAggregateZero::get(boxTy);
+        bool isRef = layout_->isReferenceType(valTy);
+        llvm::Value* data;
+        if (isRef) {
+            data = b_->CreateBitCast(val, i8p);
+        } else {
+            llvm::Type* confLl = layout_->lower(valTy);
+            llvm::Value* tmp = b_->CreateAlloca(confLl, nullptr, "box.src");
+            b_->CreateStore(val, tmp);
+            llvm::Value* heap = b_->CreateCall(
+                declareExternalSig("suki_alloc", { llvm::Type::getInt64Ty(*ctx_) }, i8p),
+                { llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_),
+                                         (uint64_t)sizeOf(confLl)) });
+            b_->CreateMemCpy(heap, llvm::MaybeAlign(), tmp, llvm::MaybeAlign(),
+                             (uint64_t)sizeOf(confLl));
+            data = heap;
+        }
+        llvm::Value* wit = witnessTableFor(protoRec, confRec);
+        llvm::Value* boxPtr = b_->CreateAlloca(boxTy, nullptr, "box");
+        b_->CreateStore(data, b_->CreateStructGEP(boxTy, boxPtr, 0, "box.d0"));
+        b_->CreateStore(wit, b_->CreateStructGEP(boxTy, boxPtr, 1, "box.d1"));
+        return b_->CreateLoad(boxTy, boxPtr, "box");
+    }
+
+    // Dispatch a method call on a protocol-typed receiver: look the requirement up
+    // in the witness table and call the matching thunk with the boxed value's data
+    // pointer as `self`.
+    llvm::Value* genProtocolCall(const Type* protoTy, MemberExpr* m, CallExpr* e) {
+        llvm::PointerType* i8p = llvm::PointerType::get(*ctx_, 0);
+        if (!protoTy->record || !protoTy->record->isProtocol()) return nullptr;
+        const TypeRecord* protoRec = protoTy->record;
+        llvm::Value* recv = genExpr(m->base.get());
+        if (!recv) return nullptr;
+        llvm::Value* data = b_->CreateExtractValue(recv, {0}, "p.data");
+        llvm::Value* wit = b_->CreateExtractValue(recv, {1}, "p.wit");
+        size_t reqIdx = 0; bool found = false;
+        for (size_t i = 0; i < protoRec->requirements.size(); ++i) {
+            if (protoRec->requirements[i].name == m->member) { reqIdx = i; found = true; break; }
+        }
+        if (!found) return nullptr;
+        const TypeRecord::Member& req = protoRec->requirements[reqIdx];
+        llvm::Type* witPtrTy = llvm::PointerType::getUnqual(i8p);
+        llvm::Value* witAsArr = b_->CreateBitCast(wit, witPtrTy, "p.witp");
+        llvm::Value* witEl = b_->CreateConstInBoundsGEP1_32(i8p, witAsArr,
+                                                            (unsigned)reqIdx, "p.fnptr");
+        llvm::Value* fnPtr = b_->CreateLoad(i8p, witEl, "p.fn");
+        std::vector<llvm::Type*> ptys = { i8p };
+        if (req.type)
+            for (auto* p : req.type->elements) ptys.push_back(layout_->lower(p));
+        llvm::Type* rty = (req.type && req.type->ret) ? layout_->lower(req.type->ret)
+                                                      : llvm::Type::getVoidTy(*ctx_);
+        llvm::FunctionType* tfty = llvm::FunctionType::get(rty, ptys, false);
+        llvm::Value* castFn = b_->CreateBitCast(fnPtr, llvm::PointerType::getUnqual(tfty),
+                                                "p.fnp");
+        std::vector<llvm::Value*> args{data};
+        for (auto& a : e->arguments) {
+            if (llvm::Value* v = genExpr(a.get())) args.push_back(v);
+        }
+        for (size_t i = 0; i < args.size() && i < tfty->getNumParams(); ++i)
+            args[i] = coerce(args[i], tfty->getParamType(i));
+        return b_->CreateCall(llvm::FunctionCallee(tfty, castFn), args);
+    }
+
     llvm::Value* genCall(CallExpr* e) {
         if (!e->callee) return nullptr;
         // A local (or member) holding a closure is called indirectly rather
@@ -5019,6 +5249,46 @@ private:
         if (e->callee->kind == NodeKind::MemberExpr) {
             auto* bm = static_cast<MemberExpr*>(e->callee.get());
             const Type* bt = bm->base ? bm->base->semaType : nullptr;
+
+            // 模块限定访问 `Module.name`（修复编译器缺陷）：按成员名直接调用全局函数
+            // 或类型构造器，不绑定接收者 self。
+            if (bm->isModuleQualified) {
+                std::vector<llvm::Value*> args;
+                std::vector<bool> isNilArg;
+                for (auto& a : e->arguments) {
+                    isNilArg.push_back(a && a->kind == NodeKind::NilLitExpr);
+                    if (a && a->kind == NodeKind::NilLitExpr) args.push_back(nullptr);
+                    else if (llvm::Value* v = genExpr(a.get())) args.push_back(v);
+                }
+                auto fit = fns_.find(bm->member);
+                llvm::Function* callee =
+                    (fit != fns_.end()) ? fit->second : declareExternal(bm->member);
+                return emitCall(callee, args,
+                                fnThrows_.count(bm->member) ? fnThrows_[bm->member]
+                                                            : false,
+                                isNilArg);
+            }
+            if (bm->isModuleQualifiedType) {
+                auto sit = structTypes_.find(bm->member);
+                if (sit != structTypes_.end()) return genStructInit(sit->second, e);
+                auto cit = classTypes_.find(bm->member);
+                if (cit != classTypes_.end()) return genClassInit(cit->second, e);
+                // 非类型构造（理论上不应到达）：按全局函数兜底调用。
+                std::vector<llvm::Value*> args;
+                std::vector<bool> isNilArg;
+                for (auto& a : e->arguments) {
+                    isNilArg.push_back(a && a->kind == NodeKind::NilLitExpr);
+                    if (a && a->kind == NodeKind::NilLitExpr) args.push_back(nullptr);
+                    else if (llvm::Value* v = genExpr(a.get())) args.push_back(v);
+                }
+                auto fit = fns_.find(bm->member);
+                llvm::Function* callee =
+                    (fit != fns_.end()) ? fit->second : declareExternal(bm->member);
+                return emitCall(callee, args,
+                                fnThrows_.count(bm->member) ? fnThrows_[bm->member]
+                                                            : false,
+                                isNilArg);
+            }
 
             if (bt && isFloatKind(bt->kind)) {
                 if (llvm::Value* recv = genExpr(bm->base.get()))
@@ -5077,6 +5347,13 @@ private:
                 ownerRecord = bt->element;
             }
             if (ownerRecord) {
+                // A protocol receiver dispatches through its witness table rather
+                // than a static method, since the concrete type is only known at
+                // the call site (where the value was boxed).
+                if (ownerRecord->record && ownerRecord->record->isProtocol()) {
+                    if (llvm::Value* r = genProtocolCall(ownerRecord, m, e)) return r;
+                    return nullptr;
+                }
                 // addTask 的子结果类型 T 由闭包实参返回类型推断（裸 TaskGroup 无
                 // elements）。该 T 必须并入查找/存储 key，否则生成后查不到而无法调用。
                 const Type* egElemTy = nullptr;
@@ -5297,12 +5574,12 @@ private:
         // A call naming a class type allocates an instance and runs `init`.
         auto cit = classTypes_.find(n);
         if (cit != classTypes_.end()) return genClassInit(cit->second, e);
-        // `print` / `println` accept any printable value; a String's runtime
+        // `print` / `printsl` accept any printable value; a String's runtime
         // entry point receives the `{ i8*, i64 }` aggregate, and other scalars
-        // are formatted first.
-        if ((n == "print" || n == "println") && !e->arguments.empty() &&
+        // are formatted first. `print` 默认换行；`printsl`（single-line）不换行。
+        if ((n == "print" || n == "printsl") && !e->arguments.empty() &&
             e->arguments[0] && e->arguments[0]->semaType) {
-            if (llvm::Value* r = genPrint(e, n == "println")) return r;
+            if (llvm::Value* r = genPrint(e, n != "printsl")) return r;
         }
         std::vector<llvm::Value*> args;
         std::vector<bool> isNilArg;
@@ -5347,7 +5624,15 @@ private:
                     args.push_back(nullptr);
                 } else {
                     isNilArg.push_back(false);
-                    if (llvm::Value* v = genExpr(e->arguments[i].get())) args.push_back(v);
+                    if (llvm::Value* v = genExpr(e->arguments[i].get())) {
+                        // Box a concrete value into a protocol existential when the
+                        // parameter is a protocol the argument conforms to.
+                        const Type* paramTy = fdecl->params[target].semaType;
+                        if (paramTy && paramTy->record && paramTy->record->isProtocol() &&
+                            v->getType() != layout_->lower(paramTy))
+                            v = boxIntoProtocol(v, e->arguments[i]->semaType, paramTy);
+                        args.push_back(v);
+                    }
                 }
                 argTypeNames.push_back(
                     e->arguments[i]->semaType
@@ -5440,10 +5725,20 @@ private:
             }
             auto sit = fns_.find(spawnSym);
             if (sit == fns_.end() || !sit->second) return nullptr;
+            // Pass the caller's error slot for a throwing async function so the
+            // error raised on the worker thread propagates back to the caller's
+            // `try`/`catch`. The slot pointer is shared across the thread
+            // boundary and the caller awaits completion before consulting it.
+            // Cap the positional arguments at the declared parameter count (not
+            // the full spawn signature, which may carry the trailing error slot).
             std::vector<llvm::Value*> callArgs;
-            for (size_t i = 0; i < args.size() && i < sit->second->arg_size(); ++i)
+            unsigned nParams = fdecl ? (unsigned)fdecl->params.size()
+                                     : (unsigned)sit->second->arg_size();
+            for (unsigned i = 0; i < nParams && i < args.size(); ++i)
                 callArgs.push_back(coerce(args[i],
                     sit->second->getFunctionType()->getParamType(i)));
+            if (fdecl && fdecl->isThrows)
+                callArgs.push_back(errorSlotForCall());
             return b_->CreateCall(sit->second, callArgs);
         }
         auto it = fns_.find(n);
@@ -5887,6 +6182,9 @@ public:
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> b_;
     std::map<std::string, llvm::Function*> fns_;
+    // Lazily-built protocol existential witness tables: key "Proto_Conformer"
+    // → the i8* pointer to a constant array of requirement thunk function ptrs.
+    std::map<std::string, llvm::Value*> witnessTables_;
     // Declarations still waiting for their body, as (decl, symbol name).
     std::vector<std::pair<FunctionDecl*, std::string>> pendingBodies_;
     std::map<std::string, bool> isMainFns_;
@@ -6299,6 +6597,37 @@ public:
             arcReleaseIfRef(v, scopeRefs_[i - 1].type);
         }
         scopeRefs_.resize(mark);
+    }
+
+    // Drop a local binding (e.g. a loop variable) at the end of its scope so that
+    // later closures do not erroneously capture a variable that has gone out of
+    // scope. For reference types the current value is ARC-released first.
+    //
+    // This must be called at the block where the scope actually ends (the loop's
+    // exit block). Without it, a loop variable bound into `locals_` lingers after
+    // the loop and an *outer* closure (e.g. a later `Task { ... }`) implicitly
+    // captures it; the captured slot's alloca then lives in the loop body block
+    // but is referenced from the exit block it does not dominate, which the LLVM
+    // verifier rejects ("Instruction does not dominate all uses").
+    //
+    // NOTE: `locals_` is a flat name→slot map, so this erases the binding rather
+    // than restoring a shadowed outer one. That matches the out-of-scope semantics
+    // (a loop variable is not visible after the loop); shadowing restoration is a
+    // separate concern not addressed here.
+    void dropLocal(const std::string& name, const Type* t) {
+        auto it = locals_.find(name);
+        if (it == locals_.end()) return;
+        if (t && layout_->isReferenceType(t)) {
+            if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(it->second)) {
+                llvm::Value* v = b_->CreateLoad(slot->getAllocatedType(), slot);
+                arcReleaseIfRef(v, t);
+            }
+        }
+        for (size_t i = 0; i < scopeRefs_.size(); ) {
+            if (scopeRefs_[i].name == name) scopeRefs_.erase(scopeRefs_.begin() + i);
+            else ++i;
+        }
+        locals_.erase(it);
     }
 
     void genMethodBody(FunctionDecl* fn, const Type* ownerTy, llvm::Function* f) {

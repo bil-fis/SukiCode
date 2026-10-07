@@ -8,6 +8,39 @@ module concurrency
 
 import core
 
+// ─── C 运行时桥接（地址以 Int 传递，与 cstrOf / suki_ptr_* 既有约定一致）──────────
+foreign func suki_intword_create(_ v: Int) -> Int
+foreign func suki_intword_destroy(_ addr: Int)
+// 注意：不可在此声明 `suki_atomic_load_i64` / `suki_atomic_store_i64` /
+// `suki_atomic_add_i64` —— 这些符号由编译器内置 atomicLoad/atomicStore/atomicAdd
+// 与 @intrinsic TaskGroup 代码生成以「指针首参」签名使用，重复声明会导致 IR 签名
+// 冲突。AtomicInt 改用独立的 `suki_aint_*` 包装（内部复用同一组原子指令）。
+foreign func suki_aint_load(_ p: Int) -> Int
+foreign func suki_aint_store(_ p: Int, _ v: Int)
+foreign func suki_aint_add(_ p: Int, _ delta: Int) -> Int
+foreign func suki_hmutex_create() -> Int
+foreign func suki_hmutex_lock(_ addr: Int)
+foreign func suki_hmutex_unlock(_ addr: Int)
+foreign func suki_hmutex_destroy(_ addr: Int)
+foreign func suki_semaphore_create(_ initial: Int) -> Int
+foreign func suki_semaphore_wait(_ addr: Int)
+foreign func suki_semaphore_signal(_ addr: Int)
+foreign func suki_semaphore_destroy(_ addr: Int)
+foreign func suki_cond_create() -> Int
+foreign func suki_cond_wait(_ addr: Int)
+foreign func suki_cond_signal(_ addr: Int)
+foreign func suki_cond_broadcast(_ addr: Int)
+foreign func suki_cond_destroy(_ addr: Int)
+// 注意：不可在此声明 `suki_future_create` / `suki_future_finish` / `suki_future_free`，
+// 这些符号由编译器 @intrinsic 代码生成（Channel / TaskGroup / withTaskGroup）使用，
+// 重复声明会导致 IR 中函数签名冲突（Call parameter type does not match）。故 Future/
+// Promise 改用独立的 `suki_promise_*` 运行时包装（内部复用 SukiFuture）。
+foreign func suki_promise_create(_ resultSize: Int) -> Int
+foreign func suki_future_store_i64(_ fAddr: Int, _ v: Int) -> Int
+foreign func suki_future_get_i64(_ fAddr: Int) -> Int
+foreign func suki_future_await_i64(_ fAddr: Int) -> Int
+foreign func suki_promise_finish(_ fAddr: Int)
+
 /// An execution context that runs work serially (e.g. the main actor).
 protocol TaskExecutor {}
 
@@ -21,14 +54,28 @@ struct TaskGroupHandle {
     var id: Int
 }
 
-/// A simple mutual-exclusion lock (backed by the C runtime spin lock).
-struct Mutex {
-    var state: Int
+/// 互斥锁：包裹 C 运行时的自旋锁，提供临界区保护。
+public struct Mutex {
+    var handle: Int
+    public init() { self.handle = suki_hmutex_create() }
+    /// 进入临界区（阻塞直至获取锁）。
+    public func lock() { suki_hmutex_lock(self.handle) }
+    /// 离开临界区。
+    public func unlock() { suki_hmutex_unlock(self.handle) }
 }
 
-/// An atomic integer counter.
-struct AtomicInt {
-    var value: Int
+/// 原子整数：所有读写经 C 运行时的原子指令，保证跨线程可见。
+public struct AtomicInt {
+    var handle: Int
+    public init(_ initial: Int) { self.handle = suki_intword_create(initial) }
+    /// 原子读取当前值。
+    public func load() -> Int { return suki_aint_load(self.handle) }
+    /// 原子写入。
+    public func store(_ v: Int) { suki_aint_store(self.handle, v) }
+    /// 原子加 delta 并返回加之后的值（与编译器内置 `atomicAdd` 语义一致）。
+    public func add(_ delta: Int) -> Int {
+        return suki_aint_add(self.handle, delta)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -68,3 +115,60 @@ struct TaskGroup<T> {
 
 /// 在作用域内运行一组子任务，作用域退出前 `await` 全部完成（结构化并发）。
 @intrinsic async func withTaskGroup(_ body: (TaskGroup) -> Void)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  同步原语（用户态类型，桥接 runtime.c）
+//
+//  这些类型的方法只接受/返回 Int 或 Void，不在结构体方法内构造字符串，规避了
+//  已知的「结构体方法内字符串拼接被破坏」缺陷。锁/信号量/条件变量均持有 C 侧
+//  分配对象的地址（以 Int 表示），与 cstrOf / suki_ptr_* 既有的「地址即 Int」
+//  约定一致。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 计数信号量：控制同时访问临界资源的协程/线程数量。
+public struct Semaphore {
+    var handle: Int
+    /// 以初始许可数创建信号量。
+    public init(_ permits: Int) { self.handle = suki_semaphore_create(permits) }
+    /// 获取一个许可；若无可用许可则阻塞。
+    public func wait() { suki_semaphore_wait(self.handle) }
+    /// 释放一个许可，唤醒一个等待者。
+    public func signal() { suki_semaphore_signal(self.handle) }
+}
+
+/// 条件变量（自带互斥锁，语义等同 wait/notify）。
+public struct Condition {
+    var handle: Int
+    public init() { self.handle = suki_cond_create() }
+    /// 在关联锁保护下等待通知。
+    public func wait() { suki_cond_wait(self.handle) }
+    /// 唤醒一个等待者。
+    public func signal() { suki_cond_signal(self.handle) }
+    /// 唤醒全部等待者。
+    public func broadcast() { suki_cond_broadcast(self.handle) }
+}
+
+// ─── Future / Promise（Int 结果）────────────────────────────────────────────────
+//
+// 受编译器限制，目前仅支持 Int 结果：自定义计算需「闭包 → C 回调」的 FFI 支持
+// （编译器待办 C5），故 Promise 的 fulfill 直接写入一个 Int 结果、Future.await
+// 阻塞读回该结果。更复杂的类型化 Future<T> 待泛型单态化完善后再行落地。
+/// 承诺：另一方通过 `fulfill` 在未来某一刻提供一个 Int 结果。
+public struct Promise {
+    var handle: Int
+    public init() { self.handle = suki_promise_create(8) }
+    /// 提供一个 Int 结果并标记完成。
+    public func fulfill(_ v: Int) {
+        suki_future_store_i64(self.handle, v)
+        suki_promise_finish(self.handle)
+    }
+}
+
+/// 未来：代表一个尚未就绪的 Int 结果，可 `await` 阻塞等待其完成。
+public struct Future {
+    var handle: Int
+    /// 由对应的 Promise 构造。
+    public init(_ p: Promise) { self.handle = p.handle }
+    /// 阻塞直至结果就绪并返回。
+    public func result() -> Int { return suki_future_await_i64(self.handle) }
+}

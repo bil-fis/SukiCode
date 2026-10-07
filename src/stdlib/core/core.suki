@@ -338,7 +338,7 @@ func unwrapOrBool(_ o: Bool?, fallback: Bool) -> Bool {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Assertions (规范 §9)
-//  `print` / `println` / `panic` are compiler builtins; `assert` /
+//  `print` / `printsl` / `panic` are compiler builtins; `assert` /
 //  `precondition` / `fatalError` sit on top of the ABI-compatible
 //  `suki_panic_string` runtime entry point.
 // ═══════════════════════════════════════════════════════════════════════════

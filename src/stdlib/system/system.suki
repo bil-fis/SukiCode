@@ -12,14 +12,12 @@ module system
 //     {ptr,i64} 的 String 字面量在 ==/stringContains 中混用，且 if let / ! 均
 //     触发 IR 验证失败）。故返回“可能缺失”的 API 一律返回非 Optional 的 String，
 //     以空串 "" 表示缺失/失败；是否存在由同组的 *exists/*contains 布尔函数判定。
-//  2. 结构体静态方法调用存在严重缺陷：形如 Type.method() 的调用，代码生成
-//     不会在调用者处产出对应的 call 指令——方法体被编译成死代码，调用者拿到
-//     未初始化的返回值（实测为栈地址之类的垃圾，且该方法内部即使有 side-effect
-//     也不执行）。此缺陷与是否返回 String / 是否接收 String 形参无关，连返回 Int
-//     的 Clock.now()/Clock.cpuMicros() 也无法幸免（其调用点被直接丢弃）。
-//     因此所有 API 一律以【模块顶层函数】形式实现（如 system.basename /
-//     system.readAllText / system.clockNow / system.clockCpuMicros）。模块名
-//     system 即命名空间，调用形如 system.basename(...)。
+//  2. 结构体静态方法调用（Type.method()）与模块限定访问（system.Type.method() /
+//     system.func() / system.Type(...)）此前存在严重缺陷（调用点被丢弃或返回被
+//     错乱解析为 ptr），现已在编译器层面修复并验证可用（见
+//     moduleTest/codegen/stdlib_module_qualified.suki）。故 System 的实际 API 以
+//     下方「类型化」形式提供（Path / FileManager / Date / OS / Hardware / Process），
+//     既可用非限定名（Clock.now()），也可用模块限定名（system.Clock.now()）。
 //  3. 调用 libc 的 foreign 函数时，time(NULL) 经 runtime.c 的 suki_time_now_sec
 //     包装（无参 foreign 返回 Int，规避指针参数 ABI 问题）可正常返回秒数；
 //     clock_gettime(CLOCK_MONOTONIC) 经 suki_clock_cpu_micros 包装返回微秒，
@@ -215,4 +213,90 @@ public struct Clock {
     public static func cpuMicros() -> Int {
         return suki_clock_cpu_micros()
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  类型化 API（规范 §12.1）
+//
+//  以下类型均以「模块顶层类型」形式提供，既可用非限定名（如 `Path("/a/b")`
+//  `FileManager.shared().exists(...)`），也可用模块限定名（`system.Path(...)` /
+//  `system.FileManager.shared()`）——模块限定访问的编译器缺陷已修复并验证可用。
+//  结构体实例方法凡涉及字符串拼接 / 循环者一律委托给上方已验证的顶层函数
+//  （basename / dirname / pathExtension / joinPath / fileExists / readAllText /
+//  writeAllText / runProcess / captureProcess 等），以规避「方法内构造 String 被破坏」
+//  的已知编译器缺陷（若该缺陷后续修复，可直接内联构造逻辑）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Path：文件路径的类型化封装 ──────────────────────────────────────────────────
+public struct Path {
+    public var path: String
+    public init(_ p: String) { self.path = p }
+    /// 文件名（最后一个 '/' 之后）。
+    public func lastComponent() -> String { return basename(self.path) }
+    /// 目录部分（最后一个 '/' 之前，含 '/'）。
+    public func directory() -> String { return dirname(self.path) }
+    /// 扩展名（最后一个 '.' 之后）；无则返回 ""。
+    public func ext() -> String { return pathExtension(self.path) }
+    /// 拼接子路径，返回新 Path。
+    public func appending(_ component: String) -> Path {
+        return Path(joinPath(self.path, component))
+    }
+    /// 是否存在（文件或目录）。
+    public func exists() -> Bool { return fileExists(self.path) }
+}
+
+// ─── FileManager：文件与目录操作 ─────────────────────────────────────────────────
+public struct FileManager {
+    public init() {}
+    /// 共享单例（结构体静态方法已修复，见 Clock.now）。
+    public static func shared() -> FileManager { return FileManager() }
+    /// 路径是否存在。
+    public func exists(_ p: Path) -> Bool { return fileExists(p.path) }
+    /// 写入文本（覆盖），成功返回 true。
+    public func write(_ p: Path, _ contents: String) -> Bool {
+        return writeAllText(p.path, contents)
+    }
+    /// 读取整个文本；失败返回 ""。
+    public func read(_ p: Path) -> String { return readAllText(p.path) }
+}
+
+// ─── Date：时间瞬间 ─────────────────────────────────────────────────────────────
+public struct Date {
+    /// 自 1970-01-01 起的秒数。
+    public var seconds: Int
+    public init() { self.seconds = suki_time_now_sec() }
+    /// 当前时刻。
+    public static func now() -> Date { return Date() }
+}
+
+// ─── OS：操作系统环境信息 ───────────────────────────────────────────────────────
+public struct OS {
+    public init() {}
+    /// 读取环境变量；不存在返回 ""。
+    public func environment(_ name: String) -> String { return getEnv(name) }
+    /// 环境变量是否存在。
+    public func hasEnvironment(_ name: String) -> Bool { return hasEnv(name) }
+    /// 当前 Unix 时间（秒）。
+    public func now() -> Int { return suki_time_now_sec() }
+}
+
+// ─── Hardware：硬件信息 ─────────────────────────────────────────────────────────
+foreign func suki_hw_cpu_count() -> Int
+foreign func suki_hw_total_memory() -> Int
+
+public struct Hardware {
+    public init() {}
+    /// 逻辑 CPU 核数。
+    public func cpuCount() -> Int { return suki_hw_cpu_count() }
+    /// 物理内存总量（字节）。
+    public func totalMemory() -> Int { return suki_hw_total_memory() }
+}
+
+// ─── Process：进程执行 ──────────────────────────────────────────────────────────
+public struct Process {
+    public init() {}
+    /// 同步执行命令，返回进程退出状态。
+    public func run(_ command: String) -> Int { return runProcess(command) }
+    /// 执行命令并捕获标准输出；失败或空输出返回 ""。
+    public func capture(_ command: String) -> String { return captureProcess(command) }
 }

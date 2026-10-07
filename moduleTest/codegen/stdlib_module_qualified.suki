@@ -1,0 +1,27 @@
+// 模块限定访问（Module.name）编译器缺陷修复回归测试
+import system
+@main func main() -> Int {
+    var score = 0
+    // 静态方法（不同方法）
+    let nowVal = system.Clock.now()
+    if nowVal > 0 { score += 1 }
+    if system.Clock.cpuMicros() > 0 { score += 2 }
+    // 顶层函数
+    if system.basename("/a/b/c.txt") == "c.txt" { score += 4 }
+    // 类型构造器 + 实例方法
+    let p = system.Path("/a/b/c.txt")
+    if p.lastComponent() == "c.txt" { score += 8 }
+    if p.directory() == "/a/b/" { score += 16 }
+    let q = system.Path("/a/b/c.txt").appending("d")
+    if q.path == "/a/b/c.txt/d" { score += 32 }
+    // 其它类型构造器与嵌套调用
+    if system.OS().hasEnvironment("PATH") { score += 64 }
+    if system.Hardware().cpuCount() > 0 { score += 128 }
+    if system.Date.now().seconds > 0 { score += 256 }
+    if system.Process().run("true") == 0 { score += 512 }
+    if system.FileManager.shared().exists(system.Path("/tmp")) { score += 1024 }
+
+    let expected = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 256 + 512 + 1024
+    if score == expected { return 0 }
+    return score
+}

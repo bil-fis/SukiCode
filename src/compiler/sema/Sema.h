@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -283,6 +284,9 @@ private:
     const TypeRecord* currentType_ = nullptr;  // enclosing named type (for `self`)
     // 当前正在分析的声明所属模块（空 = 用户主模块），用于 §10.1 跨模块访问控制。
     std::string currentModule_;
+    // 当前可见的已导入模块名集合（`import X` 与 `module X` 声明），供模块限定访问
+    // `Module.name` 解析时判定 base 是否为模块名（修复编译器缺陷）。
+    std::set<std::string> importedModules_;
     bool currentThrows_ = false;
     // While checking a binding/case pattern, bare identifiers are bindings (not
     // value references) and must not be reported as unresolved.

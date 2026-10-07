@@ -25,7 +25,8 @@
 #include <sys/time.h>
 #include <stdint.h>
 #if !defined(_WIN32)
-  #include <unistd.h>   // nanosleep (POSIX)
+  #include <unistd.h>   // nanosleep (POSIX), sysconf
+  #include <sys/sysinfo.h>   // sysinfo (物理内存)
 #endif
 
 // ─── platform threading backend ────────────────────────────────────────────────
@@ -71,6 +72,7 @@ static int64_t suki_round_pow2(int64_t v) {
 // ─── printing ─────────────────────────────────────────────────────────────
 void print(const char* s) {
     if (s) fputs(s, stdout);
+    fflush(stdout);
 }
 
 void println(const char* s) {
@@ -376,6 +378,7 @@ SukiString suki_double_to_string(double v) {
 
 void suki_print_str(SukiString s) {
     if (s.data && s.length > 0) fwrite(s.data, 1, (size_t)s.length, stdout);
+    fflush(stdout);
 }
 
 void suki_println_str(SukiString s) {
@@ -791,6 +794,22 @@ int64_t suki_ptr_write_int(void* p, int64_t v) {
     return 0;
 }
 
+// Single-byte read/write. The SukiCode side passes the address as an `Int`
+// (LP64 makes an 8-byte pointer and an int64 the same width), so these mirror
+// the int-granularity helpers above but touch exactly one byte. They let the
+// `data` standard-library module implement `Data` / Base64 / Hex without
+// over-reading past a buffer boundary (reading an Int would fetch 8 bytes).
+int64_t suki_ptr_read_byte(void* p) {
+    if (!p) return 0;
+    return (int64_t)(unsigned char)*(const unsigned char*)p;
+}
+
+int64_t suki_ptr_write_byte(void* p, int64_t v) {
+    if (!p) return 0;
+    *(unsigned char*)p = (unsigned char)(v & 0xFF);
+    return 0;
+}
+
 int64_t suki_atomic_load_i64(const int64_t* p) {
     return p ? __atomic_load_n(p, __ATOMIC_ACQUIRE) : 0;
 }
@@ -801,6 +820,38 @@ void suki_atomic_store_i64(int64_t* p, int64_t v) {
 
 int64_t suki_atomic_add_i64(int64_t* p, int64_t delta) {
     return p ? __atomic_fetch_add(p, delta, __ATOMIC_ACQ_REL) + delta : 0;
+}
+
+// ─── 堆分配的整数字（供 SukiCode 侧持有原子/锁字地址）────────────────────────────
+// SukiCode 侧把地址作为 Int 持有（LP64 下指针与 int64 同宽），C 侧按 int64_t 地址
+// 接收后强转回指针，与 suki_ptr_* / cstrOf 既有的地址即 Int 约定一致。
+int64_t suki_intword_create(int64_t v) {
+    int64_t* p = (int64_t*)suki_alloc(sizeof(int64_t));
+    *p = v;
+    return (int64_t)(intptr_t)p;
+}
+
+void suki_intword_destroy(int64_t addr) {
+    if (addr) suki_free((void*)(intptr_t)addr);
+}
+
+// ─── 互斥锁（堆分配，阻塞自旋锁封装）──────────────────────────────────────────────
+int64_t suki_hmutex_create(void) {
+    SukiMutex* m = (SukiMutex*)suki_alloc(sizeof(SukiMutex));
+    suki_mutex_init(m);
+    return (int64_t)(intptr_t)m;
+}
+
+void suki_hmutex_lock(int64_t addr) {
+    suki_mutex_lock((SukiMutex*)(intptr_t)addr);
+}
+
+void suki_hmutex_unlock(int64_t addr) {
+    suki_mutex_unlock((SukiMutex*)(intptr_t)addr);
+}
+
+void suki_hmutex_destroy(int64_t addr) {
+    if (addr) suki_free((void*)(intptr_t)addr);
 }
 
 // ─── portable threading ─────────────────────────────────────────────────────────
@@ -861,6 +912,15 @@ static void suki_cvar_broadcast(suki_cvar_t* c) {
     WakeAllConditionVariable(c);
 #else
     pthread_cond_broadcast(c);
+#endif
+}
+// Wake a single waiter (mirrors pthread_cond_signal). Used by semaphore/condition
+// signal so that only one waiter is released per permit/notification.
+static void suki_cvar_signal(suki_cvar_t* c) {
+#if defined(_WIN32)
+    WakeConditionVariable(c);
+#else
+    pthread_cond_signal(c);
 #endif
 }
 static void suki_cvar_destroy(suki_cvar_t* c) {
@@ -1275,4 +1335,165 @@ int64_t suki_test_add_c(int64_t a, int64_t b) {
 // 链接器产生 `.1` 后缀冲突）。x86_64 上 stdcall 按默认 ABI 处理，链接后可直接调用。
 int64_t suki_test_add_c_std(int64_t a, int64_t b) {
     return a + b;
+}
+
+// ─── 信号量 ─────────────────────────────────────────────────────────────────────
+typedef struct {
+    suki_bmtx_t mtx;
+    suki_cvar_t cvar;
+    int64_t     count;
+} SukiSemaphore;
+
+int64_t suki_semaphore_create(int64_t initial) {
+    SukiSemaphore* s = (SukiSemaphore*)suki_alloc(sizeof(SukiSemaphore));
+    suki_bmtx_init(&s->mtx);
+    suki_cvar_init(&s->cvar);
+    s->count = initial;
+    return (int64_t)(intptr_t)s;
+}
+
+void suki_semaphore_wait(int64_t addr) {
+    SukiSemaphore* s = (SukiSemaphore*)(intptr_t)addr;
+    if (!s) return;
+    suki_bmtx_lock(&s->mtx);
+    while (s->count <= 0) suki_cvar_wait(&s->cvar, &s->mtx);
+    s->count -= 1;
+    suki_bmtx_unlock(&s->mtx);
+}
+
+void suki_semaphore_signal(int64_t addr) {
+    SukiSemaphore* s = (SukiSemaphore*)(intptr_t)addr;
+    if (!s) return;
+    suki_bmtx_lock(&s->mtx);
+    s->count += 1;
+    suki_cvar_signal(&s->cvar);
+    suki_bmtx_unlock(&s->mtx);
+}
+
+void suki_semaphore_destroy(int64_t addr) {
+    SukiSemaphore* s = (SukiSemaphore*)(intptr_t)addr;
+    if (!s) return;
+    suki_cvar_destroy(&s->cvar);
+    suki_bmtx_destroy(&s->mtx);
+    suki_free(s);
+}
+
+// ─── 条件变量（自带互斥锁，语义等同 wait/notify）─────────────────────────────────
+typedef struct {
+    suki_bmtx_t mtx;
+    suki_cvar_t cvar;
+} SukiCond;
+
+int64_t suki_cond_create(void) {
+    SukiCond* c = (SukiCond*)suki_alloc(sizeof(SukiCond));
+    suki_bmtx_init(&c->mtx);
+    suki_cvar_init(&c->cvar);
+    return (int64_t)(intptr_t)c;
+}
+
+void suki_cond_wait(int64_t addr) {
+    SukiCond* c = (SukiCond*)(intptr_t)addr;
+    if (!c) return;
+    suki_bmtx_lock(&c->mtx);
+    suki_cvar_wait(&c->cvar, &c->mtx);
+    suki_bmtx_unlock(&c->mtx);
+}
+
+void suki_cond_signal(int64_t addr) {
+    SukiCond* c = (SukiCond*)(intptr_t)addr;
+    if (!c) return;
+    suki_bmtx_lock(&c->mtx);
+    suki_cvar_signal(&c->cvar);
+    suki_bmtx_unlock(&c->mtx);
+}
+
+void suki_cond_broadcast(int64_t addr) {
+    SukiCond* c = (SukiCond*)(intptr_t)addr;
+    if (!c) return;
+    suki_bmtx_lock(&c->mtx);
+    suki_cvar_broadcast(&c->cvar);
+    suki_bmtx_unlock(&c->mtx);
+}
+
+void suki_cond_destroy(int64_t addr) {
+    SukiCond* c = (SukiCond*)(intptr_t)addr;
+    if (!c) return;
+    suki_cvar_destroy(&c->cvar);
+    suki_bmtx_destroy(&c->mtx);
+    suki_free(c);
+}
+
+// ─── Future / Promise（Int 结果；受编译器限制仅支持 Int，自定义计算需闭包 FFI）─────
+int64_t suki_future_store_i64(int64_t fAddr, int64_t v) {
+    SukiFuture* f = (SukiFuture*)(intptr_t)fAddr;
+    if (!f || f->resultSize <= 0) return -1;
+    suki_bmtx_lock(&f->mtx);
+    *(int64_t*)f->result = v;
+    suki_bmtx_unlock(&f->mtx);
+    return 0;
+}
+
+int64_t suki_future_get_i64(int64_t fAddr) {
+    SukiFuture* f = (SukiFuture*)(intptr_t)fAddr;
+    if (!f || f->resultSize <= 0) return 0;
+    suki_bmtx_lock(&f->mtx);
+    int64_t v = *(int64_t*)f->result;
+    suki_bmtx_unlock(&f->mtx);
+    return v;
+}
+
+int64_t suki_future_await_i64(int64_t fAddr) {
+    SukiFuture* f = (SukiFuture*)(intptr_t)fAddr;
+    if (!f) return 0;
+    int64_t dummy = 0;
+    suki_future_await(f, &dummy);   // 阻塞至完成
+    return suki_future_get_i64(fAddr);
+}
+
+// Promise 专用包装：与 @intrinsic 代码生成使用的 suki_future_create / suki_future_finish
+// 解耦，避免 SukiCode 侧重复声明导致 IR 中函数签名冲突。内部复用同一 SukiFuture。
+int64_t suki_promise_create(int64_t resultSize) {
+    return (int64_t)(intptr_t)suki_future_create(resultSize);
+}
+
+void suki_promise_finish(int64_t fAddr) {
+    suki_future_finish((SukiFuture*)(intptr_t)fAddr);
+}
+
+// AtomicInt 专用包装：与 @intrinsic 代码生成 / 内置 atomicAdd 使用的 suki_atomic_*i64
+// （其首参为指针类型 ptr）解耦，避免 SukiCode 侧以 Int(i64) 声明导致 IR 签名冲突。
+// 内部复用同一组原子指令，仅参数以 Int(地址) 传入。
+int64_t suki_aint_load(int64_t p) {
+    return suki_atomic_load_i64((const int64_t*)(intptr_t)p);
+}
+void suki_aint_store(int64_t p, int64_t v) {
+    suki_atomic_store_i64((int64_t*)(intptr_t)p, v);
+}
+int64_t suki_aint_add(int64_t p, int64_t delta) {
+    return suki_atomic_add_i64((int64_t*)(intptr_t)p, delta);
+}
+
+// ─── 硬件信息（供 system 模块 Hardware 类型）────────────────────────────────────
+int64_t suki_hw_cpu_count(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int64_t)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int64_t)n : 1;
+#endif
+}
+
+int64_t suki_hw_total_memory(void) {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    return (int64_t)ms.ullTotalPhys;
+#else
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) return 0;
+    return (int64_t)info.totalram * (int64_t)info.mem_unit;
+#endif
 }

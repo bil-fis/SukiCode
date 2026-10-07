@@ -1,0 +1,41 @@
+// test 标准库：expect / assertEqual* / measure / assertThrows 验证。
+// 全部断言通过返回 0，否则返回累计失败权重。
+
+import test
+import core
+
+enum MyError: Error {
+    case boom
+}
+
+// 返回值的抛出函数：assertThrows 通过 `try?` 包裹，按结果是否为 nil 判定是否抛出。
+func doThrow() throws -> Int {
+    throw MyError.boom
+}
+
+func doSafe() throws -> Int {
+    return 0
+}
+
+@main func main() -> Int {
+    var score = 0
+
+    if expect(1 + 1 == 2) { score += 1 }
+    if assertEqualInt(3, 3) { score += 2 }
+    if assertEqualString("a", "a") { score += 4 }
+    if assertEqualBool(true, true) { score += 8 }
+    if assertEqualDouble(1.0, 1.0) { score += 16 }
+
+    // assertThrows：抛出函数经 try? 得 nil -> 判定抛出（通过）
+    if assertThrows({ try? doThrow() }) { score += 32 }
+    // assertThrows：不抛出的函数经 try? 得非 nil -> 判定未抛出（取反后通过）
+    if !assertThrows({ try? doSafe() }) { score += 64 }
+
+    // measure：运行 N 次返回非负耗时
+    let t = measure({ var x = 0; x = x + 1 }, 1000)
+    if t >= 0 { score += 128 }
+
+    let expected = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128
+    if score == expected { return 0 }
+    return score
+}

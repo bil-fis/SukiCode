@@ -1,0 +1,48 @@
+// 并发运行时回归测试：Mutex / AtomicInt / Semaphore / Condition / Future-Promise
+// 注意：本测试为单线程，仅验证各原语创建/基本操作不崩溃且语义正确；
+// 真正的并发竞争需多线程（依赖编译器闭包→C 回调 FFI，待办 C5）。
+import core
+import concurrency
+
+@main func main() -> Int {
+    var score = 0
+
+    // Mutex：加锁-解锁保护一个共享计数（单线程下等价于顺序执行）
+    let m = Mutex()
+    m.lock()
+    var shared = 0
+    shared = shared + 1
+    shared = shared + 1
+    m.unlock()
+    if shared == 2 { score += 1 }
+
+    // AtomicInt：原子读写与 fetch-add
+    let a = AtomicInt(10)
+    if a.load() == 10 { score += 2 }
+    a.store(20)
+    if a.load() == 20 { score += 4 }
+    let after = a.add(5)   // 返回加之后的值 25
+    if after == 25 && a.load() == 25 { score += 8 }
+
+    // Semaphore：初始许可 1，wait 消耗、signal 归还
+    let s = Semaphore(1)
+    s.wait()
+    s.signal()
+    score += 16
+
+    // Condition：创建/通知/销毁在单线程下均为安全无操作
+    let c = Condition()
+    c.signal()
+    c.broadcast()
+    score += 32
+
+    // Future / Promise：fulfill 后 await 读回 Int 结果
+    let p = Promise()
+    p.fulfill(42)
+    let f = Future(p)
+    if f.result() == 42 { score += 64 }
+
+    let expected = 1 + 2 + 4 + 8 + 16 + 32 + 64
+    if score == expected { return 0 }
+    return score
+}

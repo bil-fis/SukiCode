@@ -125,6 +125,11 @@ void TypeLayout::defineRecord(const TypeRecord* rec, llvm::StructType* st) {
 }
 
 // ── the core query ─────────────────────────────────────────────────────────
+llvm::Type* TypeLayout::protocolBoxTy() {
+    // Existential box: { i8* data; i8* witness }.
+    return llvm::StructType::get(ctx_, { i8Ptr(), i8Ptr() });
+}
+
 llvm::Type* TypeLayout::lower(const Type* t) {
     if (!t) return i8Ptr();
     auto& C = ctx_;
@@ -167,6 +172,11 @@ llvm::Type* TypeLayout::lower(const Type* t) {
                 if (!hasPayload) return llvm::Type::getInt64Ty(C);
                 return llvm::StructType::get(C, { llvm::Type::getInt64Ty(C), i8Ptr() });
             }
+            // A protocol type is an existential box `{ i8* data; i8* witness }`:
+            // `data` points at the concrete value (a heap copy for value types or
+            // the object pointer for reference types) and `witness` points at the
+            // per-(protocol, conformer) witness table of requirement thunks.
+            if (t->record && t->record->isProtocol()) return protocolBoxTy();
             return lowerRecord(t->record);
         }
         case TypeKind::Optional: return optionalTy(lower(t->element));

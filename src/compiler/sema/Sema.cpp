@@ -507,6 +507,17 @@ void Sema::analyze(NodeList& decls) {
     locals_.pushScope();
     registerBuiltins();
 
+    // 收集当前可见的模块名（`import X` 与 `module X` 声明），供模块限定访问
+    // `Module.name` 解析时判定 base 是否为模块名（修复编译器缺陷）。
+    for (auto& d : decls) {
+        if (!d) continue;
+        if (d->kind == NodeKind::ImportDecl)
+            importedModules_.insert(
+                static_cast<ImportDecl*>(d.get())->moduleName);
+        else if (d->kind == NodeKind::ModuleDecl)
+            importedModules_.insert(static_cast<ModuleDecl*>(d.get())->name);
+    }
+
     // Pass 1: create type records for every named type declaration.
     // Declarations belonging to the imported stdlib prelude (index < stdlibDeclCount_)
     // are trusted and may reference unsafe types (e.g. UnsafeMutablePointer).
@@ -914,11 +925,12 @@ void Sema::registerBuiltins() {
         globals_.declare(name, s);
     };
     // Provided by the C runtime (src/runtime/runtime.c).
-    // `print` / `println` accept any printable value (规范 12.1), which the
+    // `print` / `printsl` accept any printable value (规范 12.1), which the
     // `Any` parameter expresses — the code generator formats each scalar type
     // on its own.
+    // `print` 默认换行；`printsl`（single-line，不换行）用于不换行打印。
     addFn("print", { types_.anyType() }, types_.voidType());
-    addFn("println", { types_.anyType() }, types_.voidType());
+    addFn("printsl", { types_.anyType() }, types_.voidType());
     addFn("panic", { types_.stringType() }, types_.voidType());
 
     // Foreign builtins backed by the C runtime (src/runtime/runtime.c). These are
@@ -1747,6 +1759,11 @@ const Type* Sema::resolveMemberType(const Type* t, const std::string& name, Node
     if (!t) return types_.unknownType();
     if (t->kind == TypeKind::Optional) {
         // Implicit optional promotion for member access.
+        return resolveMemberType(t->element, name, at, context);
+    }
+    // 元类型上的成员访问（静态方法 / 静态属性）委托给底层具名类型解析。
+    // 修复模块限定访问 `system.Clock.now()` 等此前被错乱解析为 unknownType 的缺陷。
+    if (t->kind == TypeKind::Metatype && t->element) {
         return resolveMemberType(t->element, name, at, context);
     }
     if (t->kind == TypeKind::Named && t->record) {
@@ -2834,6 +2851,11 @@ void Sema::checkIntegerLiteral(Node* e) {
              (raw[p + 1] == 'b' || raw[p + 1] == 'B')) { base = 2; p += 2; }
     else if (p + 1 < raw.size() && raw[p] == '0' &&
              (raw[p + 1] == 'o' || raw[p + 1] == 'O')) { base = 8; p += 2; }
+    // 前缀（0x/0b/0o）已被上面的分支消费，digStart 指向真正的数字首位，
+    // 供下面截取“纯数字”之用——不能再用跳过符号的 i，否则 substr 会把 “0x”
+    // 一并带进去；而 strtoull 在“显式” base（16/2/8）下不识别 “0x” 前缀，
+    // 只会读第一个数字并在 ‘x’ 处停止，得到 0（如 0xDE -> 0）。
+    size_t digStart = p;
     while (p < raw.size()) {
         char c = raw[p];
         bool ok = (c >= '0' && c <= '9') || c == '_';
@@ -2843,7 +2865,7 @@ void Sema::checkIntegerLiteral(Node* e) {
         if (!ok) break;
         ++p;
     }
-    std::string digits = raw.substr(i, p - i);
+    std::string digits = raw.substr(digStart, p - digStart);
     // 剥离内部下划线。
     for (char& c : digits) if (c == '_') c = ' ';
     digits.erase(std::remove(digits.begin(), digits.end(), ' '), digits.end());
@@ -3168,6 +3190,33 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
         }
         case NodeKind::MemberExpr: {
             auto* m = static_cast<MemberExpr*>(e);
+            // 模块限定访问 `Module.name`（修复编译器缺陷）：当 base 为已导入模块名时，
+            // 将 name 在该模块的公开作用域中解析，使 `Module.Type` / `Module.func()` /
+            // `Module.Type.staticMethod()` 与非限定形式语义一致。此前此形态被错乱解析
+            // （如 `system.Clock.now()` 被当成需接收者的实例调用，返回 ptr）。
+            if (m->base && m->base->kind == NodeKind::IdentExpr) {
+                const std::string& bn =
+                    static_cast<IdentExpr*>(m->base.get())->name;
+                if (importedModules_.count(bn)) {
+                    const std::string& mem = m->member;
+                    // 成员为类型：解析为元类型（metatype），复用既有「裸类型名作
+                    // 成员访问基」的静态派发路径（无接收者 self）。
+                    if (const TypeRecord* rec = findType(mem)) {
+                        const Type* ty = types_.named(rec, mem);
+                        m->base->semaType = types_.metatype(ty, false);
+                        m->semaType = m->base->semaType;
+                        m->isModuleQualifiedType = true;
+                        return m->semaType;
+                    }
+                    // 成员为函数 / 全局变量：直接引用该全局符号，无接收者。
+                    if (const Symbol* s = globals_.lookup(mem)) {
+                        m->semaType = s->type ? s->type : types_.unknownType();
+                        m->isModuleQualified = true;
+                        return m->semaType;
+                    }
+                    // 模块内无此成员：落入通用路径报错。
+                }
+            }
             // MemoryLayout<T>.size / .stride / .alignment（规范 P4.5）：编译期布局
             // 常量。须在 checkExpr(base) 之前识别，否则 `MemoryLayout` 作为未声明
             // 标识符会误报 "not found"。支持两种解析形态：NamedType 带泛型实参
@@ -3469,6 +3518,24 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                     return target;
                 }
             }
+            // 模块限定构造器 `system.Type(...)`：`callee` 为 `Module.Type` 形态，等价于
+            // 非限定 `Type(...)`，返回该类型的实例。此处直接以模块名识别，避免依赖
+            // MemberExpr 检查顺序（修复编译器缺陷）。
+            if (c->callee->kind == NodeKind::MemberExpr) {
+                auto* mqm = static_cast<MemberExpr*>(c->callee.get());
+                if (mqm->base && mqm->base->kind == NodeKind::IdentExpr) {
+                    const std::string& bn =
+                        static_cast<IdentExpr*>(mqm->base.get())->name;
+                    if (importedModules_.count(bn)) {
+                        if (const TypeRecord* rec = findType(mqm->member)) {
+                            checkExpr(c->callee.get(), context);
+                            const Type* instTy = types_.named(rec, mqm->member);
+                            c->callee->semaType = instTy;
+                            return instTy;
+                        }
+                    }
+                }
+            }
             // `Enum.case(args...)` constructs an enum case with a payload. The
             // callee resolves to a member of the enum type, so recover the enum
             // here and require the payload arity to match the declaration.
@@ -3587,11 +3654,11 @@ const Type* Sema::checkExprInner(Node* e, const TypeRecord* context) {
                 }
             }
             const Type* callee = checkExpr(c->callee.get(), context);
-            // `print` / `println` take any printable value and any number of
-            // them (规范 12.1), so they bypass the ordinary argument check.
+            // `print` / `printsl` take any printable value and
+            // any number of them (规范 12.1), so they bypass the ordinary argument check.
             if (c->callee && c->callee->kind == NodeKind::IdentExpr) {
                 const std::string& pn = static_cast<IdentExpr*>(c->callee.get())->name;
-                if (pn == "print" || pn == "println") {
+                if (pn == "print" || pn == "printsl") {
                     for (auto& a : c->arguments) checkExpr(a.get(), context);
                     return types_.voidType();
                 }

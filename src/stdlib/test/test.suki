@@ -1,0 +1,75 @@
+/// SukiCode standard library — `test` module.
+///
+/// Per specification §12.8 the `Test` module provides an XCTest-flavoured API:
+///   - `expect(_:)`            : assert a boolean condition;
+///   - `assertEqualInt/String/Bool/Double` : typed equality (generic equality is
+///       not available across arbitrary `T` yet, so concrete overloads are used,
+///       mirroring the `core` module's `unwrapOr*` / collection-combinator style);
+///   - `measure(_:iterations:)`: run a closure N times, return elapsed microseconds
+///       (backed by the monotonic clock via the C runtime);
+///   - `assertThrows(_:)`      : assert that a throwing function raises an error.
+///
+/// Each assertion returns `Bool` (true == pass) so a test program can accumulate
+/// a score and `return 0` only when everything passed — matching the existing
+/// `moduleTest/codegen` convention where the exit code is the pass/fail signal.
+///
+/// `assertThrows` takes a non-throwing closure that wraps the throwing call with
+/// `try?`; the framework observes whether that produced `nil` (threw) or a value
+/// (did not throw). Example:
+///   assertThrows({ try? riskyCall() })        // riskyCall() throws -> Int
+/// The throwing function must return a value (the common, sensible case) so its
+/// `try?` result is an `Int?` distinguishable from `nil`.
+
+module test
+
+import core
+
+// 单调时钟微秒数（clock_gettime(CLOCK_MONOTONIC)），由 runtime.c 提供；参数为空，
+// 规避 SukiCode 侧传递指针参数的 ABI 缺陷。
+foreign func suki_clock_cpu_micros() -> Int
+
+/// 断言 `condition` 成立。返回是否通过，便于调用方累计分数。
+public func expect(_ condition: Bool) -> Bool {
+    return condition
+}
+
+/// 整数相等。
+public func assertEqualInt(_ a: Int, _ b: Int) -> Bool {
+    return a == b
+}
+
+/// 字符串相等。
+public func assertEqualString(_ a: String, _ b: String) -> Bool {
+    return a == b
+}
+
+/// 布尔相等。
+public func assertEqualBool(_ a: Bool, _ b: Bool) -> Bool {
+    return a == b
+}
+
+/// 浮点相等（容差 1e-9，规避累积误差）。
+public func assertEqualDouble(_ a: Double, _ b: Double) -> Bool {
+    let diff = a - b
+    if diff < 0 { return (-diff) < 1e-9 }
+    return diff < 1e-9
+}
+
+/// 运行 `body` `iterations` 次，返回总耗时（微秒）。
+public func measure(_ body: () -> Void, _ iterations: Int) -> Int {
+    let start = suki_clock_cpu_micros()
+    var i = 0
+    while i < iterations {
+        body()
+        i = i + 1
+    }
+    let end = suki_clock_cpu_micros()
+    return end - start
+}
+
+/// 断言 `body`（非抛出闭包，内部以 `try?` 包裹抛出调用）抛出了错误。
+/// 返回 true 表示 `body()` 求值得到 `nil`（即内部 `try?` 捕获了错误），通过。
+public func assertThrows(_ body: () -> Int?) -> Bool {
+    let result = body()
+    return result == nil
+}

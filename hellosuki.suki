@@ -1,0 +1,238 @@
+// hellosuki.suki
+// SukiCode 语言项目总览 —— 一份能运行的"语言名片"。
+// 展示：中文标识符与中文输出、基础语法与算法、结构化类型、可选值与守卫、
+//       错误处理、宏，以及完整的并发家族（async/await · Channel · TaskGroup · actor · select）。
+
+import concurrency
+import system
+
+// ── 全局常量（中文标识符）──
+let 语言名 = "SukiCode"
+let 标语 = "一门为系统编程与并发而生的现代语言"
+let 版本号 = "v0.0.0-alpha.0"
+
+// ── 进度条动画：验证 flush + 中文 + 计时 ──
+func 进度条(_ 标题: String) {
+    var p = 0
+    while p <= 100 {
+        var 条 = ""
+        var b = 0
+        while b < 20 {
+            if b < p / 5 { 条 = 条 + "█" } else { 条 = 条 + "·" }
+            b = b + 1
+        }
+        printsl("\r\(标题) [\(条)] \(p)%")
+        let 终点 = Clock.cpuMicros() + 50000
+        var 忙等 = 0
+        while Clock.cpuMicros() < 终点 { 忙等 = 忙等 + 1 }
+        p = p + 10
+    }
+    print("")
+}
+
+// 递归斐波那契（用于算法展示）
+func 斐波那契(_ n: Int) -> Int {
+    if n < 2 { return n }
+    return 斐波那契(n - 1) + 斐波那契(n - 2)
+}
+
+// ── 第 1 章：基础语法与算法 ──
+func 基础演示() {
+    print("【第 1 章】基础语法与算法")
+    let 姓名 = "小明"
+    var 年龄 = 18
+    年龄 = 年龄 + 1
+    let 信息 = (姓名, 年龄)
+    print("  元组：用户 \(信息.0) 今年 \(信息.1) 岁")
+
+    var 和 = 0
+    var i = 0
+    while i < 10 {
+        和 = 和 + 斐波那契(i)
+        i = i + 1
+    }
+    print("  斐波那契：前 10 项之和 = \(和)，第 10 项 = \(斐波那契(9))")
+
+    // 素数筛（试除法，统计 2..上限 之间素数个数）
+    let 上限 = 50
+    var 素数个数 = 0
+    var n = 2
+    while n <= 上限 {
+        var 是素数 = true
+        var d = 2
+        while d * d <= n {
+            if n % d == 0 { 是素数 = false }
+            d = d + 1
+        }
+        if 是素数 { 素数个数 = 素数个数 + 1 }
+        n = n + 1
+    }
+    print("  素数筛：2..\(上限) 之间共 \(素数个数) 个素数")
+}
+
+// ── 第 2 章：结构化类型 ──
+protocol 可自我介绍 {
+    func 介绍() -> String
+}
+struct 学生: 可自我介绍 {
+    var 名字: String = ""
+    var 年级: Int = 0
+    func 介绍() -> String { return "我是 \(名字)，\(年级) 年级学生" }
+}
+struct 老师: 可自我介绍 {
+    var 名字: String = ""
+    func 介绍() -> String { return "我是老师 \(名字)" }
+}
+enum 季节 {
+    case 春
+    case 夏
+    case 秋
+    case 冬
+}
+// 协议存在类型：把具体类型作为协议类型形参传递，运行时经 witness 表动态分派。
+func 做自我介绍(_ 谁: 可自我介绍) {
+    print("  [存在类型] \(谁.介绍())")
+}
+func 类型演示() {
+    print("【第 2 章】结构化类型（struct / protocol / enum / 多态）")
+    var 甲 = 学生()
+    甲.名字 = "小红"
+    甲.年级 = 3
+    var 乙 = 老师()
+    乙.名字 = "王老师"
+    // 各类型自行实现协议方法，体现多态分发
+    print("  \(甲.介绍())")
+    print("  \(乙.介绍())")
+
+    // 协议存在类型：把具体类型作为协议类型形参传递，运行时经 witness 表动态分派
+    做自我介绍(甲)
+    做自我介绍(乙)
+
+    let 当前 = 季节.秋
+    switch 当前 {
+    case 季节.秋: print("  现在是秋天，丰收的季节")
+    default: print("  不是秋天")
+    }
+}
+
+// ── 第 3 章：可选值与守卫 ──
+func 类型检查(_ 输入: Int?) -> String {
+    guard let 值 = 输入 else { return "无输入" }
+    return "得到数值 \(值)"
+}
+func 可选值演示() {
+    print("【第 3 章】可选值与守卫（guard let）")
+    print("  \(类型检查(42))")
+    print("  \(类型检查(nil))")
+}
+
+// ── 第 4 章：错误处理（throws / do-catch 异常分派）──
+enum 计算错误: Error {
+    case 输入非法
+}
+func 可能失败(_ x: Int) throws -> Int {
+    if x < 0 { throw 计算错误.输入非法 }
+    return x * 2
+}
+func 错误演示() {
+    print("【第 4 章】错误处理（throws / do-catch 异常分派）")
+    do {
+        let 值 = try 可能失败(21)
+        print("  计算成功：\(值)")
+    } catch {
+        print("  不应到达")
+    }
+    do {
+        let 值 = try 可能失败(-1)
+        print("  不应到达：\(值)")
+    } catch {
+        print("  捕获到错误：输入非法")
+    }
+}
+
+// ── 第 5 章：宏（编译期代码生成）──
+@freestanding(expression)
+macro 平方(_ x: Int) -> Int {
+    return #makeExpr("(\(x) * \(x))")
+}
+func 宏演示() {
+    print("【第 5 章】宏（编译期展开 #makeExpr）")
+    let 数 = #平方(x: 9)
+    print("  #平方(9) = \(数)")
+}
+
+// ── 第 6 章：并发全家桶 ──
+actor 计数器 {
+    private var 值: Int = 0
+    func 加一() { 值 = 值 + 1 }
+    func 取数() -> Int { return 值 }
+}
+async func 平方计算(_ n: Int) -> Int { return n * n }
+async func 通道演示() {
+    let 通道 = Channel<Int>(capacity: 5)
+    Task {
+        var i = 1
+        while i <= 5 {
+            await 通道.send(i * i)
+            i = i + 1
+        }
+        await 通道.close()
+    }
+    var 和 = 0
+    for await 值 in 通道 { 和 = 和 + 值 }
+    print("  通道求和 1²+…+5² = \(和)")
+}
+async func 任务组演示() {
+    await withTaskGroup { 组 in
+        var i = 1
+        while i <= 5 {
+            let n = i
+            组.addTask { return await 平方计算(n) }
+            i = i + 1
+        }
+        var 总 = 0
+        for await 数据 in 组 { 总 = 总 + 数据 }
+        print("  任务组并行平方求和 = \(总)")
+    }
+}
+async func 选择演示() {
+    let 信 = Channel<String>(capacity: 1)
+    await 信.send("你好，并发世界")
+    select {
+    case 消息 <- 信:
+        print("  select 收到：\(消息)")
+    default:
+        print("  select 默认分支")
+    }
+}
+async func 并发演示() {
+    print("【第 6 章】并发（async/await · Channel · TaskGroup · actor · select）")
+    let 计 = 计数器()
+    计.加一()
+    计.加一()
+    计.加一()
+    let 计数结果 = await 计.取数()
+    print("  actor 计数 = \(计数结果)")
+    await 通道演示()
+    await 任务组演示()
+    await 选择演示()
+}
+
+// ── 主程序 ──
+@main func main() async -> Int {
+    print("══════════════════════════════════════")
+    print("   \(语言名)  \(版本号)")
+    print("   \(标语)")
+    print("══════════════════════════════════════")
+    进度条("正在启动展示")
+    基础演示()
+    类型演示()
+    可选值演示()
+    错误演示()
+    宏演示()
+    await 并发演示()
+    print("")
+    print("──── 展示完毕 ────")
+    print("\(语言名) 已展示：中文标识符 · 类型系统 · 错误处理 · 宏 · 并发全家桶")
+    return 0
+}

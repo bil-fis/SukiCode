@@ -1,0 +1,266 @@
+/// SukiCode standard library — `data` module.
+///
+/// Per specification §12.6 the `Data` module owns:
+///   - `Data`    : a growable/contiguous byte buffer with pointer interop;
+///   - Base64    : `base64Encode` / `base64Decode` (RFC 4648, standard alphabet);
+///   - Hex       : `hexEncode` / `hexDecode` (lower-case output, lenient input).
+///
+/// Compression (`GZip` / `Zlib`) is intentionally deferred — it requires the
+/// system `zlib`, which is not yet wired into the runtime link step; the byte
+/// layer here is what those codecs would build upon.
+///
+/// All memory is managed through the C runtime helpers declared below. Addresses
+/// are carried as `Int` (LP64 ⇒ same width as a pointer, see `memory` module).
+/// Buffers are overallocated by 8 bytes so single-byte reads/writes near the
+/// tail never straddle an allocation boundary.
+
+module data
+
+import core
+
+// ─── C 运行时桥接 ─────────────────────────────────────────────────────────────
+// 单字节读写：src/runtime/runtime.c 的 suki_ptr_read_byte / suki_ptr_write_byte。
+foreign func suki_ptr_alloc(_ n: Int) -> Int
+foreign func suki_ptr_drop(_ p: Int) -> Int
+foreign func suki_ptr_read_byte(_ p: Int) -> Int
+foreign func suki_ptr_write_byte(_ p: Int, _ v: Int) -> Int
+// 字符串结果在 suki_str_from_cstr 处仅记录指针（不拷贝），需用 concat 强制
+// 独立副本，避免返回悬空 String（见 system.readAllText 的同类处理）。
+foreign func suki_str_from_cstr(_ p: Int) -> String
+foreign func suki_str_concat(_ a: String, _ b: String) -> String
+
+// ─── Data：连续字节序列 ────────────────────────────────────────────────────────
+
+/// 一段连续字节。布局与 C 运行时数组一致：`raw` 为堆缓冲指针（Int），
+/// `count` 为有效字节数。缓冲额外分配 8 字节，供尾端单字节读写越界保护。
+public struct Data {
+    var raw: Int
+    var count: Int
+
+    /// 空 Data 用 `Data(capacity: 0)` 构造（count=0、raw=0）。
+    /// 不使用无参 `init()`：编译器在存在无参构造器时无法按标签解析到
+    /// `init(capacity:)`，会错误落到无参构造器；也不使用静态工厂，以规避
+    /// 结构体静态方法调用的 codegen 缺陷。
+
+    /// 分配 `cap` 字节（内容未初始化，须先写入再读）。`cap <= 0` 视为空。
+    public init(capacity cap: Int) {
+        if cap <= 0 {
+            self.raw = 0
+            self.count = 0
+            return
+        }
+        self.raw = suki_ptr_alloc(cap + 8)
+        self.count = cap
+    }
+
+    /// 取第 `i` 字节（0 ≤ i < count）；越界返回 0。
+    public func byteAt(_ i: Int) -> Int {
+        if i < 0 || i >= self.count { return 0 }
+        return suki_ptr_read_byte(self.raw + i)
+    }
+
+    /// 写第 `i` 字节；越界忽略。
+    public func setByte(_ i: Int, _ v: Int) {
+        if i < 0 || i >= self.count { return }
+        suki_ptr_write_byte(self.raw + i, v)
+    }
+
+    /// 有效字节数。
+    public func length() -> Int {
+        return self.count
+    }
+
+    /// 是否为空。
+    public func isEmpty() -> Bool {
+        return self.count == 0
+    }
+}
+
+// ─── Data 构造辅助 ─────────────────────────────────────────────────────────────
+
+/// 从原始指针深拷贝 `len` 字节构造 Data（安全：与源缓冲无别名）。
+public func dataFromRaw(_ ptr: Int, _ len: Int) -> Data {
+    if len <= 0 { return Data(capacity: 0) }
+    var d = Data(capacity: len)
+    var i = 0
+    while i < len {
+        suki_ptr_write_byte(d.raw + i, suki_ptr_read_byte(ptr + i))
+        i = i + 1
+    }
+    return d
+}
+
+/// 拼接两个 Data，返回新 Data；任一为空则退化为另一份（可能为空的拷贝）。
+public func dataConcat(_ a: Data, _ b: Data) -> Data {
+    let total = a.count + b.count
+    if total <= 0 { return Data(capacity: 0) }
+    var out = Data(capacity: total)
+    var i = 0
+    while i < a.count {
+        suki_ptr_write_byte(out.raw + i, a.byteAt(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < b.count {
+        suki_ptr_write_byte(out.raw + i + j, b.byteAt(j))
+        j = j + 1
+    }
+    return out
+}
+
+// 把 NUL 结尾的堆缓冲安全转为独立拥有的 String 副本（避免悬空指针）。
+private func ownedStringFromCstr(_ buf: Int) -> String {
+    let s = suki_str_from_cstr(buf)
+    let owned = suki_str_concat(s, "")
+    return owned
+}
+
+// ─── Base64（RFC 4648，标准字母表）───────────────────────────────────────────
+
+/// 将 Data 编码为标准 Base64 字符串（含 `=` 填充）。空输入返回 ""。
+public func base64Encode(_ d: Data) -> String {
+    let len = d.count
+    if len == 0 { return "" }
+    let groups = (len + 2) / 3
+    let outLen = groups * 4
+    let buf = suki_ptr_alloc(outLen + 8)
+    var g = 0
+    var pos = 0
+    while g < groups {
+        let i = g * 3
+        let b0 = d.byteAt(i)
+        let b1 = d.byteAt(i + 1)
+        let b2 = d.byteAt(i + 2)
+        let hasB1 = i + 1 < len
+        let hasB2 = i + 2 < len
+        var n = b0 << 16
+        if hasB1 { n = n | (b1 << 8) }
+        if hasB2 { n = n | b2 }
+        let c0 = stringCharAt("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", (n >> 18) & 63)
+        let c1 = stringCharAt("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", (n >> 12) & 63)
+        var c2 = 61   // '=' 填充
+        if hasB1 { c2 = stringCharAt("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", (n >> 6) & 63) }
+        var c3 = 61
+        if hasB2 { c3 = stringCharAt("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", n & 63) }
+        suki_ptr_write_byte(buf + pos, c0); pos = pos + 1
+        suki_ptr_write_byte(buf + pos, c1); pos = pos + 1
+        suki_ptr_write_byte(buf + pos, c2); pos = pos + 1
+        suki_ptr_write_byte(buf + pos, c3); pos = pos + 1
+        g = g + 1
+    }
+    suki_ptr_write_byte(buf + pos, 0)
+    let result = ownedStringFromCstr(buf)
+    suki_ptr_drop(buf)
+    return result
+}
+
+// 将 Base64 字符码映射回 6-bit 值；无效字符按 0 处理。
+private func base64Value(_ c: Int) -> Int {
+    if c >= 65 && c <= 90 { return c - 65 }       // A-Z -> 0..25
+    if c >= 97 && c <= 122 { return c - 71 }      // a-z -> 26..51
+    if c >= 48 && c <= 57 { return c + 4 }        // 0-9 -> 52..61
+    if c == 43 { return 62 }                       // '+'
+    if c == 47 { return 63 }                       // '/'
+    return 0
+}
+
+/// 将 Base64 字符串解码为 Data。空输入或纯填充返回空 Data；
+/// 行尾 `=` 填充会被跳过。对空白/非法字符做容错（按 0 处理）。
+public func base64Decode(_ s: String) -> Data {
+    let len = stringLength(s)
+    if len == 0 { return Data(capacity: 0) }
+    var pad = 0
+    if stringCharAt(s, len - 1) == 61 { pad = pad + 1 }
+    if len >= 2 && stringCharAt(s, len - 2) == 61 { pad = pad + 1 }
+    let outLen = (len / 4) * 3 - pad
+    if outLen <= 0 { return Data(capacity: 0) }
+    var d = Data(capacity: outLen)
+    var i = 0
+    var outPos = 0
+    while i + 4 <= len {
+        let v0 = base64Value(stringCharAt(s, i))
+        let v1 = base64Value(stringCharAt(s, i + 1))
+        let v2 = base64Value(stringCharAt(s, i + 2))
+        let v3 = base64Value(stringCharAt(s, i + 3))
+        let triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+        suki_ptr_write_byte(d.raw + outPos, (triple >> 16) & 255)
+        if outPos + 1 < outLen { suki_ptr_write_byte(d.raw + outPos + 1, (triple >> 8) & 255) }
+        if outPos + 2 < outLen { suki_ptr_write_byte(d.raw + outPos + 2, triple & 255) }
+        outPos = outPos + 3
+        i = i + 4
+    }
+    return d
+}
+
+// ─── Hex（小写输出，输入容错）─────────────────────────────────────────────────
+
+private func hexDigitChar(_ v: Int) -> Int {
+    if v < 10 { return 48 + v }    // '0'..'9'
+    return 87 + v                  // 'a'..'f'（87 = 'a' - 10）
+}
+
+private func isHexChar(_ c: Int) -> Bool {
+    if c >= 48 && c <= 57 { return true }    // 0-9
+    if c >= 97 && c <= 102 { return true }   // a-f
+    if c >= 65 && c <= 70 { return true }    // A-F
+    return false
+}
+
+private func hexCharValue(_ c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 65 && c <= 70 { return c - 55 }  // A-F -> 10..15
+    return c - 87                            // a-f -> 10..15
+}
+
+/// 将 Data 编码为小写十六进制字符串。空输入返回 ""。
+public func hexEncode(_ d: Data) -> String {
+    let len = d.count
+    if len == 0 { return "" }
+    let buf = suki_ptr_alloc(len * 2 + 8)
+    var i = 0
+    while i < len {
+        let b = d.byteAt(i)
+        suki_ptr_write_byte(buf + i * 2, hexDigitChar((b >> 4) & 15))
+        suki_ptr_write_byte(buf + i * 2 + 1, hexDigitChar(b & 15))
+        i = i + 1
+    }
+    suki_ptr_write_byte(buf + len * 2, 0)
+    let result = ownedStringFromCstr(buf)
+    suki_ptr_drop(buf)
+    return result
+}
+
+/// 将十六进制字符串解码为 Data。跳过非 hex 字符，奇数个 hex 数字时
+/// 丢弃最后一个半字节。空输入返回空 Data。
+public func hexDecode(_ s: String) -> Data {
+    let len = stringLength(s)
+    if len == 0 { return Data(capacity: 0) }
+    var nibbles = 0
+    var i = 0
+    while i < len {
+        if isHexChar(stringCharAt(s, i)) { nibbles = nibbles + 1 }
+        i = i + 1
+    }
+    let outLen = nibbles / 2
+    if outLen <= 0 { return Data(capacity: 0) }
+    var d = Data(capacity: outLen)
+    var pos = 0
+    var acc = 0
+    var have = 0
+    i = 0
+    while i < len {
+        let c = stringCharAt(s, i)
+        if isHexChar(c) {
+            acc = (acc << 4) | hexCharValue(c)
+            have = have + 1
+            if have == 2 {
+                suki_ptr_write_byte(d.raw + pos, acc)
+                pos = pos + 1
+                have = 0
+                acc = 0
+            }
+        }
+        i = i + 1
+    }
+    return d
+}

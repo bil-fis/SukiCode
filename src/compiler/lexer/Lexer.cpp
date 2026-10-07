@@ -44,10 +44,14 @@ std::string cleanDocBlock(const std::string& raw) {
 } // namespace
 
 bool Lexer::isIdentStart(char c) {
-    return std::isalpha((unsigned char)c) != 0 || c == '_' || c == '$';
+    // 允许 UTF-8 多字节首字节（>= 0x80），使中文等 Unicode 标识符可被词法分析。
+    // 续字节（0x80–0xBF）会由 isIdentCont 接纳，整段 UTF-8 序列被合并为一个标识符 token。
+    return std::isalpha((unsigned char)c) != 0 || c == '_' || c == '$' ||
+           ((unsigned char)c) >= 0x80;
 }
 bool Lexer::isIdentCont(char c) {
-    return std::isalnum((unsigned char)c) != 0 || c == '_' || c == '$';
+    return std::isalnum((unsigned char)c) != 0 || c == '_' || c == '$' ||
+           ((unsigned char)c) >= 0x80;
 }
 bool Lexer::isDigit(char c) { return c >= '0' && c <= '9'; }
 

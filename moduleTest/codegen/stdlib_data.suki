@@ -1,0 +1,58 @@
+// data 标准库：Data 字节序列 / Base64 / Hex 端到端验证。
+// 全部断言通过返回 0，否则返回累计失败权重。
+
+import data
+import core
+
+@main func main() -> Int {
+    var score = 0
+
+    // 1. Data 字节读写
+    var d = Data(capacity: 4)
+    d.setByte(0, 10)
+    d.setByte(1, 20)
+    d.setByte(2, 30)
+    d.setByte(3, 40)
+    if d.length() == 4 && d.byteAt(0) == 10 && d.byteAt(3) == 40 { score += 1 }
+
+    // 2. Base64 往返
+    let enc = base64Encode(d)
+    let dec = base64Decode(enc)
+    if dec.length() == 4 && dec.byteAt(0) == 10 && dec.byteAt(3) == 40 { score += 2 }
+
+    // 3. 已知 Base64 向量： "hello" -> "aGVsbG8="
+    var hello = Data(capacity: 5)
+    hello.setByte(0, 104)  // 'h'
+    hello.setByte(1, 101)  // 'e'
+    hello.setByte(2, 108)  // 'l'
+    hello.setByte(3, 108)  // 'l'
+    hello.setByte(4, 111)  // 'o'
+    if base64Encode(hello) == "aGVsbG8=" { score += 4 }
+    let helloDec = base64Decode("aGVsbG8=")
+    if helloDec.length() == 5 && helloDec.byteAt(0) == 104 && helloDec.byteAt(4) == 111 { score += 8 }
+
+    // 4. Hex 往返 + 已知向量 [0xDE,0xAD,0xBE,0xEF] -> "deadbeef"
+    if hexEncode(d) != "" {
+        let hexDec = hexDecode(hexEncode(d))
+        if hexDec.length() == 4 && hexDec.byteAt(1) == 20 { score += 16 }
+    }
+    var deadbeef = Data(capacity: 4)
+    deadbeef.setByte(0, 0xDE)
+    deadbeef.setByte(1, 0xAD)
+    deadbeef.setByte(2, 0xBE)
+    deadbeef.setByte(3, 0xEF)
+    if hexEncode(deadbeef) == "deadbeef" { score += 32 }
+    let back = hexDecode("DEADBEEF")
+    if back.length() == 4 && back.byteAt(0) == 0xDE && back.byteAt(3) == 0xEF { score += 64 }
+
+    // 5. dataConcat
+    let cat = dataConcat(d, hello)
+    if cat.length() == 9 && cat.byteAt(4) == 104 { score += 128 }
+
+    // 6. 空 Data 编解码返回空字符串
+    if base64Encode(Data(capacity: 0)) == "" && hexEncode(Data(capacity: 0)) == "" { score += 256 }
+
+    let expected = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 256
+    if score == expected { return 0 }
+    return score
+}
