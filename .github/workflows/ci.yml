@@ -92,11 +92,14 @@ jobs:
             $srcUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-18.1.8.src.tar.xz"
             $tar = Join-Path $env:TEMP "llvm-18.1.8.src.tar.xz"
             curl.exe -L --retry 5 --retry-delay 5 -o $tar $srcUrl
-            $srcDir = Join-Path $env:TEMP "llvm-18.1.8.src"
-            New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
-            tar -xf $tar -C $srcDir
-            $llvmSrc = Join-Path $srcDir "llvm-18.1.8.src\llvm"
-            cmake -S $llvmSrc -B "$srcDir\build" -G Ninja `
+            $srcRoot = "D:\llvm-src"
+            New-Item -ItemType Directory -Force -Path $srcRoot | Out-Null
+            tar -xf $tar -C $srcRoot
+            # 顶层解压为 llvm-18.1.8.src；取其下 llvm/ 作为 CMake 源根（其兄弟目录含 cmake/third-party）
+            $top = Get-ChildItem $srcRoot -Directory | Select-Object -First 1
+            $llvmSrc = Join-Path $top.FullName "llvm"
+            if (-not (Test-Path "$llvmSrc\CMakeLists.txt")) { throw "LLVM 源码目录未找到：$llvmSrc" }
+            cmake -S $llvmSrc -B "$srcRoot\build" -G Ninja `
               -DCMAKE_BUILD_TYPE=Release `
               -DLLVM_TARGETS_TO_BUILD=X86 `
               -DCMAKE_INSTALL_PREFIX=$llvmRoot `
@@ -104,8 +107,8 @@ jobs:
               -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF `
               -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF `
               -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_TERMINFO=OFF
-            cmake --build "$srcDir\build" --parallel
-            cmake --install "$srcDir\build"
+            cmake --build "$srcRoot\build" --parallel
+            cmake --install "$srcRoot\build"
           } else {
             Write-Host "Cache hit — 复用已构建的 LLVM 18.1.8"
           }
