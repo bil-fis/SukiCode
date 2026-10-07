@@ -15,6 +15,12 @@ on:
     tags: ['v*']
   pull_request:
 
+# 同一分支/标签的并发触发只保留最新一次：避免重复推送 tag 时多个 publish
+# job 并发竞争创建 Release；正在运行的同组任务会被取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write   # 供 softprops/action-gh-release 创建 Release
 
@@ -29,10 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies (LLVM + clang + cmake)
+      - name: Install dependencies (LLVM 18 + clang 18 + cmake)
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
+          sudo apt-get install -y llvm-18-dev clang libclang-18-dev cmake ninja-build
 
       - name: Run test suite
         # `bash <file>` 而非 ./<file>：不依赖脚本在 git 中的可执行位
@@ -59,18 +65,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: (Linux) Install dependencies
+      - name: (Linux) Install dependencies (LLVM 18 + clang 18)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev clang libclang-dev cmake ninja-build
+          sudo apt-get install -y llvm-18-dev clang libclang-18-dev cmake ninja-build
 
-      - name: (Windows) Install LLVM
+      - name: (Windows) Install LLVM 18.1.8
         if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
-          curl -L -o llvm-installer.exe https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe
+          # 锁定与 Linux 主版本一致的 LLVM 18.1.8；/S 静默安装到默认目录（管理员 runner 下为 Program Files）
+          curl.exe -L -o llvm-installer.exe https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe
           Start-Process -Wait -FilePath .\llvm-installer.exe -ArgumentList '/S'
-          echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH
+          # 安装路径可能为 Program Files（管理员）或 LOCALAPPDATA，统一探测后写入 PATH
+          $candidates = @("$env:ProgramFiles\LLVM\bin", "$env:LOCALAPPDATA\Programs\LLVM\bin")
+          $llvmBin = $candidates | Where-Object { Test-Path (Join-Path $_ 'llvm-config.exe') } | Select-Object -First 1
+          if (-not $llvmBin) {
+            throw "LLVM 未安装成功：未在 $($candidates -join ', ') 下找到 llvm-config.exe"
+          }
+          echo "$llvmBin" | Out-File -Append -FilePath $env:GITHUB_PATH
 
       - name: (Linux) Configure & build
         if: matrix.os == 'ubuntu-latest'
@@ -120,7 +134,9 @@ jobs:
         run: |
           cd idePlugins/vscode
           npm install
-          npx @vscode/vsce package --no-yarn
+          # 用仓库已有脚本 npm run pack（= vsce package）：使用 package.json 锁定的
+          # vsce ^2.15.0，而非 npx 拉取的最新版；vsce 打包时自动执行 vscode:prepublish(tsc)
+          npm run pack
 
       - name: Rename vsix to tag version
         run: |
