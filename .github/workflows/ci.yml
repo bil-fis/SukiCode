@@ -75,10 +75,13 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          # 用 chocolatey 锁定安装 LLVM 18.1.8（LLVM 官方推荐的 Windows 包管理，
-          # 自动处理官方安装器静默开关，固定安装到 Program Files\LLVM）。
-          # -f 强制：即使镜像已预装其它 LLVM 版本，也覆盖为 18.1.8。
-          choco install llvm --version=18.1.8 -y -f --no-progress
+          # 用 LLVM 官方 GitHub release 的 Windows 安装器静默安装（runner 拉取
+          # GitHub 资产快且可靠，避免 chocolatey.org 等第三方源的瞬时超时）。
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe"
+          $installer = Join-Path $env:TEMP "LLVM-18.1.8-win64.exe"
+          curl.exe -L --retry 5 --retry-delay 5 -o $installer $url
+          Start-Process -FilePath $installer -ArgumentList '/S' -Wait
+          Start-Sleep -Seconds 3
           # 诊断：确认官方 Windows 包是否含 LLVM 开发文件（LLVMConfig.cmake / 头文件 / 静态库）
           Write-Host "LLVMConfig.cmake exists: $([IO.File]::Exists('C:\Program Files\LLVM\lib\cmake\llvm\LLVMConfig.cmake'))"
           Write-Host "DataLayout.h      exists: $([IO.File]::Exists('C:\Program Files\LLVM\include\llvm\IR\DataLayout.h'))"

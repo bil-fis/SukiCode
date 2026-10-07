@@ -35,7 +35,8 @@ if(SUKICODE_USE_SYSTEM_LLVM)
         # find_package(LLVM CONFIG) 提供 LLVM_LINK_TARGETS / LLVM_INCLUDE_DIRS /
         # LLVM_ENABLE_RTTI 等，供 src/compiler 链接。CI 通过 CMAKE_PREFIX_PATH
         # 或 LLVM_DIR 指向 LLVM 安装前缀。
-        find_package(LLVM CONFIG QUIET)
+        find_package(LLVM CONFIG QUIET
+            PATHS "C:/Program Files/LLVM/lib/cmake/llvm" "$ENV{LLVM_DIR}")
         if(LLVM_FOUND)
             message(STATUS "Found LLVM via find_package: ${LLVM_VERSION} (LLVM_DIR=${LLVM_DIR})")
         else()
