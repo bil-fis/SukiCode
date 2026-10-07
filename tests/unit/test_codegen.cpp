@@ -87,7 +87,31 @@ void testScalarsAndStrings() {
         }
     )SUKI", "SukiString");
     // Printing routes through the runtime entry point that takes the aggregate.
-    expectIR("print of a string", R"SUKI(
+    // Two runtime entry points exist (spec 12.1): `print` appends a newline,
+    // `printsl` (single-line) does not. Both take the { pointer, length }
+    // aggregate directly for a String operand.
+    expectIR("printsl of a string (no newline)", R"SUKI(
+        @main
+        func main() -> Int {
+            printsl("hi")
+            return 0
+        }
+    )SUKI", "suki_print_str");
+    rejectIR("printsl must not emit the newline entry point", R"SUKI(
+        @main
+        func main() -> Int {
+            printsl("hi")
+            return 0
+        }
+    )SUKI", "suki_println_str");
+    expectIR("print of a string (adds newline)", R"SUKI(
+        @main
+        func main() -> Int {
+            print("hi")
+            return 0
+        }
+    )SUKI", "suki_println_str");
+    rejectIR("print must not emit the single-line entry point", R"SUKI(
         @main
         func main() -> Int {
             print("hi")
