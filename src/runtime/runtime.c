@@ -22,9 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/time.h>
 #include <stdint.h>
 #if !defined(_WIN32)
+  #include <sys/time.h>   // gettimeofday（POSIX；Windows 无此头）
   #include <unistd.h>   // nanosleep (POSIX), sysconf
   #include <sys/sysinfo.h>   // sysinfo (物理内存)
 #endif
@@ -176,12 +176,20 @@ int64_t suki_time_now_sec(void) {
     return (int64_t)t;
 }
 int64_t suki_clock_cpu_micros(void) {
+#if defined(_WIN32)
+    // Windows: 用高精度单调时钟 QueryPerformanceCounter
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (int64_t)((double)counter.QuadPart * 1e6 / (double)freq.QuadPart);
+#else
     // clock(3) is unreliable in some environments (returns 0 / garbage); use a
     // monotonic clock via clock_gettime for a stable, monotonically increasing
     // microsecond timer suitable for benchmarking / elapsed-time measurement.
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+#endif
 }
 
 int64_t suki_str_length(SukiString s) { return s.length; }

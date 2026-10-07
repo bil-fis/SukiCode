@@ -65,38 +65,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: (Windows) Cache LLVM 18.1.8 build
+        if: matrix.os == 'windows-latest'
+        uses: actions/cache@v4
+        with:
+          path: D:\llvm-dev
+          key: llvm-18.1.8-msvc-x86
+
       - name: (Linux) Install dependencies (LLVM 18 + clang 18)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev clang libclang-18-dev cmake ninja-build
 
-      - name: (Windows) Install LLVM 18.1.8
+      - name: (Windows) Build LLVM 18.1.8 from source (cached)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          # 用 LLVM 官方 GitHub release 的 Windows 安装器静默安装（runner 拉取
-          # GitHub 资产快且可靠，避免 chocolatey.org 等第三方源的瞬时超时）。
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe"
-          $installer = Join-Path $env:TEMP "LLVM-18.1.8-win64.exe"
-          curl.exe -L --retry 5 --retry-delay 5 -o $installer $url
-          Start-Process -FilePath $installer -ArgumentList '/S' -Wait
-          Start-Sleep -Seconds 3
-          # 精确诊断：官方 win64.exe 安装后的真实结构
-          Write-Host "=== C:\Program Files\LLVM top ==="
-          Get-ChildItem "C:\Program Files\LLVM" -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
-          Write-Host "=== include top ==="
-          Get-ChildItem "C:\Program Files\LLVM\include" -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
-          Write-Host "=== lib top ==="
-          Get-ChildItem "C:\Program Files\LLVM\lib" -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
-          Write-Host "=== LLVMConfig.cmake search (Program Files, depth 4) ==="
-          Get-ChildItem "C:\Program Files" -Recurse -Depth 4 -Filter LLVMConfig.cmake -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-          $llvmBin = "$env:ProgramFiles\LLVM\bin"
-          # Windows 官方包不含 llvm-config.exe，以 clang.exe 作为安装成功标志。
-          if (-not (Test-Path "$llvmBin\clang.exe")) {
-            throw "LLVM 18.1.8 未安装成功：$llvmBin 下未找到 clang.exe"
+          # 官方 Windows 二进制包只含 clang 工具与 C ABI 库（LLVM-C 等），不含
+          # C++ API 开发库（无 llvm/*.h 头文件、无 LLVMConfig.cmake、无 llvm-config.exe）。
+          # 因此 MSVC 链接 LLVM C++ API 必须从源码构建 LLVM，并用 actions/cache 复用结果。
+          $llvmRoot = "D:\llvm-dev"
+          $cmakeDir = "$llvmRoot\lib\cmake\llvm"
+          if (-not (Test-Path "$cmakeDir\LLVMConfig.cmake")) {
+            Write-Host "Cache miss — 从源码构建 LLVM 18.1.8 ..."
+            $srcUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-18.1.8.src.tar.xz"
+            $tar = Join-Path $env:TEMP "llvm-18.1.8.src.tar.xz"
+            curl.exe -L --retry 5 --retry-delay 5 -o $tar $srcUrl
+            $srcDir = Join-Path $env:TEMP "llvm-18.1.8.src"
+            New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+            tar -xf $tar -C $srcDir
+            $llvmSrc = Join-Path $srcDir "llvm-18.1.8.src\llvm"
+            cmake -S $llvmSrc -B "$srcDir\build" -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DLLVM_TARGETS_TO_BUILD=X86 `
+              -DCMAKE_INSTALL_PREFIX=$llvmRoot `
+              -DLLVM_ENABLE_PROJECTS="" -DLLVM_ENABLE_RUNTIMES="" `
+              -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF `
+              -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF `
+              -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_TERMINFO=OFF
+            cmake --build "$srcDir\build" --parallel
+            cmake --install "$srcDir\build"
+          } else {
+            Write-Host "Cache hit — 复用已构建的 LLVM 18.1.8"
           }
-          echo "$llvmBin" | Out-File -Append -FilePath $env:GITHUB_PATH
+          if (-not (Test-Path "$cmakeDir\LLVMConfig.cmake")) {
+            throw "LLVM 构建产物缺失：$cmakeDir\LLVMConfig.cmake"
+          }
+          echo "LLVM_DIR=$cmakeDir" | Out-File -Append -FilePath $env:GITHUB_ENV
 
       - name: (Linux) Configure & build
         if: matrix.os == 'ubuntu-latest'
@@ -109,11 +125,10 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: |
           # windows-latest 已迁移到 Visual Studio 2026，生成器名相应为 "Visual Studio 18 2026"；
-          # CMAKE_PREFIX_PATH 指向 LLVM 安装前缀，供顶层 CMakeLists 的 find_package(LLVM CONFIG) 定位
+          # LLVM_DIR 指向源码构建安装的 LLVMConfig.cmake，供 find_package(LLVM CONFIG) 定位
           cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
                 -DCMAKE_BUILD_TYPE=Release -DSUKICODE_BUILD_TESTS=OFF `
-                -DCMAKE_PREFIX_PATH="C:/Program Files/LLVM" `
-                -DLLVM_DIR="C:/Program Files/LLVM/lib/cmake/llvm"
+                -DLLVM_DIR="$env:LLVM_DIR"
           cmake --build build --config Release
 
       - name: (Linux) Package standalone zip
